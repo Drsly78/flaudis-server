@@ -1,7 +1,7 @@
 {
   "name": "sav-server",
-  "version": "1.0.0",
-  "description": "Serveur proxy pour SAV Analyser Outlook Add-in",
+  "version": "2.0.0",
+  "description": "Serveur proxy SAV avec support notices PDF",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
