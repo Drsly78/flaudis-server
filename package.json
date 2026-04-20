@@ -1,12 +1,11 @@
 {
   "name": "sav-server",
-  "version": "2.0.0",
-  "description": "Serveur proxy SAV avec support notices PDF",
+  "version": "2.1.0",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
+  "scripts": { "start": "node server.js" },
+  "dependencies": {
+    "pdfjs-dist": "3.11.174",
+    "canvas": "^2.11.2"
   },
-  "engines": {
-    "node": ">=18"
-  }
+  "engines": { "node": ">=18" }
 }
