@@ -168,20 +168,13 @@ const server = http.createServer(async function(req, res) {
         }
         // Demander à Claude d'analyser les similarités
         const historique = result.rows.map(function(r) {
-          return `- ${r.date_reception||'?'} | Ref: ${r.ref_produit||'?'} | Pièce: ${r.piece||'?'} | Décision: ${r.decision||'?'}`;
-        }).join('
-');
+          return '- ' + (r.date_reception||'?') + ' | Ref: ' + (r.ref_produit||'?') + ' | Piece: ' + (r.piece||'?') + ' | Decision: ' + (r.decision||'?');
+        }).join('\n');
 
         const analysePayload = {
           messages: [{
             role: 'user',
-            content: `Dossier actuel : Ref=${ref_produit}, Problème=${designation_piece}
-
-Historique des ${result.rows.length} derniers dossiers de ce magasin :
-${historique}
-
-En une seule phrase courte (max 15 mots), signale s'il y a une similarité notable (même produit récemment, même problème récurrent).
-Si rien de notable, réponds: AUCUN`
+            content: 'Dossier actuel : Ref=' + ref_produit + ', Probleme=' + designation_piece + '\n\nHistorique des ' + result.rows.length + ' derniers dossiers de ce magasin :\n' + historique + '\n\nEn une seule phrase courte (max 15 mots), signale s\'il y a une similarite notable (meme produit recemment, meme probleme recurrent). Si rien de notable, reponds: AUCUN'
           }],
           max_tokens: 100
         };
