@@ -152,6 +152,46 @@ const server = http.createServer(async function(req, res) {
         return;
       }
 
+      // HISTORIQUE SIMILAIRE DU MAGASIN
+      if (req.url === '/check-historique-magasin') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ alerte: null })); return; }
+        const { enseigne, departement_ville, ref_produit, designation_piece } = payload;
+        // Récupérer les 15 derniers dossiers du magasin
+        const result = await pool.query(
+          `SELECT * FROM dossiers 
+           WHERE enseigne=$1 AND departement_ville=$2 
+           ORDER BY date_traitement DESC LIMIT 15`,
+          [enseigne, departement_ville]
+        );
+        if (result.rows.length === 0) {
+          res.writeHead(200); res.end(JSON.stringify({ alerte: null })); return;
+        }
+        // Demander à Claude d'analyser les similarités
+        const historique = result.rows.map(function(r) {
+          return `- ${r.date_reception||'?'} | Ref: ${r.ref_produit||'?'} | Pièce: ${r.piece||'?'} | Décision: ${r.decision||'?'}`;
+        }).join('
+');
+
+        const analysePayload = {
+          messages: [{
+            role: 'user',
+            content: `Dossier actuel : Ref=${ref_produit}, Problème=${designation_piece}
+
+Historique des ${result.rows.length} derniers dossiers de ce magasin :
+${historique}
+
+En une seule phrase courte (max 15 mots), signale s'il y a une similarité notable (même produit récemment, même problème récurrent).
+Si rien de notable, réponds: AUCUN`
+          }],
+          max_tokens: 100
+        };
+        const aiResult = await callAnthropic(analysePayload);
+        const aiText = aiResult.content && aiResult.content[0] ? aiResult.content[0].text.trim() : 'AUCUN';
+        const alerte = aiText === 'AUCUN' ? null : aiText;
+        res.writeHead(200); res.end(JSON.stringify({ alerte }));
+        return;
+      }
+
       // ANALYSE AVEC NOTICE
       if (req.url === '/analyze-with-notice' && payload.ref_produit) {
         const ref = payload.ref_produit.trim();
