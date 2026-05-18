@@ -187,10 +187,31 @@ const server = http.createServer(async function(req, res) {
 
       // ANALYSE AVEC NOTICE
       if (req.url === '/analyze-with-notice' && payload.ref_produit) {
-        const ref = payload.ref_produit.trim();
-        console.log('Cherche notice:', GITHUB_NOTICES + ref + '.pdf');
-        const pdfBuffer = await downloadBuffer(GITHUB_NOTICES + ref + '.pdf');
+        const raw = payload.ref_produit.trim();
+        const parts = raw.split(/\s+/);
+
+        // Candidats dans l'ordre de priorité
+        const candidates = [raw]; // ex: "12176 ANTIBES 2025"
+        // Sans année si dernière partie = 4 chiffres commençant par 20
+        if (parts.length > 1 && /^20\d{2}$/.test(parts[parts.length - 1])) {
+          candidates.push(parts.slice(0, -1).join(' ')); // "12176 ANTIBES"
+        }
+        // Ref seule (première partie)
+        if (parts.length > 1) candidates.push(parts[0]); // "12176"
+
+        console.log('Candidats notice:', candidates);
+
+        let pdfBuffer = null;
+        let foundRef = null;
+        for (const cand of candidates) {
+          const url = GITHUB_NOTICES + encodeURIComponent(cand) + '.pdf';
+          console.log('Essai:', url);
+          const buf = await downloadBuffer(url);
+          if (buf) { pdfBuffer = buf; foundRef = cand; break; }
+        }
+
         if (pdfBuffer) {
+          console.log('Notice trouvée:', foundRef);
           const images = await pdfToImages(pdfBuffer);
           if (images.length > 0) {
             const noticeContent = [
