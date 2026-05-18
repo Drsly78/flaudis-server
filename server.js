@@ -215,7 +215,7 @@ const server = http.createServer(async function(req, res) {
           const images = await pdfToImages(pdfBuffer);
           if (images.length > 0) {
             const noticeContent = [
-              { type: 'text', text: 'Notice technique du produit ' + ref + ' (' + images.length + ' pages) :' }
+              { type: 'text', text: 'Notice technique du produit ' + foundRef + ' (' + images.length + ' pages) :' }
             ];
             images.forEach((img, i) => {
               noticeContent.push({ type: 'text', text: '[Page ' + (i+1) + ']' });
