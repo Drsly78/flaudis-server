@@ -156,13 +156,25 @@ const server = http.createServer(async function(req, res) {
       if (req.url === '/check-historique-magasin') {
         if (!pool) { res.writeHead(200); res.end(JSON.stringify({ alerte: null })); return; }
         const { enseigne, departement_ville, ref_produit, designation_piece } = payload;
-        // Récupérer les 15 derniers dossiers du magasin
-        const result = await pool.query(
+        // Récupérer les 20 derniers dossiers du même magasin (recherche souple sur ville)
+        // + 10 derniers dossiers toutes enseignes pour détecter patterns produit
+        const villeKeyword = (departement_ville||'').replace(/^\d+\s*/, '').trim();
+        
+        const resultMagasin = await pool.query(
           `SELECT * FROM dossiers 
-           WHERE enseigne=$1 AND departement_ville=$2 
-           ORDER BY date_traitement DESC LIMIT 15`,
-          [enseigne, departement_ville]
+           WHERE departement_ville ILIKE $1
+           ORDER BY date_traitement DESC LIMIT 20`,
+          ['%' + villeKeyword + '%']
         );
+        const resultProduit = await pool.query(
+          `SELECT * FROM dossiers 
+           WHERE ref_produit ILIKE $1
+           AND departement_ville NOT ILIKE $2
+           ORDER BY date_traitement DESC LIMIT 10`,
+          ['%' + (ref_produit||'') + '%', '%' + villeKeyword + '%']
+        );
+
+        const result = { rows: [...resultMagasin.rows, ...resultProduit.rows] };
         if (result.rows.length === 0) {
           res.writeHead(200); res.end(JSON.stringify({ alerte: null })); return;
         }
@@ -174,7 +186,17 @@ const server = http.createServer(async function(req, res) {
         const analysePayload = {
           messages: [{
             role: 'user',
-            content: 'Dossier actuel : Ref=' + ref_produit + ', Probleme=' + designation_piece + '\n\nHistorique des ' + result.rows.length + ' derniers dossiers de ce magasin :\n' + historique + '\n\nEn une seule phrase courte (max 15 mots), signale s\'il y a une similarite notable (meme produit recemment, meme probleme recurrent). Si rien de notable, reponds: AUCUN'
+            content: 'Nouveau dossier SAV :\n' +
+              'Enseigne: ' + enseigne + '\n' +
+              'Ville: ' + departement_ville + '\n' +
+              'Ref produit: ' + ref_produit + '\n' +
+              'Piece: ' + designation_piece + '\n\n' +
+              'Historique (' + result.rows.length + ' dossiers) :\n' + historique + '\n\n' +
+              'Analyse cet historique et dis en une phrase courte si tu detectes :\n' +
+              '- Ce magasin a deja fait une demande similaire (meme produit ou meme probleme)\n' +
+              '- Ce produit est problematique (demandes recurrentes sur plusieurs magasins)\n' +
+              'Sois souple sur les noms (Super U / SUPER U / magasin U = meme chose).\n' +
+              'Si rien de notable : reponds AUCUN'
           }],
           max_tokens: 100
         };
