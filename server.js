@@ -153,6 +153,23 @@ const server = http.createServer(async function(req, res) {
       }
 
       // HISTORIQUE SIMILAIRE DU MAGASIN
+      if (req.url === '/get-dossiers-magasin') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ dossiers: [] })); return; }
+        const { enseigne, departement_ville } = payload;
+        const villeKeyword = (departement_ville||'').replace(/^\d+\s*/, '').trim();
+        const enseigneKeyword = (enseigne||'');
+        const result = await pool.query(
+          `SELECT * FROM dossiers
+           WHERE departement_ville ILIKE $1
+           AND (enseigne ILIKE $2 OR $2 = '')
+           ORDER BY date_traitement DESC LIMIT 30`,
+          ['%' + villeKeyword + '%', enseigneKeyword ? '%' + enseigneKeyword + '%' : '']
+        );
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ dossiers: result.rows }));
+        return;
+      }
+
       if (req.url === '/check-historique-magasin') {
         if (!pool) { res.writeHead(200); res.end(JSON.stringify({ alerte: null })); return; }
         const { enseigne, departement_ville, ref_produit, designation_piece, strict_magasin } = payload;
