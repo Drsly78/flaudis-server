@@ -155,26 +155,20 @@ const server = http.createServer(async function(req, res) {
       // HISTORIQUE SIMILAIRE DU MAGASIN
       if (req.url === '/check-historique-magasin') {
         if (!pool) { res.writeHead(200); res.end(JSON.stringify({ alerte: null })); return; }
-        const { enseigne, departement_ville, ref_produit, designation_piece } = payload;
-        // Récupérer les 20 derniers dossiers du même magasin (recherche souple sur ville)
-        // + 10 derniers dossiers toutes enseignes pour détecter patterns produit
+        const { enseigne, departement_ville, ref_produit, designation_piece, strict_magasin } = payload;
+        // Recherche stricte par magasin uniquement (enseigne + ville)
         const villeKeyword = (departement_ville||'').replace(/^\d+\s*/, '').trim();
-        
+        const enseigneKeyword = (enseigne||'').toUpperCase().replace(/SUPER\s*U/i, 'SUPER U').replace(/HYPER\s*U/i, 'HYPER U');
+
         const resultMagasin = await pool.query(
           `SELECT * FROM dossiers 
            WHERE departement_ville ILIKE $1
+           AND (enseigne ILIKE $2 OR $2 = '')
            ORDER BY date_traitement DESC LIMIT 20`,
-          ['%' + villeKeyword + '%']
-        );
-        const resultProduit = await pool.query(
-          `SELECT * FROM dossiers 
-           WHERE ref_produit ILIKE $1
-           AND departement_ville NOT ILIKE $2
-           ORDER BY date_traitement DESC LIMIT 10`,
-          ['%' + (ref_produit||'') + '%', '%' + villeKeyword + '%']
+          ['%' + villeKeyword + '%', enseigneKeyword ? '%' + enseigneKeyword + '%' : '']
         );
 
-        const result = { rows: [...resultMagasin.rows, ...resultProduit.rows] };
+        const result = { rows: resultMagasin.rows };
         if (result.rows.length === 0) {
           res.writeHead(200); res.end(JSON.stringify({ alerte: null })); return;
         }
@@ -191,11 +185,11 @@ const server = http.createServer(async function(req, res) {
               'Ville: ' + departement_ville + '\n' +
               'Ref produit: ' + ref_produit + '\n' +
               'Piece: ' + designation_piece + '\n\n' +
-              'Historique (' + result.rows.length + ' dossiers) :\n' + historique + '\n\n' +
-              'Analyse cet historique et dis en une phrase courte si tu detectes :\n' +
-              '- Ce magasin a deja fait une demande similaire (meme produit ou meme probleme)\n' +
-              '- Ce produit est problematique (demandes recurrentes sur plusieurs magasins)\n' +
-              'Sois souple sur les noms (Super U / SUPER U / magasin U = meme chose).\n' +
+              'Magasin actuel : ' + enseigne + ' ' + departement_ville + '\n' +
+              'Produit actuel : ' + ref_produit + ' — ' + designation_piece + '\n\n' +
+              'Historique des ' + result.rows.length + ' derniers dossiers de CE magasin :\n' + historique + '\n\n' +
+              'Ce magasin a-t-il deja fait une demande pour ce meme produit ou ce meme type de probleme ? ' +
+              'Reponds en 1 phrase courte UNIQUEMENT si tu trouves une similarite directe avec CE magasin. ' +
               'Si rien de notable : reponds AUCUN'
           }],
           max_tokens: 100
