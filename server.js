@@ -203,11 +203,15 @@ const server = http.createServer(async function(req, res) {
               'Ref produit: ' + ref_produit + '\n' +
               'Piece: ' + designation_piece + '\n\n' +
               'Magasin actuel : ' + enseigne + ' ' + departement_ville + '\n' +
-              'Produit actuel : ' + ref_produit + ' — ' + designation_piece + '\n\n' +
+              'Produit actuel : ' + ref_produit + '\n' +
+              'Piece demandee actuellement : ' + designation_piece + '\n\n' +
               'Historique des ' + result.rows.length + ' derniers dossiers de CE magasin :\n' + historique + '\n\n' +
-              'Ce magasin a-t-il deja fait une demande pour ce meme produit ou ce meme type de probleme ? ' +
-              'Reponds en 1 phrase courte UNIQUEMENT si tu trouves une similarite directe avec CE magasin. ' +
-              'Si rien de notable : reponds AUCUN'
+              'Analyse si ce magasin a deja fait une demande pour EXACTEMENT le meme probleme sur le MEME produit ET la MEME piece. ' +
+              'IMPORTANT : une demande sur un produit similaire mais pour une piece differente N EST PAS un doublon. ' +
+              'Par exemple : plateau demande en mars et pied demande en juin = deux demandes distinctes, pas un doublon. ' +
+              'Reponds UNIQUEMENT si tu identifies un vrai doublon (meme produit + meme piece ou probleme tres similaire). ' +
+              'Format : "Deja traite le JJ/MM - meme piece : [nom piece]". ' +
+              'Si pas de doublon evident : reponds AUCUN'
           }],
           max_tokens: 100
         };
