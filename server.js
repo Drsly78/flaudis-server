@@ -153,6 +153,56 @@ const server = http.createServer(async function(req, res) {
       }
 
       // HISTORIQUE SIMILAIRE DU MAGASIN
+      if (req.url === '/scan-notice') {
+        const { pdfUrl, ref } = payload;
+        if (!pdfUrl) { res.writeHead(400); res.end(JSON.stringify({ error: 'pdfUrl required' })); return; }
+        
+        // Télécharger le PDF et l'encoder en base64
+        const https = require('https');
+        const http = require('http');
+        const pdfData = await new Promise((resolve, reject) => {
+          const client = pdfUrl.startsWith('https') ? https : http;
+          client.get(pdfUrl, (r) => {
+            const chunks = [];
+            r.on('data', c => chunks.push(c));
+            r.on('end', () => resolve(Buffer.concat(chunks)));
+            r.on('error', reject);
+          }).on('error', reject);
+        });
+        const b64 = pdfData.toString('base64');
+        
+        // Envoyer à Claude pour extraction des pièces
+        const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': process.env.ANTHROPIC_API_KEY,
+            'anthropic-version': '2023-06-01'
+          },
+          body: JSON.stringify({
+            model: 'claude-opus-4-5-20251101',
+            max_tokens: 2000,
+            messages: [{
+              role: 'user',
+              content: [{
+                type: 'document',
+                source: { type: 'base64', media_type: 'application/pdf', data: b64 }
+              }, {
+                type: 'text',
+                text: 'Cette notice PDF contient une liste de pièces détachées. Extrait TOUTES les pièces avec leur numéro/nom et quantité incluse dans le produit. Retourne UNIQUEMENT ce JSON valide sans texte autour : {"pieces": [{"nom": "A - Nom de la pièce", "qte": 2}, ...]}. Si une pièce a plusieurs références couleur, liste-les séparément. Inclus TOUTES les pièces visibles dans la nomenclature.'
+              }]
+            }]
+          })
+        });
+        const claudeData = await claudeRes.json();
+        const text = claudeData.content?.map(b => b.text || '').join('') || '';
+        const jsonMatch = text.match(/\{[\s\S]*\}/);
+        const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : text);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(parsed));
+        return;
+      }
+
       if (req.url === '/get-dossiers-magasin') {
         if (!pool) { res.writeHead(200); res.end(JSON.stringify({ dossiers: [] })); return; }
         const { enseigne, departement_ville } = payload;
