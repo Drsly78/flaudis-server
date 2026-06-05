@@ -189,7 +189,7 @@ const server = http.createServer(async function(req, res) {
                 source: { type: 'base64', media_type: 'application/pdf', data: b64 }
               }, {
                 type: 'text',
-                text: 'Cette notice PDF contient une liste de pièces détachées. Extrait TOUTES les pièces avec leur numéro/nom et quantité incluse dans le produit. Retourne UNIQUEMENT ce JSON valide sans texte autour : {"pieces": [{"nom": "A - Nom de la pièce", "qte": 2}, ...]}. Si une pièce a plusieurs références couleur, liste-les séparément. Inclus TOUTES les pièces visibles dans la nomenclature.'
+                text: "Cette notice PDF contient une nomenclature de pièces. Extrait TOUTES les pièces. Retourne la référence exacte telle qu'elle apparaît (ex: A, B, 1, 2, A2, K) et la quantité. Aucune description. JSON uniquement : {\"pieces\": [{\"nom\": \"A\", \"qte\": 2}]}"
               }]
             }]
           })
