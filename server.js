@@ -2,12 +2,15 @@ const https  = require('https');
 const http   = require('http');
 const { Pool } = require('pg');
 
-const API_KEY    = process.env.ANTHROPIC_API_KEY;
-const APP_SECRET = process.env.APP_SECRET || 'sav-flaudis-2024';
-const PORT       = process.env.PORT || 3000;
-const GITHUB_NOTICES = 'https://raw.githubusercontent.com/Drsly78/sav-notices/main/notices/';
+const API_KEY         = process.env.ANTHROPIC_API_KEY;
+const APP_SECRET      = process.env.APP_SECRET || 'sav-flaudis-2024';
+const PORT            = process.env.PORT || 3000;
+const GITHUB_NOTICES  = 'https://raw.githubusercontent.com/Drsly78/flaudis-notices/main/notices/';
+const FIREBASE_URL    = process.env.FIREBASE_URL || 'https://flaudis-prod-default-rtdb.europe-west1.firebasedatabase.app';
+const FIREBASE_SECRET = process.env.FIREBASE_SECRET; // optionnel si règles ouvertes
+const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID;
 
-// PostgreSQL
+// ── PostgreSQL ────────────────────────────────────────────
 const pool = process.env.DATABASE_URL ? new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
@@ -30,10 +33,69 @@ async function initDB() {
         notes TEXT
       )
     `);
+    // Ajout colonnes tracking et date_envoi si absentes
+    await pool.query(`ALTER TABLE dossiers ADD COLUMN IF NOT EXISTS tracking VARCHAR(200)`);
+    await pool.query(`ALTER TABLE dossiers ADD COLUMN IF NOT EXISTS date_envoi VARCHAR(20)`);
+    // Table compteurs pour numéros d'accord
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS compteurs (
+        cle VARCHAR(50) PRIMARY KEY,
+        valeur INTEGER NOT NULL DEFAULT 0,
+        mois_annee VARCHAR(10)
+      )
+    `);
     console.log('Table dossiers OK');
   } catch(e) { console.error('DB init error:', e.message); }
 }
 
+// ── Google Sheets Auth ────────────────────────────────────
+let _sheetsToken = null;
+let _sheetsTokenExpiry = 0;
+
+async function getSheetsToken() {
+  if (_sheetsToken && Date.now() < _sheetsTokenExpiry - 60000) return _sheetsToken;
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT;
+  if (!raw) throw new Error('GOOGLE_SERVICE_ACCOUNT manquant');
+  const sa = JSON.parse(raw);
+  const now = Math.floor(Date.now() / 1000);
+  const header = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString('base64url');
+  const claim = Buffer.from(JSON.stringify({
+    iss: sa.client_email,
+    scope: 'https://www.googleapis.com/auth/spreadsheets',
+    aud: 'https://oauth2.googleapis.com/token',
+    exp: now + 3600,
+    iat: now
+  })).toString('base64url');
+  const { createSign } = require('crypto');
+  const sign = createSign('RSA-SHA256');
+  sign.update(header + '.' + claim);
+  const sig = sign.sign(sa.private_key, 'base64url');
+  const jwt = header + '.' + claim + '.' + sig;
+  const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`
+  });
+  const tokenData = await tokenRes.json();
+  _sheetsToken = tokenData.access_token;
+  _sheetsTokenExpiry = Date.now() + 3500000;
+  return _sheetsToken;
+}
+
+// ── Firebase REST ─────────────────────────────────────────
+async function firebaseGet(path) {
+  const url = FIREBASE_URL + '/' + path + '.json' +
+    (FIREBASE_SECRET ? '?auth=' + FIREBASE_SECRET : '');
+  const r = await fetch(url);
+  if (!r.ok) return null;
+  return r.json();
+}
+
+function getKey(ref) {
+  return ref.replace(/[.#$\/\[\]]/g, '_');
+}
+
+// ── Helpers ───────────────────────────────────────────────
 function corsHeaders(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
@@ -100,13 +162,14 @@ function callAnthropic(payload) {
   });
 }
 
+// ── Serveur ───────────────────────────────────────────────
 const server = http.createServer(async function(req, res) {
   corsHeaders(res);
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', version: '3.0', db: !!pool }));
+    res.end(JSON.stringify({ status: 'ok', version: '4.0', db: !!pool }));
     return;
   }
 
@@ -122,44 +185,194 @@ const server = http.createServer(async function(req, res) {
     catch(e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid JSON' })); return; }
 
     try {
-      // SAUVEGARDER UN DOSSIER
+
+      // ── SAUVEGARDER UN DOSSIER ────────────────────────────
       if (req.url === '/save-dossier') {
         if (!pool) { res.writeHead(200); res.end(JSON.stringify({ ok: true, msg: 'no db' })); return; }
         const d = payload;
         await pool.query(`
-          INSERT INTO dossiers (numero_dossier, enseigne, departement_ville, ref_produit, piece, decision, date_reception)
-          VALUES ($1,$2,$3,$4,$5,$6,$7)
+          INSERT INTO dossiers (numero_dossier, enseigne, departement_ville, ref_produit, piece, decision, date_reception, tracking, date_envoi)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
           ON CONFLICT (numero_dossier) DO UPDATE SET
             enseigne=$2, departement_ville=$3, ref_produit=$4, piece=$5,
-            decision=$6, date_reception=$7, date_traitement=NOW()
+            decision=$6, date_reception=$7, date_traitement=NOW(),
+            tracking=COALESCE(EXCLUDED.tracking, dossiers.tracking),
+            date_envoi=COALESCE(EXCLUDED.date_envoi, dossiers.date_envoi)
         `, [d.numero_dossier||null, d.enseigne||null, d.departement_ville||null,
-            d.ref_produit||null, d.piece||null, d.decision||null, d.date_reception||null]);
+            d.ref_produit||null, d.piece||null, d.decision||null, d.date_reception||null,
+            d.tracking||null, d.date_envoi||null]);
         res.writeHead(200); res.end(JSON.stringify({ ok: true }));
         return;
       }
 
-      // VERIFIER UN DOSSIER
+      // ── VERIFIER UN DOSSIER ───────────────────────────────
       if (req.url === '/check-dossier') {
         if (!pool) { res.writeHead(200); res.end(JSON.stringify({ found: false })); return; }
         const { numero_dossier } = payload;
         if (!numero_dossier) { res.writeHead(200); res.end(JSON.stringify({ found: false })); return; }
         const result = await pool.query('SELECT * FROM dossiers WHERE numero_dossier=$1', [numero_dossier]);
-        if (result.rows.length > 0) {
-          res.writeHead(200); res.end(JSON.stringify({ found: true, dossier: result.rows[0] }));
-        } else {
-          res.writeHead(200); res.end(JSON.stringify({ found: false }));
-        }
+        res.writeHead(200);
+        res.end(JSON.stringify(result.rows.length > 0
+          ? { found: true, dossier: result.rows[0] }
+          : { found: false }));
         return;
       }
 
-      // HISTORIQUE SIMILAIRE DU MAGASIN
+      // ── HISTORIQUE MAGASIN (2 tableaux) ──────────────────
+      if (req.url === '/get-historique-magasin') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ par_ref: [], complet: [] })); return; }
+        const { enseigne, departement_ville, ref_produit } = payload;
+
+        // Extraire le nom de ville seul (sans département)
+        const ville = (departement_ville||'').replace(/^\d+\s*/, '').trim();
+
+        const deuxMoisAvant = new Date();
+        deuxMoisAvant.setMonth(deuxMoisAvant.getMonth() - 2);
+        const dateLimit = deuxMoisAvant.toISOString().slice(0, 10);
+
+        // Tableau 1 : même magasin + même ref, 2 mois
+        const resRef = await pool.query(`
+          SELECT * FROM dossiers
+          WHERE UPPER(departement_ville) LIKE $1
+          AND UPPER(enseigne) LIKE $2
+          AND UPPER(ref_produit) = $3
+          AND date_reception >= $4
+          ORDER BY date_reception DESC
+          LIMIT 20
+        `, [
+          '%' + ville.toUpperCase() + '%',
+          '%' + (enseigne||'').toUpperCase() + '%',
+          (ref_produit||'').toUpperCase(),
+          dateLimit
+        ]);
+
+        // Tableau 2 : même magasin tous produits, 2 mois
+        const resComplet = await pool.query(`
+          SELECT * FROM dossiers
+          WHERE UPPER(departement_ville) LIKE $1
+          AND UPPER(enseigne) LIKE $2
+          AND date_reception >= $3
+          ORDER BY date_reception DESC
+          LIMIT 50
+        `, [
+          '%' + ville.toUpperCase() + '%',
+          '%' + (enseigne||'').toUpperCase() + '%',
+          dateLimit
+        ]);
+
+        // Pour chaque dossier avec CNB, tenter de récupérer tracking + date_envoi depuis Sheet
+        const enrichir = async (rows) => {
+          if (!GOOGLE_SHEET_ID) return rows;
+          try {
+            const token = await getSheetsToken();
+            // Lire colonne B (date expé) et G (tracking) de la feuille Import SAV
+            const range = encodeURIComponent('SYSTEME U!A:H');
+            const sheetRes = await fetch(
+              `https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${range}`,
+              { headers: { Authorization: 'Bearer ' + token } }
+            );
+            const sheetData = await sheetRes.json();
+            const sheetRows = sheetData.values || [];
+            // Construire index par numéro CNB (colonne H = index 7)
+            const cnbIndex = {};
+            sheetRows.forEach(r => {
+              const cnb = (r[7]||'').trim();
+              if (cnb) cnbIndex[cnb] = { date_envoi: r[1]||'', tracking: r[6]||'' };
+            });
+            return rows.map(r => {
+              const extra = r.numero_dossier ? cnbIndex[r.numero_dossier] : null;
+              if (extra) {
+                return {
+                  ...r,
+                  date_envoi: extra.date_envoi || r.date_envoi || '',
+                  tracking: extra.tracking || r.tracking || ''
+                };
+              }
+              return r;
+            });
+          } catch(e) {
+            console.error('Sheets enrichissement error:', e.message);
+            return rows;
+          }
+        };
+
+        const [par_ref, complet] = await Promise.all([
+          enrichir(resRef.rows),
+          enrichir(resComplet.rows)
+        ]);
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ par_ref, complet }));
+        return;
+      }
+
+      // ── INFOS PRODUIT ENTREPÔT (Firebase) ────────────────
+      if (req.url === '/get-produit-info') {
+        const { ref } = payload;
+        if (!ref) { res.writeHead(200); res.end(JSON.stringify({ found: false })); return; }
+
+        const key = getKey(ref);
+        const data = await firebaseGet('produits/' + key);
+
+        if (!data) {
+          res.writeHead(200); res.end(JSON.stringify({ found: false })); return;
+        }
+
+        // Collecter tous les emplacements (loc, loc2, loc3...)
+        const emplacements = [];
+        let i = 0;
+        while (true) {
+          const slotKey = i === 0 ? 'loc' : 'loc' + (i + 1);
+          // Vérifier aussi les nouvelles clés loc2, loc3...
+          const locKey = i === 0 ? 'loc' : 'loc' + (i + 1);
+          const loc = data[locKey];
+          if (!loc && i > 0) break;
+          if (loc && loc.allee) {
+            let label = '';
+            if (loc.allee === 'AREA') label = 'Zone AREA';
+            else if (loc.cote === 'SOL') label = 'Allée ' + loc.allee + ' SOL';
+            else {
+              label = 'Allée ' + loc.allee;
+              if (loc.cote) label += ' ' + loc.cote;
+              if (loc.rack != null) label += ' R' + loc.rack;
+              if (loc.hauteur != null) label += ' H' + loc.hauteur;
+            }
+            emplacements.push(label);
+          }
+          i++;
+          if (i > 10) break; // sécurité
+        }
+
+        // Stock cartons
+        const pieces = data.pieces || {};
+        const pids = Object.keys(pieces);
+        let cartons_complets = 0;
+        let cartons_total = 0;
+        if (pids.length > 0) {
+          const fp = pieces[pids[0]];
+          const allC = Object.keys(fp.cartons || {}).filter(c => /^c[0-9]+$/.test(c));
+          cartons_total = fp.totalCartons || allC.length;
+          cartons_complets = allC.filter(c => fp.cartons[c]?.sealed === true).length;
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          found: true,
+          emplacements,                          // ['Allée 1 G R2 H1', 'Allée 3 D R1 H0']
+          emplacements_str: emplacements.join(' / ') || 'Non renseigné',
+          visserie: data.visserie ?? null,        // true / false / null
+          cartons_complets,                       // nb cartons sealed
+          cartons_total,                          // nb total cartons
+          qty: data.qty ?? null,                  // pour produits sans pièces
+          note: data.note || ''
+        }));
+        return;
+      }
+
+      // ── SCAN NOTICE ───────────────────────────────────────
       if (req.url === '/scan-notice') {
-        const { pdfUrl, ref } = payload;
+        const { pdfUrl } = payload;
         if (!pdfUrl) { res.writeHead(400); res.end(JSON.stringify({ error: 'pdfUrl required' })); return; }
-        
-        // Télécharger le PDF et l'encoder en base64
-        const https = require('https');
-        const http = require('http');
         const pdfData = await new Promise((resolve, reject) => {
           const client = pdfUrl.startsWith('https') ? https : http;
           client.get(pdfUrl, (r) => {
@@ -170,28 +383,19 @@ const server = http.createServer(async function(req, res) {
           }).on('error', reject);
         });
         const b64 = pdfData.toString('base64');
-        
-        // Envoyer à Claude pour extraction des pièces
         const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': process.env.ANTHROPIC_API_KEY,
-            'anthropic-version': '2023-06-01'
-          },
+          headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01' },
           body: JSON.stringify({
             model: 'claude-sonnet-4-20250514',
             max_tokens: 2000,
-            messages: [{
-              role: 'user',
-              content: [{
-                type: 'document',
-                source: { type: 'base64', media_type: 'application/pdf', data: b64 }
-              }, {
-                type: 'text',
-                text: "Cette notice PDF contient une nomenclature de pièces. Extrait TOUTES les pièces. Retourne la référence exacte telle qu'elle apparaît (ex: A, B, 1, 2, A2, K) et la quantité. Aucune description. JSON uniquement : {\"pieces\": [{\"nom\": \"A\", \"qte\": 2}]}"
-              }]
-            }]
+            messages: [{ role: 'user', content: [{
+              type: 'document',
+              source: { type: 'base64', media_type: 'application/pdf', data: b64 }
+            }, {
+              type: 'text',
+              text: "Cette notice PDF contient une nomenclature de pièces. Extrait TOUTES les pièces. Retourne la référence exacte telle qu'elle apparaît (ex: A, B, 1, 2, A2, K) et la quantité. Aucune description. JSON uniquement : {\"pieces\": [{\"nom\": \"A\", \"qte\": 2}]}"
+            }]}]
           })
         });
         const claudeData = await claudeRes.json();
@@ -203,120 +407,118 @@ const server = http.createServer(async function(req, res) {
         return;
       }
 
+      // ── HISTORIQUE MAGASIN (ancien endpoint — conservé compat) ──
       if (req.url === '/get-dossiers-magasin') {
         if (!pool) { res.writeHead(200); res.end(JSON.stringify({ dossiers: [] })); return; }
         const { enseigne, departement_ville } = payload;
         const villeKeyword = (departement_ville||'').replace(/^\d+\s*/, '').trim();
-        const enseigneKeyword = (enseigne||'');
         const result = await pool.query(
-          `SELECT * FROM dossiers
-           WHERE departement_ville ILIKE $1
-           AND (enseigne ILIKE $2 OR $2 = '')
+          `SELECT * FROM dossiers WHERE departement_ville ILIKE $1 AND (enseigne ILIKE $2 OR $2 = '')
            ORDER BY date_traitement DESC LIMIT 30`,
-          ['%' + villeKeyword + '%', enseigneKeyword ? '%' + enseigneKeyword + '%' : '']
+          ['%' + villeKeyword + '%', enseigne ? '%' + enseigne + '%' : '']
         );
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ dossiers: result.rows }));
         return;
       }
 
+      // ── CHECK HISTORIQUE (ancien — conservé compat) ───────
       if (req.url === '/check-historique-magasin') {
         if (!pool) { res.writeHead(200); res.end(JSON.stringify({ alerte: null })); return; }
-        const { enseigne, departement_ville, ref_produit, designation_piece, strict_magasin } = payload;
-        // Recherche stricte par magasin uniquement (enseigne + ville)
+        const { enseigne, departement_ville, ref_produit, designation_piece } = payload;
         const villeKeyword = (departement_ville||'').replace(/^\d+\s*/, '').trim();
-        const enseigneKeyword = (enseigne||'').toUpperCase().replace(/SUPER\s*U/i, 'SUPER U').replace(/HYPER\s*U/i, 'HYPER U');
-
         const resultMagasin = await pool.query(
-          `SELECT * FROM dossiers 
-           WHERE departement_ville ILIKE $1
-           AND (enseigne ILIKE $2 OR $2 = '')
+          `SELECT * FROM dossiers WHERE departement_ville ILIKE $1 AND (enseigne ILIKE $2 OR $2 = '')
            ORDER BY date_traitement DESC LIMIT 20`,
-          ['%' + villeKeyword + '%', enseigneKeyword ? '%' + enseigneKeyword + '%' : '']
+          ['%' + villeKeyword + '%', enseigne ? '%' + enseigne + '%' : '']
         );
-
-        const result = { rows: resultMagasin.rows };
-        if (result.rows.length === 0) {
+        if (resultMagasin.rows.length === 0) {
           res.writeHead(200); res.end(JSON.stringify({ alerte: null })); return;
         }
-        // Demander à Claude d'analyser les similarités
-        const historique = result.rows.map(function(r) {
-          return '- ' + (r.date_reception||'?') + ' | Ref: ' + (r.ref_produit||'?') + ' | Piece: ' + (r.piece||'?') + ' | Decision: ' + (r.decision||'?');
-        }).join('\n');
-
-        const analysePayload = {
-          messages: [{
-            role: 'user',
-            content: 'Nouveau dossier SAV :\n' +
-              'Enseigne: ' + enseigne + '\n' +
-              'Ville: ' + departement_ville + '\n' +
-              'Ref produit: ' + ref_produit + '\n' +
-              'Piece: ' + designation_piece + '\n\n' +
-              'Magasin actuel : ' + enseigne + ' ' + departement_ville + '\n' +
-              'Produit actuel : ' + ref_produit + '\n' +
-              'Piece demandee actuellement : ' + designation_piece + '\n\n' +
-              'Historique des ' + result.rows.length + ' derniers dossiers de CE magasin :\n' + historique + '\n\n' +
-              'Analyse si ce magasin a deja fait une demande pour EXACTEMENT le meme probleme sur le MEME produit ET la MEME piece. ' +
-              'IMPORTANT : une demande sur un produit similaire mais pour une piece differente N EST PAS un doublon. ' +
-              'Par exemple : plateau demande en mars et pied demande en juin = deux demandes distinctes, pas un doublon. ' +
-              'Reponds UNIQUEMENT si tu identifies un vrai doublon (meme produit + meme piece ou probleme tres similaire). ' +
-              'Format : "Deja traite le JJ/MM - meme piece : [nom piece]". ' +
-              'Si pas de doublon evident : reponds AUCUN'
+        const historique = resultMagasin.rows.map(r =>
+          '- ' + (r.date_reception||'?') + ' | Ref: ' + (r.ref_produit||'?') + ' | Piece: ' + (r.piece||'?') + ' | Decision: ' + (r.decision||'?')
+        ).join('\n');
+        const aiResult = await callAnthropic({
+          messages: [{ role: 'user', content:
+            'Nouveau dossier SAV :\nEnseigne: ' + enseigne + '\nVille: ' + departement_ville +
+            '\nRef produit: ' + ref_produit + '\nPiece: ' + designation_piece + '\n\n' +
+            'Historique des ' + resultMagasin.rows.length + ' derniers dossiers de CE magasin :\n' + historique + '\n\n' +
+            'Analyse si ce magasin a deja fait une demande pour EXACTEMENT le meme probleme sur le MEME produit ET la MEME piece. ' +
+            'IMPORTANT : une demande sur un produit similaire mais pour une piece differente N EST PAS un doublon. ' +
+            'Reponds UNIQUEMENT si tu identifies un vrai doublon. Format : "Deja traite le JJ/MM - meme piece : [nom piece]". Si pas de doublon : reponds AUCUN'
           }],
           max_tokens: 100
-        };
-        const aiResult = await callAnthropic(analysePayload);
-        const aiText = aiResult.content && aiResult.content[0] ? aiResult.content[0].text.trim() : 'AUCUN';
-        const alerte = aiText === 'AUCUN' ? null : aiText;
-        res.writeHead(200); res.end(JSON.stringify({ alerte }));
+        });
+        const aiText = aiResult.content?.[0]?.text?.trim() || 'AUCUN';
+        res.writeHead(200); res.end(JSON.stringify({ alerte: aiText === 'AUCUN' ? null : aiText }));
         return;
       }
 
-      // ANALYSE AVEC NOTICE
+      // ── NUMÉRO D'ACCORD ──────────────────────────────────────
+      if (req.url === '/get-next-accord') {
+        if (!pool) {
+          // Fallback sans DB : timestamp
+          const now = new Date();
+          const yy = String(now.getFullYear()).slice(2);
+          const mm = String(now.getMonth()+1).padStart(2,'0');
+          res.writeHead(200); res.end(JSON.stringify({ accord: 'SU'+yy+mm+'001' }));
+          return;
+        }
+        const now = new Date();
+        const yy = String(now.getFullYear()).slice(2);
+        const mm = String(now.getMonth()+1).padStart(2,'0');
+        const moisAnnee = yy + mm;
+        const cle = 'accord_su';
+
+        // Récupérer ou créer le compteur, reset si nouveau mois
+        const existing = await pool.query('SELECT * FROM compteurs WHERE cle=$1', [cle]);
+        let num;
+        if (existing.rows.length === 0 || existing.rows[0].mois_annee !== moisAnnee) {
+          // Nouveau mois ou première fois : repartir à 1
+          num = 1;
+          await pool.query(`
+            INSERT INTO compteurs (cle, valeur, mois_annee) VALUES ($1, 1, $2)
+            ON CONFLICT (cle) DO UPDATE SET valeur=1, mois_annee=$2
+          `, [cle, moisAnnee]);
+        } else {
+          // Incrémenter
+          num = existing.rows[0].valeur + 1;
+          await pool.query('UPDATE compteurs SET valeur=$1 WHERE cle=$2', [num, cle]);
+        }
+        const accord = 'SU' + yy + mm + String(num).padStart(3, '0');
+        res.writeHead(200); res.end(JSON.stringify({ accord }));
+        return;
+      }
+
+      // ── ANALYSE AVEC NOTICE ───────────────────────────────
       if (req.url === '/analyze-with-notice' && payload.ref_produit) {
         const raw = payload.ref_produit.trim();
         const parts = raw.split(/\s+/);
-
-        // Candidats dans l'ordre de priorité
-        const candidates = [raw]; // ex: "12176 ANTIBES 2025"
-        // Sans année si dernière partie = 4 chiffres commençant par 20
-        if (parts.length > 1 && /^20\d{2}$/.test(parts[parts.length - 1])) {
-          candidates.push(parts.slice(0, -1).join(' ')); // "12176 ANTIBES"
-        }
-        // Ref seule (première partie)
-        if (parts.length > 1) candidates.push(parts[0]); // "12176"
-
-        console.log('Candidats notice:', candidates);
-
-        let pdfBuffer = null;
-        let foundRef = null;
+        const candidates = [raw];
+        if (parts.length > 1 && /^20\d{2}$/.test(parts[parts.length - 1]))
+          candidates.push(parts.slice(0, -1).join(' '));
+        if (parts.length > 1) candidates.push(parts[0]);
+        let pdfBuffer = null, foundRef = null;
         for (const cand of candidates) {
-          const url = GITHUB_NOTICES + encodeURIComponent(cand) + '.pdf';
-          console.log('Essai:', url);
-          const buf = await downloadBuffer(url);
+          const buf = await downloadBuffer(GITHUB_NOTICES + encodeURIComponent(cand) + '.pdf');
           if (buf) { pdfBuffer = buf; foundRef = cand; break; }
         }
-
         if (pdfBuffer) {
-          console.log('Notice trouvée:', foundRef);
           const images = await pdfToImages(pdfBuffer);
           if (images.length > 0) {
-            const noticeContent = [
-              { type: 'text', text: 'Notice technique du produit ' + foundRef + ' (' + images.length + ' pages) :' }
-            ];
+            const noticeContent = [{ type: 'text', text: 'Notice technique du produit ' + foundRef + ' (' + images.length + ' pages) :' }];
             images.forEach((img, i) => {
               noticeContent.push({ type: 'text', text: '[Page ' + (i+1) + ']' });
               noticeContent.push({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: img } });
             });
             const lastMsg = payload.messages[payload.messages.length - 1];
-            const orig = Array.isArray(lastMsg.content)
-              ? lastMsg.content : [{ type: 'text', text: lastMsg.content }];
+            const orig = Array.isArray(lastMsg.content) ? lastMsg.content : [{ type: 'text', text: lastMsg.content }];
             lastMsg.content = [...noticeContent, ...orig];
           }
         }
       }
 
-      // ANALYSE STANDARD
+      // ── ANALYSE STANDARD ──────────────────────────────────
       const data = await callAnthropic(payload);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(data));
@@ -329,5 +531,5 @@ const server = http.createServer(async function(req, res) {
 });
 
 initDB().then(() => {
-  server.listen(PORT, () => console.log('SAV Server v3.0 on port ' + PORT));
+  server.listen(PORT, () => console.log('SAV Server v4.0 on port ' + PORT));
 });
