@@ -311,8 +311,24 @@ const server = http.createServer(async function(req, res) {
         const { ref } = payload;
         if (!ref) { res.writeHead(200); res.end(JSON.stringify({ found: false })); return; }
 
-        const key = getKey(ref);
-        const data = await firebaseGet('produits/' + key);
+        // Chercher d'abord la clé exacte, sinon chercher par préfixe
+        let key = getKey(ref);
+        let data = await firebaseGet('produits/' + key);
+
+        if (!data) {
+          // Chercher toutes les clés Firebase qui commencent par la ref
+          const allProduits = await firebaseGet('produits');
+          if (allProduits) {
+            const refUpper = ref.toUpperCase().replace(/[.#$\/\[\]]/g, '_');
+            const matchKey = Object.keys(allProduits).find(k =>
+              k.toUpperCase().replace(/[.#$\/\[\]]/g, '_').startsWith(refUpper)
+            );
+            if (matchKey) {
+              key = getKey(matchKey);
+              data = allProduits[matchKey];
+            }
+          }
+        }
 
         if (!data) {
           res.writeHead(200); res.end(JSON.stringify({ found: false })); return;
