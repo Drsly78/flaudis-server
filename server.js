@@ -223,8 +223,11 @@ const server = http.createServer(async function(req, res) {
         if (!pool) { res.writeHead(200); res.end(JSON.stringify({ par_ref: [], complet: [] })); return; }
         const { enseigne, departement_ville, ref_produit } = payload;
 
-        // Extraire le nom de ville seul (sans département)
-        const ville = (departement_ville||'').replace(/^\d+\s*/, '').trim();
+        // Extraire le nom de ville seul (sans département) et normaliser
+        const ville = (departement_ville||'')
+          .replace(/^\d+\s*/, '').trim()
+          .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+          .replace(/-/g, ' ').replace(/\s+/g, ' ').trim();
 
         const deuxMoisAvant = new Date();
         deuxMoisAvant.setMonth(deuxMoisAvant.getMonth() - 2);
@@ -265,19 +268,20 @@ const server = http.createServer(async function(req, res) {
           if (!GOOGLE_SHEET_ID) return rows;
           try {
             const token = await getSheetsToken();
-            // Lire colonne B (date expé) et G (tracking) de la feuille Import SAV
-            const range = encodeURIComponent('SYSTEME U!A:H');
-            const sheetRes = await fetch(
-              `https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${range}`,
-              { headers: { Authorization: 'Bearer ' + token } }
-            );
-            const sheetData = await sheetRes.json();
-            const sheetRows = sheetData.values || [];
-            // Construire index par numéro CNB (colonne H = index 7)
+            // Lire SYSTEME U (col H=CNB, B=date_envoi, G=tracking)
+            // et REMBOURSEMENT SU (col I=CNB, A=date_recep)
+            const [sheetSav, sheetRemb] = await Promise.all([
+              fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent('SYSTEME U!A:H')}`, { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json()),
+              fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent('REMBOURSEMENT SU!A:J')}`, { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json())
+            ]);
             const cnbIndex = {};
-            sheetRows.forEach(r => {
+            (sheetSav.values || []).forEach(r => {
               const cnb = (r[7]||'').trim();
               if (cnb) cnbIndex[cnb] = { date_envoi: r[1]||'', tracking: r[6]||'' };
+            });
+            (sheetRemb.values || []).forEach(r => {
+              const cnb = (r[8]||'').trim();
+              if (cnb && !cnbIndex[cnb]) cnbIndex[cnb] = { date_envoi: r[1]||'', tracking: '' };
             });
             return rows.map(r => {
               const extra = r.numero_dossier ? cnbIndex[r.numero_dossier] : null;
@@ -382,6 +386,32 @@ const server = http.createServer(async function(req, res) {
           qty: data.qty ?? null,                  // pour produits sans pièces
           note: data.note || ''
         }));
+        return;
+      }
+
+      // ── EXPORT VERS GOOGLE SHEET ─────────────────────────
+      if (req.url === '/export-to-sheet') {
+        if (!GOOGLE_SHEET_ID) { res.writeHead(200); res.end(JSON.stringify({ ok: false, error: 'GOOGLE_SHEET_ID manquant' })); return; }
+        const { mode, row } = payload;
+        if (!row || !Array.isArray(row)) { res.writeHead(400); res.end(JSON.stringify({ error: 'row requis' })); return; }
+        try {
+          const token = await getSheetsToken();
+          const sheetName = mode === 'remb' ? 'Import Refund' : 'Import SAV';
+          const range = encodeURIComponent(sheetName + '!A:A');
+          const appendRes = await fetch(
+            `https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${range}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
+            {
+              method: 'POST',
+              headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ values: [row] })
+            }
+          );
+          const appendData = await appendRes.json();
+          if (appendData.error) throw new Error(appendData.error.message);
+          res.writeHead(200); res.end(JSON.stringify({ ok: true }));
+        } catch(e) {
+          res.writeHead(500); res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
         return;
       }
 
