@@ -114,6 +114,54 @@ function downloadBuffer(url) {
   });
 }
 
+// ── INDEX DES NOTICES (GitHub) avec matching flou ──────────
+// Les refs du fichier EAN ne correspondent pas toujours exactement aux noms
+// de fichiers (ex: ref "BLAINVILLE 3X4 A/B" → fichier "BLAINVILLE 3X4 AB.pdf",
+// un "/" étant impossible dans un nom de fichier).
+let noticeIndex = { files: null, ts: 0 };
+
+function fetchGithubJSON(url) {
+  return new Promise((resolve) => {
+    https.get(url, { headers: { 'User-Agent': 'flaudis-server', 'Accept': 'application/vnd.github+json' } }, res => {
+      if (res.statusCode !== 200) { resolve(null); return; }
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => { try { resolve(JSON.parse(Buffer.concat(chunks).toString())); } catch(e) { resolve(null); } });
+    }).on('error', () => resolve(null));
+  });
+}
+
+// Normalisation : majuscules, suppression de .pdf et de tout caractère non alphanumérique
+const normRef = s => String(s || '').toUpperCase().replace(/\.PDF$/i, '').replace(/[^A-Z0-9]/g, '');
+
+async function findNoticeFile(ref) {
+  // Index rafraîchi toutes les 10 minutes
+  if (!noticeIndex.files || Date.now() - noticeIndex.ts > 10 * 60 * 1000) {
+    const list = await fetchGithubJSON('https://api.github.com/repos/Drsly78/flaudis-notices/contents/notices');
+    if (Array.isArray(list)) {
+      noticeIndex = { files: list.filter(f => /\.pdf$/i.test(f.name)).map(f => f.name), ts: Date.now() };
+      console.log('Index notices rafraîchi:', noticeIndex.files.length, 'fichiers');
+    }
+  }
+  const files = noticeIndex.files || [];
+  const rn = normRef(ref);
+  if (!rn || files.length === 0) return null;
+
+  // 1. Égalité normalisée (BLAINVILLE 3X4 A/B ↔ BLAINVILLE 3X4 AB.pdf)
+  let m = files.filter(f => normRef(f) === rn);
+  if (m.length) return m[0];
+  // 2. Préfixe normalisé dans les deux sens — le match le plus long gagne
+  m = files.filter(f => { const fn = normRef(f); return fn.startsWith(rn) || rn.startsWith(fn); });
+  if (m.length) return m.sort((a, b) => normRef(b).length - normRef(a).length)[0];
+  // 3. Premier mot de la ref, seulement si UN SEUL fichier correspond
+  const tok = normRef(String(ref).split(/\s+/)[0]);
+  if (tok.length >= 4) {
+    m = files.filter(f => normRef(f).startsWith(tok));
+    if (m.length === 1) return m[0];
+  }
+  return null;
+}
+
 async function pdfToImages(pdfBuffer, maxPages = 20) {
   try {
     const pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
@@ -516,19 +564,30 @@ const server = http.createServer(async function(req, res) {
       let noticeInfo = null;
       if (req.url === '/analyze-with-notice' && payload.ref_produit) {
         const raw = payload.ref_produit.trim();
-        const parts = raw.split(/\s+/);
-        const candidates = [raw];
-        if (parts.length > 1 && /^20\d{2}$/.test(parts[parts.length - 1]))
-          candidates.push(parts.slice(0, -1).join(' '));
-        if (parts.length > 1) candidates.push(parts[0]);
         let pdfBuffer = null, foundRef = null;
-        for (const cand of candidates) {
-          const buf = await downloadBuffer(GITHUB_NOTICES + encodeURIComponent(cand) + '.pdf');
-          if (buf) { pdfBuffer = buf; foundRef = cand; break; }
+
+        // 1. Matching flou contre l'index réel des fichiers du repo
+        const fileName = await findNoticeFile(raw);
+        if (fileName) {
+          const buf = await downloadBuffer(GITHUB_NOTICES + encodeURIComponent(fileName));
+          if (buf) { pdfBuffer = buf; foundRef = fileName.replace(/\.pdf$/i, ''); }
+        }
+
+        // 2. Secours : anciens candidats par nom exact (si l'API GitHub est indisponible)
+        if (!pdfBuffer) {
+          const parts = raw.split(/\s+/);
+          const candidates = [raw];
+          if (parts.length > 1 && /^20\d{2}$/.test(parts[parts.length - 1]))
+            candidates.push(parts.slice(0, -1).join(' '));
+          if (parts.length > 1) candidates.push(parts[0]);
+          for (const cand of candidates) {
+            const buf = await downloadBuffer(GITHUB_NOTICES + encodeURIComponent(cand) + '.pdf');
+            if (buf) { pdfBuffer = buf; foundRef = cand; break; }
+          }
         }
         if (!pdfBuffer) {
-          noticeInfo = { attached: false, reason: 'notice introuvable sur GitHub', tried: candidates };
-          console.log('Notice INTROUVABLE pour:', raw, '— candidats testés:', candidates.join(', '));
+          noticeInfo = { attached: false, reason: 'notice introuvable sur GitHub', tried: [raw, fileName].filter(Boolean) };
+          console.log('Notice INTROUVABLE pour:', raw, '— meilleur candidat index:', fileName || 'aucun');
         } else {
           const images = await pdfToImages(pdfBuffer);
           if (images.length > 0) {
