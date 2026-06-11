@@ -513,6 +513,7 @@ const server = http.createServer(async function(req, res) {
       }
 
       // ── ANALYSE AVEC NOTICE ───────────────────────────────
+      let noticeInfo = null;
       if (req.url === '/analyze-with-notice' && payload.ref_produit) {
         const raw = payload.ref_produit.trim();
         const parts = raw.split(/\s+/);
@@ -525,7 +526,10 @@ const server = http.createServer(async function(req, res) {
           const buf = await downloadBuffer(GITHUB_NOTICES + encodeURIComponent(cand) + '.pdf');
           if (buf) { pdfBuffer = buf; foundRef = cand; break; }
         }
-        if (pdfBuffer) {
+        if (!pdfBuffer) {
+          noticeInfo = { attached: false, reason: 'notice introuvable sur GitHub', tried: candidates };
+          console.log('Notice INTROUVABLE pour:', raw, '— candidats testés:', candidates.join(', '));
+        } else {
           const images = await pdfToImages(pdfBuffer);
           if (images.length > 0) {
             const noticeContent = [{ type: 'text', text: 'Notice technique du produit ' + foundRef + ' (' + images.length + ' pages) :' }];
@@ -536,12 +540,18 @@ const server = http.createServer(async function(req, res) {
             const lastMsg = payload.messages[payload.messages.length - 1];
             const orig = Array.isArray(lastMsg.content) ? lastMsg.content : [{ type: 'text', text: lastMsg.content }];
             lastMsg.content = [...noticeContent, ...orig];
+            noticeInfo = { attached: true, ref: foundRef, pages: images.length };
+            console.log('Notice attachée:', foundRef, '—', images.length, 'pages');
+          } else {
+            noticeInfo = { attached: false, reason: 'conversion PDF echouee', ref: foundRef };
+            console.log('Notice trouvée mais conversion ÉCHOUÉE:', foundRef);
           }
         }
       }
 
       // ── ANALYSE STANDARD ──────────────────────────────────
       const data = await callAnthropic(payload);
+      if (noticeInfo) data._notice = noticeInfo;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(data));
 
