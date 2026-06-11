@@ -459,6 +459,30 @@ const server = http.createServer(async function(req, res) {
         try {
           const token = await getSheetsToken();
           const sheetName = mode === 'remb' ? 'Import Refund' : 'Import SAV';
+
+          // ── ANTI-DOUBLON ──────────────────────────────────
+          // Clé d'identification : CNB en priorité, FLA à défaut
+          // Import SAV : CNB col H (idx 7), FLA col I (idx 8)
+          // Import Refund : CNB col I (idx 8), FLA col M (idx 12)
+          const cnbIdx = mode === 'remb' ? 8 : 7;
+          const flaIdx = mode === 'remb' ? 12 : 8;
+          const key = (row[cnbIdx] || '').trim() || (row[flaIdx] || '').trim();
+          if (key) {
+            const checkRange = encodeURIComponent(sheetName + '!A:N');
+            const existing = await fetch(
+              `https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${checkRange}`,
+              { headers: { Authorization: 'Bearer ' + token } }
+            ).then(r => r.json());
+            const dup = (existing.values || []).some(r =>
+              ((r[cnbIdx] || '').trim() === key) || ((r[flaIdx] || '').trim() === key)
+            );
+            if (dup) {
+              console.log('Export ignoré — déjà présent dans', sheetName, ':', key);
+              res.writeHead(200); res.end(JSON.stringify({ ok: true, duplicate: true, key }));
+              return;
+            }
+          }
+
           const range = encodeURIComponent(sheetName + '!A:A');
           const appendRes = await fetch(
             `https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${range}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
