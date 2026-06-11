@@ -124,7 +124,7 @@ async function pdfToImages(pdfBuffer, maxPages = 20) {
     const pages = Math.min(pdf.numPages, maxPages);
     for (let i = 1; i <= pages; i++) {
       const page = await pdf.getPage(i);
-      const viewport = page.getViewport({ scale: 1.5 });
+      const viewport = page.getViewport({ scale: 2.2 }); // résolution élevée — tables de pièces lisibles
       const canvas = createCanvas(viewport.width, viewport.height);
       await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
       images.push(canvas.toBuffer('image/jpeg', { quality: 0.85 }).toString('base64'));
