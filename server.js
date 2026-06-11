@@ -162,7 +162,7 @@ async function findNoticeFile(ref) {
   return null;
 }
 
-async function pdfToImages(pdfBuffer, maxPages = 20) {
+async function pdfToImages(pdfBuffer, maxPages = 25) {
   try {
     const pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
     const { createCanvas } = require('canvas');
@@ -184,7 +184,7 @@ async function pdfToImages(pdfBuffer, maxPages = 20) {
 function callAnthropic(payload) {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-6',
       max_tokens: payload.max_tokens || 2000,
       ...(payload.system ? { system: payload.system } : {}),
       messages: payload.messages
@@ -482,7 +482,7 @@ const server = http.createServer(async function(req, res) {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01' },
           body: JSON.stringify({
-            model: 'claude-sonnet-4-20250514',
+            model: 'claude-sonnet-4-6',
             max_tokens: 2000,
             messages: [{ role: 'user', content: [{
               type: 'document',
