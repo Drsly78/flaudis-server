@@ -278,11 +278,11 @@ const server = http.createServer(async function(req, res) {
           .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
           .replace(/-/g, ' ').replace(/\s+/g, ' ').trim();
 
-        const deuxMoisAvant = new Date();
-        deuxMoisAvant.setMonth(deuxMoisAvant.getMonth() - 2);
-        const dateLimit = deuxMoisAvant.toISOString().slice(0, 10);
+        const sixMoisAvant = new Date();
+        sixMoisAvant.setMonth(sixMoisAvant.getMonth() - 6);
+        const dateLimit = sixMoisAvant.toISOString().slice(0, 10);
 
-        // Tableau 1 : même magasin + même ref, 2 mois
+        // Tableau 1 : même magasin + même ref, 6 mois
         const resRef = await pool.query(`
           SELECT * FROM dossiers
           WHERE UPPER(departement_ville) LIKE $1
@@ -298,14 +298,14 @@ const server = http.createServer(async function(req, res) {
           dateLimit
         ]);
 
-        // Tableau 2 : même magasin tous produits, 2 mois
+        // Tableau 2 : même magasin tous produits, 6 mois
         const resComplet = await pool.query(`
           SELECT * FROM dossiers
           WHERE UPPER(departement_ville) LIKE $1
           AND UPPER(enseigne) LIKE $2
           AND date_reception >= $3
           ORDER BY date_reception DESC
-          LIMIT 50
+          LIMIT 150
         `, [
           '%' + ville.toUpperCase() + '%',
           '%' + (enseigne||'').toUpperCase() + '%',
@@ -335,10 +335,23 @@ const server = http.createServer(async function(req, res) {
             return rows.map(r => {
               const extra = r.numero_dossier ? cnbIndex[r.numero_dossier] : null;
               if (extra) {
+                // SYNC RETOUR : si le Sheet a un tracking/date_envoi absent ou différent
+                // en base, on met à jour PostgreSQL (en arrière-plan, sans bloquer)
+                const newTracking = extra.tracking || r.tracking || '';
+                const newEnvoi = extra.date_envoi || r.date_envoi || '';
+                if (pool && r.numero_dossier &&
+                    ((extra.tracking && extra.tracking !== (r.tracking || '')) ||
+                     (extra.date_envoi && extra.date_envoi !== (r.date_envoi || '')))) {
+                  pool.query(
+                    'UPDATE dossiers SET tracking = $1, date_envoi = $2 WHERE numero_dossier = $3',
+                    [newTracking, newEnvoi, r.numero_dossier]
+                  ).then(() => console.log('Sync tracking → DB:', r.numero_dossier, newTracking))
+                   .catch(e => console.error('Sync tracking erreur:', e.message));
+                }
                 return {
                   ...r,
-                  date_envoi: extra.date_envoi || r.date_envoi || '',
-                  tracking: extra.tracking || r.tracking || ''
+                  date_envoi: newEnvoi,
+                  tracking: newTracking
                 };
               }
               return r;
