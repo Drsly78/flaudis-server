@@ -114,14 +114,15 @@ function downloadBuffer(url) {
   });
 }
 
-async function pdfToImages(pdfBuffer) {
+async function pdfToImages(pdfBuffer, maxPages = 20) {
   try {
     const pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
     const { createCanvas } = require('canvas');
     const data = new Uint8Array(pdfBuffer);
     const pdf = await pdfjsLib.getDocument({ data }).promise;
     const images = [];
-    for (let i = 1; i <= pdf.numPages; i++) {
+    const pages = Math.min(pdf.numPages, maxPages);
+    for (let i = 1; i <= pages; i++) {
       const page = await pdf.getPage(i);
       const viewport = page.getViewport({ scale: 1.5 });
       const canvas = createCanvas(viewport.width, viewport.height);
@@ -501,38 +502,13 @@ const server = http.createServer(async function(req, res) {
       }
 
       // ── NUMÉRO D'ACCORD ──────────────────────────────────────
+      // Format : SU + année (2 chiffres) + mois (2 chiffres) — ex: SU2606
+      // Identique pour tous les dossiers du mois, change automatiquement chaque mois
       if (req.url === '/get-next-accord') {
-        if (!pool) {
-          // Fallback sans DB : timestamp
-          const now = new Date();
-          const yy = String(now.getFullYear()).slice(2);
-          const mm = String(now.getMonth()+1).padStart(2,'0');
-          res.writeHead(200); res.end(JSON.stringify({ accord: 'SU'+yy+mm+'001' }));
-          return;
-        }
         const now = new Date();
         const yy = String(now.getFullYear()).slice(2);
         const mm = String(now.getMonth()+1).padStart(2,'0');
-        const moisAnnee = yy + mm;
-        const cle = 'accord_su';
-
-        // Récupérer ou créer le compteur, reset si nouveau mois
-        const existing = await pool.query('SELECT * FROM compteurs WHERE cle=$1', [cle]);
-        let num;
-        if (existing.rows.length === 0 || existing.rows[0].mois_annee !== moisAnnee) {
-          // Nouveau mois ou première fois : repartir à 1
-          num = 1;
-          await pool.query(`
-            INSERT INTO compteurs (cle, valeur, mois_annee) VALUES ($1, 1, $2)
-            ON CONFLICT (cle) DO UPDATE SET valeur=1, mois_annee=$2
-          `, [cle, moisAnnee]);
-        } else {
-          // Incrémenter
-          num = existing.rows[0].valeur + 1;
-          await pool.query('UPDATE compteurs SET valeur=$1 WHERE cle=$2', [num, cle]);
-        }
-        const accord = 'SU' + yy + mm + String(num).padStart(3, '0');
-        res.writeHead(200); res.end(JSON.stringify({ accord }));
+        res.writeHead(200); res.end(JSON.stringify({ accord: 'SU' + yy + mm }));
         return;
       }
 
