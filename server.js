@@ -165,6 +165,27 @@ function coreNoticeMatch(files, rn) {
   return null;
 }
 
+// Candidats de recherche pour une ref : complète, segments "/", sans couleurs
+function refCandidates(ref) {
+  const raw = String(ref || '').trim();
+  const candidates = [raw];
+  if (raw.includes('/')) raw.split('/').forEach(s => { s = s.trim(); if (s) candidates.push(s); });
+  const sansCouleur = raw.replace(COLOR_WORDS, '').replace(/[\s\-_,]+$/, '').trim();
+  if (sansCouleur && sansCouleur !== raw) candidates.push(sansCouleur);
+  return candidates;
+}
+
+// Meilleur match d'une ref parmi une liste de noms (notices ou clés Firebase)
+function findBestMatch(names, ref) {
+  let best = null;
+  for (const c of refCandidates(ref)) {
+    const r = coreNoticeMatch(names, normRef(c));
+    if (r && (!best || r.score > best.score)) best = r;
+    if (best && best.score === 99) break;
+  }
+  return best ? best.file : null;
+}
+
 async function findNoticeFile(ref) {
   // Index rafraîchi toutes les 10 minutes
   if (!noticeIndex.files || Date.now() - noticeIndex.ts > 10 * 60 * 1000) {
@@ -176,21 +197,7 @@ async function findNoticeFile(ref) {
   }
   const files = noticeIndex.files || [];
   if (files.length === 0) return null;
-
-  // Candidats : ref complète, chaque segment séparé par "/", ref sans mots de couleur
-  const raw = String(ref || '').trim();
-  const candidates = [raw];
-  if (raw.includes('/')) raw.split('/').forEach(s => { s = s.trim(); if (s) candidates.push(s); });
-  const sansCouleur = raw.replace(COLOR_WORDS, '').replace(/[\s\-_,]+$/, '').trim();
-  if (sansCouleur && sansCouleur !== raw) candidates.push(sansCouleur);
-
-  let best = null;
-  for (const c of candidates) {
-    const r = coreNoticeMatch(files, normRef(c));
-    if (r && (!best || r.score > best.score)) best = r;
-    if (best && best.score === 99) break;
-  }
-  return best ? best.file : null;
+  return findBestMatch(files, ref);
 }
 
 async function pdfToImages(pdfBuffer, maxPages = 25) {
@@ -413,14 +420,14 @@ const server = http.createServer(async function(req, res) {
         let data = await firebaseGet('produits/' + key);
 
         if (!data) {
-          // Chercher toutes les clés Firebase qui commencent par la ref
+          // Matching flou contre les clés Firebase réelles — même algorithme
+          // que les notices (les clés entrepôt viennent des noms de notices)
           const allProduits = await firebaseGet('produits');
           if (allProduits) {
-            const refUpper = ref.toUpperCase().replace(/[.#$\/\[\]]/g, '_');
-            const matchKey = Object.keys(allProduits).find(k =>
-              k.toUpperCase().replace(/[.#$\/\[\]]/g, '_').startsWith(refUpper)
-            );
+            const keys = Object.keys(allProduits);
+            const matchKey = findBestMatch(keys, ref);
             if (matchKey) {
+              console.log('Entrepôt — match flou:', ref, '→', matchKey);
               key = getKey(matchKey);
               data = allProduits[matchKey];
             }
