@@ -133,6 +133,37 @@ function fetchGithubJSON(url) {
 
 // Normalisation : majuscules, suppression de .pdf et de tout caractère non alphanumérique
 const normRef = s => String(s || '').toUpperCase().replace(/\.PDF$/i, '').replace(/[^A-Z0-9]/g, '');
+const COLOR_WORDS = /\b(BLEU|GRIS|ROSE|ROUGE|VERT|KAKI|BLANC|NOIR|BEIGE|TAUPE|TERRACOTTA|MULTICOLORE?|WARM|WHITE|COLD|ANTHRACITE|CHENE|NATUREL|MARRON|JAUNE|ORANGE|VIOLET|TURQUOISE)\b/gi;
+const yearOf = f => { const m = String(f).match(/(20\d\d)/); return m ? parseInt(m[1]) : 0; };
+
+// Cœur du matching sur une chaîne normalisée — 4 niveaux
+function coreNoticeMatch(files, rn) {
+  if (!rn || rn.length < 3) return null;
+  // 1. Égalité normalisée
+  let m = files.filter(f => normRef(f) === rn);
+  if (m.length) return { file: m.sort((a,b) => yearOf(b)-yearOf(a))[0], score: 99 };
+  // 2. Préfixe normalisé bidirectionnel
+  m = files.filter(f => { const fn = normRef(f); return fn.startsWith(rn) || rn.startsWith(fn); });
+  if (m.length) return { file: m.sort((a,b) => (normRef(b).length - normRef(a).length) || (yearOf(b)-yearOf(a)))[0], score: 98 };
+  // 3. Ref contenue dans le nom (fichiers multi-références)
+  if (rn.length >= 6) {
+    m = files.filter(f => normRef(f).includes(rn));
+    if (m.length) return { file: m.sort((a,b) => (normRef(a).length - normRef(b).length) || (yearOf(b)-yearOf(a)))[0], score: 97 };
+  }
+  // 4. Plus long préfixe commun (gère suffixes divergents : A/B, _8, années…)
+  let best = null, bs = 0;
+  for (const f of files) {
+    const fn = normRef(f).replace(/20\d\d$/, '');
+    let i = 0;
+    while (i < rn.length && i < fn.length && rn[i] === fn[i]) i++;
+    if (i > bs || (i === bs && best && yearOf(f) > yearOf(best))) { best = f; bs = i; }
+  }
+  if (best) {
+    const fn = normRef(best).replace(/20\d\d$/, '');
+    if (bs >= 6 && bs >= 0.65 * Math.min(rn.length, fn.length)) return { file: best, score: bs };
+  }
+  return null;
+}
 
 async function findNoticeFile(ref) {
   // Index rafraîchi toutes les 10 minutes
@@ -144,22 +175,22 @@ async function findNoticeFile(ref) {
     }
   }
   const files = noticeIndex.files || [];
-  const rn = normRef(ref);
-  if (!rn || files.length === 0) return null;
+  if (files.length === 0) return null;
 
-  // 1. Égalité normalisée (BLAINVILLE 3X4 A/B ↔ BLAINVILLE 3X4 AB.pdf)
-  let m = files.filter(f => normRef(f) === rn);
-  if (m.length) return m[0];
-  // 2. Préfixe normalisé dans les deux sens — le match le plus long gagne
-  m = files.filter(f => { const fn = normRef(f); return fn.startsWith(rn) || rn.startsWith(fn); });
-  if (m.length) return m.sort((a, b) => normRef(b).length - normRef(a).length)[0];
-  // 3. Premier mot de la ref, seulement si UN SEUL fichier correspond
-  const tok = normRef(String(ref).split(/\s+/)[0]);
-  if (tok.length >= 4) {
-    m = files.filter(f => normRef(f).startsWith(tok));
-    if (m.length === 1) return m[0];
+  // Candidats : ref complète, chaque segment séparé par "/", ref sans mots de couleur
+  const raw = String(ref || '').trim();
+  const candidates = [raw];
+  if (raw.includes('/')) raw.split('/').forEach(s => { s = s.trim(); if (s) candidates.push(s); });
+  const sansCouleur = raw.replace(COLOR_WORDS, '').replace(/[\s\-_,]+$/, '').trim();
+  if (sansCouleur && sansCouleur !== raw) candidates.push(sansCouleur);
+
+  let best = null;
+  for (const c of candidates) {
+    const r = coreNoticeMatch(files, normRef(c));
+    if (r && (!best || r.score > best.score)) best = r;
+    if (best && best.score === 99) break;
   }
-  return null;
+  return best ? best.file : null;
 }
 
 async function pdfToImages(pdfBuffer, maxPages = 25) {
