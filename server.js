@@ -200,7 +200,7 @@ async function findNoticeFile(ref) {
   return findBestMatch(files, ref);
 }
 
-async function pdfToImages(pdfBuffer, maxPages = 25) {
+async function pdfToImages(pdfBuffer, maxPages = 14) {
   try {
     const pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
     const { createCanvas } = require('canvas');
@@ -209,18 +209,26 @@ async function pdfToImages(pdfBuffer, maxPages = 25) {
     const images = [];
     const pages = Math.min(pdf.numPages, maxPages);
     for (let i = 1; i <= pages; i++) {
+      let canvas = null;
       try {
         const page = await pdf.getPage(i);
-        const viewport = page.getViewport({ scale: 2.2 }); // résolution élevée — tables de pièces lisibles
-        const canvas = createCanvas(viewport.width, viewport.height);
-        // Garde-fou : une page qui ne rend pas en 30s est abandonnée (pas toute la notice)
+        // Résolution adaptative : ~1600px de large max. Net pour lire les
+        // tables de pièces, sans saturer la RAM (scale 2.2 faisait crasher Railway).
+        const base = page.getViewport({ scale: 1 });
+        const scale = Math.min(1.8, Math.max(1.2, 1600 / base.width));
+        const viewport = page.getViewport({ scale });
+        canvas = createCanvas(viewport.width, viewport.height);
         await Promise.race([
           page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise,
           new Promise((_, rej) => setTimeout(() => rej(new Error('render timeout p' + i)), 30000))
         ]);
-        images.push(canvas.toBuffer('image/jpeg', { quality: 0.85 }).toString('base64'));
+        images.push(canvas.toBuffer('image/jpeg', { quality: 0.8 }).toString('base64'));
+        page.cleanup(); // libère la mémoire interne de la page
       } catch(pageErr) {
         console.warn('pdfToImages — page', i, 'ignorée:', pageErr.message);
+      } finally {
+        // Libère explicitement le canvas (gros consommateur RAM) avant la page suivante
+        if (canvas) { canvas.width = 0; canvas.height = 0; canvas = null; }
       }
     }
     return images;
