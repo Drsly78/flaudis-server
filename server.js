@@ -215,7 +215,7 @@ async function pdfToImages(pdfBuffer, maxPages = 14) {
         // Résolution adaptative : ~1600px de large max. Net pour lire les
         // tables de pièces, sans saturer la RAM (scale 2.2 faisait crasher Railway).
         const base = page.getViewport({ scale: 1 });
-        const scale = Math.min(1.8, Math.max(1.2, 1600 / base.width));
+        const scale = 1.5; // résolution d'origine qui fonctionnait
         const viewport = page.getViewport({ scale });
         canvas = createCanvas(viewport.width, viewport.height);
         await Promise.race([
@@ -235,8 +235,7 @@ async function pdfToImages(pdfBuffer, maxPages = 14) {
   } catch(e) { console.error('pdfToImages error:', e.message); return []; }
 }
 
-function callAnthropic(payload, attempt = 1) {
-  const MAX_ATTEMPTS = 3;
+function callAnthropic(payload) {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify({
       model: 'claude-sonnet-4-6',
@@ -254,26 +253,12 @@ function callAnthropic(payload, attempt = 1) {
         'anthropic-version': '2023-06-01',
         'Content-Length': Buffer.byteLength(data)
       },
-      timeout: 120000 // 2 min : couvre les grosses notices sans rester bloqué indéfiniment
-    };
-    const retryable = (reason) => {
-      if (attempt < MAX_ATTEMPTS) {
-        const wait = attempt * 4000; // 4s, puis 8s
-        console.warn(`callAnthropic tentative ${attempt} échouée (${reason}) — réessai dans ${wait/1000}s`);
-        setTimeout(() => callAnthropic(payload, attempt + 1).then(resolve).catch(reject), wait);
-        return true;
-      }
-      return false;
+      timeout: 120000 // 2 min, sans rester bloqué indéfiniment
     };
     const req = https.request(options, res => {
       let response = '';
       res.on('data', c => { response += c; });
       res.on('end', () => {
-        // Surcharge (429/529) ou erreur serveur (5xx) → réessai
-        if (res.statusCode === 429 || res.statusCode >= 500) {
-          if (retryable('HTTP ' + res.statusCode)) return;
-          return reject(new Error('API Claude surchargée (HTTP ' + res.statusCode + ') après ' + MAX_ATTEMPTS + ' tentatives'));
-        }
         if (res.statusCode !== 200) {
           return reject(new Error('API Claude HTTP ' + res.statusCode + ' : ' + response.slice(0, 200)));
         }
@@ -281,8 +266,8 @@ function callAnthropic(payload, attempt = 1) {
         catch(e) { reject(new Error('Réponse API illisible : ' + response.slice(0, 120))); }
       });
     });
-    req.on('timeout', () => { req.destroy(); if (!retryable('timeout 2min')) reject(new Error('Timeout API Claude (2 min)')); });
-    req.on('error', err => { if (!retryable(err.message)) reject(err); });
+    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout API Claude (2 min)')); });
+    req.on('error', reject);
     req.write(data);
     req.end();
   });
@@ -304,8 +289,23 @@ const server = http.createServer(async function(req, res) {
   }
 
   let body = '';
-  req.on('data', chunk => { body += chunk; });
+  let bodySize = 0;
+  const MAX_BODY = 12 * 1024 * 1024; // 12 Mo : au-delà on refuse plutôt que crasher
+  let bodyTooBig = false;
+  req.on('data', chunk => {
+    bodySize += chunk.length;
+    if (bodySize > MAX_BODY) {
+      bodyTooBig = true;
+      return; // on arrête d'accumuler en mémoire
+    }
+    body += chunk;
+  });
   req.on('end', async () => {
+    if (bodyTooBig) {
+      res.writeHead(413, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Requête trop volumineuse (pièces jointes). Réduisez le nombre de photos/PDF.' }));
+      return;
+    }
     let payload;
     try { payload = JSON.parse(body); }
     catch(e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid JSON' })); return; }
@@ -678,7 +678,9 @@ const server = http.createServer(async function(req, res) {
       // ⛔ NOTICES TEMPORAIREMENT DÉSACTIVÉES (économie RAM Railway)
       // Pour réactiver : passer NOTICES_ENABLED à true (ou définir la
       // variable d'env NOTICES_ENABLED=true dans Railway).
-      const NOTICES_ENABLED = (process.env.NOTICES_ENABLED === 'true');
+      // Notices actives par défaut. Pour les couper sans toucher au code :
+      // définir NOTICES_ENABLED=false dans les variables Railway.
+      const NOTICES_ENABLED = (process.env.NOTICES_ENABLED !== 'false');
 
       let noticeInfo = null;
       if (NOTICES_ENABLED && req.url === '/analyze-with-notice' && payload.ref_produit) {
