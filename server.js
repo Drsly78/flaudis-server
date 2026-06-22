@@ -209,17 +209,26 @@ async function pdfToImages(pdfBuffer, maxPages = 25) {
     const images = [];
     const pages = Math.min(pdf.numPages, maxPages);
     for (let i = 1; i <= pages; i++) {
-      const page = await pdf.getPage(i);
-      const viewport = page.getViewport({ scale: 2.2 }); // résolution élevée — tables de pièces lisibles
-      const canvas = createCanvas(viewport.width, viewport.height);
-      await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
-      images.push(canvas.toBuffer('image/jpeg', { quality: 0.85 }).toString('base64'));
+      try {
+        const page = await pdf.getPage(i);
+        const viewport = page.getViewport({ scale: 2.2 }); // résolution élevée — tables de pièces lisibles
+        const canvas = createCanvas(viewport.width, viewport.height);
+        // Garde-fou : une page qui ne rend pas en 30s est abandonnée (pas toute la notice)
+        await Promise.race([
+          page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise,
+          new Promise((_, rej) => setTimeout(() => rej(new Error('render timeout p' + i)), 30000))
+        ]);
+        images.push(canvas.toBuffer('image/jpeg', { quality: 0.85 }).toString('base64'));
+      } catch(pageErr) {
+        console.warn('pdfToImages — page', i, 'ignorée:', pageErr.message);
+      }
     }
     return images;
   } catch(e) { console.error('pdfToImages error:', e.message); return []; }
 }
 
-function callAnthropic(payload) {
+function callAnthropic(payload, attempt = 1) {
+  const MAX_ATTEMPTS = 3;
   return new Promise((resolve, reject) => {
     const data = JSON.stringify({
       model: 'claude-sonnet-4-6',
@@ -236,14 +245,36 @@ function callAnthropic(payload) {
         'x-api-key': API_KEY,
         'anthropic-version': '2023-06-01',
         'Content-Length': Buffer.byteLength(data)
+      },
+      timeout: 120000 // 2 min : couvre les grosses notices sans rester bloqué indéfiniment
+    };
+    const retryable = (reason) => {
+      if (attempt < MAX_ATTEMPTS) {
+        const wait = attempt * 4000; // 4s, puis 8s
+        console.warn(`callAnthropic tentative ${attempt} échouée (${reason}) — réessai dans ${wait/1000}s`);
+        setTimeout(() => callAnthropic(payload, attempt + 1).then(resolve).catch(reject), wait);
+        return true;
       }
+      return false;
     };
     const req = https.request(options, res => {
       let response = '';
       res.on('data', c => { response += c; });
-      res.on('end', () => { try { resolve(JSON.parse(response)); } catch(e) { reject(e); } });
+      res.on('end', () => {
+        // Surcharge (429/529) ou erreur serveur (5xx) → réessai
+        if (res.statusCode === 429 || res.statusCode >= 500) {
+          if (retryable('HTTP ' + res.statusCode)) return;
+          return reject(new Error('API Claude surchargée (HTTP ' + res.statusCode + ') après ' + MAX_ATTEMPTS + ' tentatives'));
+        }
+        if (res.statusCode !== 200) {
+          return reject(new Error('API Claude HTTP ' + res.statusCode + ' : ' + response.slice(0, 200)));
+        }
+        try { resolve(JSON.parse(response)); }
+        catch(e) { reject(new Error('Réponse API illisible : ' + response.slice(0, 120))); }
+      });
     });
-    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); if (!retryable('timeout 2min')) reject(new Error('Timeout API Claude (2 min)')); });
+    req.on('error', err => { if (!retryable(err.message)) reject(err); });
     req.write(data);
     req.end();
   });
