@@ -675,8 +675,13 @@ const server = http.createServer(async function(req, res) {
       }
 
       // ── ANALYSE AVEC NOTICE ───────────────────────────────
+      // ⛔ NOTICES TEMPORAIREMENT DÉSACTIVÉES (économie RAM Railway)
+      // Pour réactiver : passer NOTICES_ENABLED à true (ou définir la
+      // variable d'env NOTICES_ENABLED=true dans Railway).
+      const NOTICES_ENABLED = (process.env.NOTICES_ENABLED === 'true');
+
       let noticeInfo = null;
-      if (req.url === '/analyze-with-notice' && payload.ref_produit) {
+      if (NOTICES_ENABLED && req.url === '/analyze-with-notice' && payload.ref_produit) {
         const raw = payload.ref_produit.trim();
         let pdfBuffer = null, foundRef = null;
 
