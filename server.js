@@ -765,8 +765,15 @@ Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
       if (req.url === '/trackings-apply') {
         if (!GOOGLE_SHEET_ID) { res.writeHead(500); res.end(JSON.stringify({ error: 'GOOGLE_SHEET_ID manquant' })); return; }
         const items = Array.isArray(payload.items) ? payload.items : [];
-        const dateExpe = (payload.date_expe || '').trim();
+        let dateExpe = (payload.date_expe || '').trim();
         if (!items.length || !dateExpe) { res.writeHead(400); res.end(JSON.stringify({ error: 'items et date_expe requis' })); return; }
+        // Format maison du tableau : JJ/MM/AA (ex 22/07/26)
+        const dm = dateExpe.match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})$/);
+        if (dm) {
+          const jj = dm[1].padStart(2, '0'), mm = dm[2].padStart(2, '0');
+          const aa = dm[3].length === 4 ? dm[3].slice(2) : dm[3].padStart(2, '0');
+          dateExpe = jj + '/' + mm + '/' + aa;
+        }
         const token = await getSheetsToken();
         const applied = [], skipped = [];
         const valueUpdates = [];
@@ -793,7 +800,7 @@ Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
           await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchUpdate`, {
             method: 'POST',
             headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ valueInputOption: 'USER_ENTERED', data: valueUpdates })
+            body: JSON.stringify({ valueInputOption: 'RAW', data: valueUpdates })
           });
         }
 
