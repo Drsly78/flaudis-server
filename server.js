@@ -44,6 +44,14 @@ async function initDB() {
         mois_annee VARCHAR(10)
       )
     `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS produits_kb (
+        ref TEXT PRIMARY KEY,
+        notice_file TEXT,
+        transcription TEXT,
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
     console.log('Table dossiers OK');
   } catch(e) { console.error('DB init error:', e.message); }
 }
@@ -725,6 +733,39 @@ const server = http.createServer(async function(req, res) {
 
         // 1. Matching flou contre l'index réel des fichiers du repo
         const fileName = await findNoticeFile(raw);
+
+        // ── 🧠 CERVEAU PRODUIT : transcription mémorisée ──────────
+        // Si on a déjà lu cette notice (même fichier, < 45 jours), on injecte
+        // la transcription texte au lieu de reconvertir le PDF en images.
+        // payload.force_reread = true (bouton "Relire") court-circuite le cache.
+        let kbHit = null;
+        if (pool && fileName && !payload.force_reread) {
+          try {
+            const kb = await pool.query('SELECT notice_file, transcription, updated_at FROM produits_kb WHERE ref = $1', [raw]);
+            if (kb.rows.length) {
+              const row = kb.rows[0];
+              const ageJours = (Date.now() - new Date(row.updated_at).getTime()) / 86400000;
+              if (row.notice_file === fileName && ageJours < 45 &&
+                  row.transcription && row.transcription.length > 150 &&
+                  (row.transcription.match(/ILLISIBLE/g) || []).length < 5) {
+                kbHit = row;
+              }
+            }
+          } catch(e) { console.warn('KB lecture:', e.message); }
+        }
+
+        if (kbHit) {
+          const noticeContent = [{ type: 'text', text:
+            'NOTICE TECHNIQUE du produit ' + raw + ' — TRANSCRIPTION MÉMORISÉE (lue précédemment sur le fichier "' + kbHit.notice_file + '") :\n\n' +
+            kbHit.transcription +
+            '\n\nCette transcription est ta référence fiable des repères, désignations et quantités de ce produit — elle remplace les pages images de la notice. Dans ta réponse, la section TRANSCRIPTION peut reprendre ces données telles quelles.' }];
+          const lastMsg = payload.messages[payload.messages.length - 1];
+          const orig = Array.isArray(lastMsg.content) ? lastMsg.content : [{ type: 'text', text: lastMsg.content }];
+          lastMsg.content = [...noticeContent, ...orig];
+          noticeInfo = { attached: true, ref: kbHit.notice_file.replace(/\.pdf$/i, ''), pages: 0, cached: true };
+          console.log('🧠 Cerveau produit — transcription mémorisée injectée pour:', raw);
+        } else {
+
         if (fileName) {
           const buf = await downloadBuffer(GITHUB_NOTICES + encodeURIComponent(fileName));
           if (buf) { pdfBuffer = buf; foundRef = fileName.replace(/\.pdf$/i, ''); }
@@ -763,10 +804,36 @@ const server = http.createServer(async function(req, res) {
             console.log('Notice trouvée mais conversion ÉCHOUÉE:', foundRef);
           }
         }
+        } // fin else kbHit (chemin lecture complète)
       }
 
       // ── ANALYSE STANDARD ──────────────────────────────────
       const data = await callAnthropic(payload);
+
+      // ── 🧠 CERVEAU PRODUIT : mémoriser la transcription ───────
+      // Après une lecture COMPLÈTE (images) réussie, on extrait la section
+      // TRANSCRIPTION de la réponse et on la sauvegarde pour les prochains scans.
+      // En arrière-plan, sans bloquer ni faire échouer la réponse.
+      if (pool && noticeInfo && noticeInfo.attached && !noticeInfo.cached && payload.ref_produit) {
+        try {
+          const full = (data.content || []).map(b => b.text || '').join('');
+          const m = full.match(/TRANSCRIPTION\s*[—–:-]*\s*([\s\S]*?)(?=IDENTIFICATION|```|\{\s*")/);
+          const transcription = m ? m[1].trim().slice(0, 8000) : '';
+          const illisibles = (transcription.match(/ILLISIBLE/g) || []).length;
+          if (transcription.length > 150 && illisibles < 5) {
+            pool.query(`
+              INSERT INTO produits_kb (ref, notice_file, transcription, updated_at)
+              VALUES ($1, $2, $3, NOW())
+              ON CONFLICT (ref) DO UPDATE SET notice_file = $2, transcription = $3, updated_at = NOW()
+            `, [payload.ref_produit.trim(), noticeInfo.ref + '.pdf', transcription])
+              .then(() => console.log('🧠 Transcription mémorisée:', payload.ref_produit, '(' + transcription.length + ' car.)'))
+              .catch(e => console.warn('KB sauvegarde:', e.message));
+          } else {
+            console.log('🧠 Transcription non mémorisée (trop courte ou illisible):', payload.ref_produit);
+          }
+        } catch(e) { console.warn('KB extraction:', e.message); }
+      }
+
       if (noticeInfo) data._notice = noticeInfo;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(data));
