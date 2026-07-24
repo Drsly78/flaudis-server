@@ -678,6 +678,42 @@ const server = http.createServer(async function(req, res) {
       // ⛔ NOTICES TEMPORAIREMENT DÉSACTIVÉES (économie RAM Railway)
       // Pour réactiver : passer NOTICES_ENABLED à true (ou définir la
       // variable d'env NOTICES_ENABLED=true dans Railway).
+      // ── BILAN PRODUIT (lecture seule) ────────────────────────
+      // Statistiques SAV d'une référence : volumes, décisions, pièces, tendance
+      if (req.url === '/bilan-produit') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ error: 'no db' })); return; }
+        const ref = (payload.ref || '').trim();
+        if (!ref) { res.writeHead(400); res.end(JSON.stringify({ error: 'ref requise' })); return; }
+        // Préfixe : couvre les variantes couleur (QD101-3/6 → QD101-3/6 VERT KAKI…)
+        const q = await pool.query(
+          `SELECT numero_dossier, piece, decision, date_reception, departement_ville, tracking
+           FROM dossiers
+           WHERE ref_produit ILIKE $1
+           ORDER BY date_reception DESC NULLS LAST
+           LIMIT 500`, [ref + '%']);
+        const rows = q.rows || [];
+
+        const stats = { ref, total: rows.length, envois: 0, remboursements: 0, top_pieces: [], par_mois: [], derniers: [] };
+        const pieces = {}, mois = {};
+        rows.forEach(r => {
+          if (r.decision === 'remboursement') stats.remboursements++; else stats.envois++;
+          const p = (r.piece || '').trim();
+          if (p) pieces[p.toUpperCase()] = (pieces[p.toUpperCase()] || 0) + 1;
+          const m = (r.date_reception || '').slice(0, 7);
+          if (/^\d{4}-\d{2}$/.test(m)) mois[m] = (mois[m] || 0) + 1;
+        });
+        stats.top_pieces = Object.entries(pieces).sort((a, b) => b[1] - a[1]).slice(0, 10)
+          .map(([piece, n]) => ({ piece, n }));
+        stats.par_mois = Object.entries(mois).sort((a, b) => a[0].localeCompare(b[0]))
+          .map(([m, n]) => ({ mois: m, n }));
+        stats.derniers = rows.slice(0, 30).map(r => ({
+          date: r.date_reception, ville: r.departement_ville, piece: r.piece, decision: r.decision
+        }));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(stats));
+        return;
+      }
+
       // Notices actives par défaut. Pour les couper sans toucher au code :
       // définir NOTICES_ENABLED=false dans les variables Railway.
       const NOTICES_ENABLED = (process.env.NOTICES_ENABLED !== 'false');
