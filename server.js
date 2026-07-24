@@ -370,11 +370,12 @@ const server = http.createServer(async function(req, res) {
           .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
           .replace(/-/g, ' ').replace(/\s+/g, ' ').trim();
 
+        const HIST_MOIS = 4; // fenêtre d'historique magasin affichée dans l'app
         const sixMoisAvant = new Date();
-        sixMoisAvant.setMonth(sixMoisAvant.getMonth() - 6);
+        sixMoisAvant.setMonth(sixMoisAvant.getMonth() - HIST_MOIS);
         const dateLimit = sixMoisAvant.toISOString().slice(0, 10);
 
-        // Tableau 1 : même magasin + même ref, 6 mois
+        // Tableau 1 : même magasin + même ref, sur la fenêtre HIST_MOIS
         const resRef = await pool.query(`
           SELECT * FROM dossiers
           WHERE UPPER(departement_ville) LIKE $1
@@ -390,7 +391,7 @@ const server = http.createServer(async function(req, res) {
           dateLimit
         ]);
 
-        // Tableau 2 : même magasin tous produits, 6 mois
+        // Tableau 2 : même magasin tous produits, sur la fenêtre HIST_MOIS
         const resComplet = await pool.query(`
           SELECT * FROM dossiers
           WHERE UPPER(departement_ville) LIKE $1
@@ -693,6 +694,30 @@ const server = http.createServer(async function(req, res) {
       // ⛔ NOTICES TEMPORAIREMENT DÉSACTIVÉES (économie RAM Railway)
       // Pour réactiver : passer NOTICES_ENABLED à true (ou définir la
       // variable d'env NOTICES_ENABLED=true dans Railway).
+      // ── CERVEAU : état de la mémoire d'une référence ──────────
+      if (req.url === '/kb-status') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ kb: null })); return; }
+        const kref = (payload.ref || '').trim();
+        const kq = await pool.query(
+          'SELECT ref, notice_file, updated_at, LENGTH(transcription) AS taille, transcription FROM produits_kb WHERE ref = $1', [kref]);
+        const row = kq.rows[0] || null;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ kb: row ? {
+          ref: row.ref, notice_file: row.notice_file, updated_at: row.updated_at,
+          taille: row.taille, extrait: (row.transcription || '').slice(0, 600)
+        } : null }));
+        return;
+      }
+      // Liste complète des refs mémorisées
+      if (req.url === '/kb-list') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ items: [] })); return; }
+        const kl = await pool.query(
+          'SELECT ref, notice_file, updated_at, LENGTH(transcription) AS taille FROM produits_kb ORDER BY updated_at DESC LIMIT 200');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ items: kl.rows }));
+        return;
+      }
+
       // ── CERVEAU : associations manuelles ref → notice ─────────
       if (req.url === '/notices-overrides') {
         if (!pool) { res.writeHead(200); res.end(JSON.stringify({ overrides: [] })); return; }
