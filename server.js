@@ -45,6 +45,13 @@ async function initDB() {
       )
     `);
     await pool.query(`
+      CREATE TABLE IF NOT EXISTS notices_override (
+        ref TEXT PRIMARY KEY,
+        notice_file TEXT NOT NULL,
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS produits_kb (
         ref TEXT PRIMARY KEY,
         notice_file TEXT,
@@ -686,6 +693,47 @@ const server = http.createServer(async function(req, res) {
       // ⛔ NOTICES TEMPORAIREMENT DÉSACTIVÉES (économie RAM Railway)
       // Pour réactiver : passer NOTICES_ENABLED à true (ou définir la
       // variable d'env NOTICES_ENABLED=true dans Railway).
+      // ── CERVEAU : associations manuelles ref → notice ─────────
+      if (req.url === '/notices-overrides') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ overrides: [] })); return; }
+        const q = await pool.query('SELECT ref, notice_file, updated_at FROM notices_override ORDER BY ref');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ overrides: q.rows }));
+        return;
+      }
+      if (req.url === '/notices-override-set') {
+        if (!pool) { res.writeHead(500); res.end(JSON.stringify({ error: 'no db' })); return; }
+        const oref = (payload.ref || '').trim();
+        const ofile = (payload.notice_file || '').trim();
+        if (!oref || !ofile) { res.writeHead(400); res.end(JSON.stringify({ error: 'ref et notice_file requis' })); return; }
+        await pool.query(`
+          INSERT INTO notices_override (ref, notice_file, updated_at) VALUES ($1, $2, NOW())
+          ON CONFLICT (ref) DO UPDATE SET notice_file = $2, updated_at = NOW()`, [oref, ofile]);
+        // L'association change la notice → purger la transcription mémorisée de cette ref
+        await pool.query('DELETE FROM produits_kb WHERE ref = $1', [oref]).catch(() => {});
+        console.log('Association manuelle:', oref, '→', ofile);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      if (req.url === '/notices-override-delete') {
+        if (!pool) { res.writeHead(500); res.end(JSON.stringify({ error: 'no db' })); return; }
+        const dref = (payload.ref || '').trim();
+        await pool.query('DELETE FROM notices_override WHERE ref = $1', [dref]);
+        await pool.query('DELETE FROM produits_kb WHERE ref = $1', [dref]).catch(() => {});
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      // Liste des fichiers notices du repo (pour l'onglet Cerveau)
+      if (req.url === '/notices-files') {
+        const list = await fetchGithubJSON('https://api.github.com/repos/Drsly78/flaudis-notices/contents/notices');
+        const files = Array.isArray(list) ? list.filter(f => /\.pdf$/i.test(f.name)).map(f => f.name) : [];
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ files }));
+        return;
+      }
+
       // ── BILAN PRODUIT (lecture seule) ────────────────────────
       // Statistiques SAV d'une référence : volumes, décisions, pièces, tendance
       if (req.url === '/bilan-produit') {
@@ -731,8 +779,19 @@ const server = http.createServer(async function(req, res) {
         const raw = payload.ref_produit.trim();
         let pdfBuffer = null, foundRef = null;
 
-        // 1. Matching flou contre l'index réel des fichiers du repo
-        const fileName = await findNoticeFile(raw);
+        // 0. Association manuelle prioritaire (onglet Cerveau)
+        let fileName = null;
+        if (pool) {
+          try {
+            const ov = await pool.query('SELECT notice_file FROM notices_override WHERE ref = $1', [raw]);
+            if (ov.rows.length) {
+              fileName = ov.rows[0].notice_file;
+              console.log('Association manuelle utilisée:', raw, '→', fileName);
+            }
+          } catch(e) {}
+        }
+        // 1. Sinon : matching flou contre l'index réel des fichiers du repo
+        if (!fileName) fileName = await findNoticeFile(raw);
 
         // ── 🧠 CERVEAU PRODUIT : transcription mémorisée ──────────
         // Si on a déjà lu cette notice (même fichier, < 45 jours), on injecte
