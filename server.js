@@ -694,6 +694,148 @@ const server = http.createServer(async function(req, res) {
       // ⛔ NOTICES TEMPORAIREMENT DÉSACTIVÉES (économie RAM Railway)
       // Pour réactiver : passer NOTICES_ENABLED à true (ou définir la
       // variable d'env NOTICES_ENABLED=true dans Railway).
+      // ── TRACKINGS : helpers ───────────────────────────────────
+      async function getSheetGid(token, sheetName) {
+        const meta = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}?fields=sheets.properties`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const sh = (meta.sheets || []).find(x => x.properties && x.properties.title === sheetName);
+        return sh ? sh.properties.sheetId : null;
+      }
+      async function getExpedieColor() {
+        // Vert EXPEDIE officiel du tableau : #92d050
+        return { red: 146/255, green: 208/255, blue: 80/255 };
+      }
+
+      // ── TRACKINGS 1/3 : lignes candidates (marquées d'un x) ───
+      if (req.url === '/trackings-candidates') {
+        if (!GOOGLE_SHEET_ID) { res.writeHead(500); res.end(JSON.stringify({ error: 'GOOGLE_SHEET_ID manquant' })); return; }
+        const token = await getSheetsToken();
+        const data = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'SYSTEME U'!A:I")}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const rows = data.values || [];
+        const candidates = [];
+        rows.forEach((r, i) => {
+          const dateExpe = (r[1] || '').toString().trim().toLowerCase();
+          if (dateExpe === 'x') {
+            candidates.push({
+              row: i + 1, // numéro de ligne Sheet (1-based)
+              date_recep: r[0] || '', ref: r[2] || '', piece: r[3] || '',
+              enseigne: r[4] || '', ville: r[5] || '', tracking: r[6] || '', cnb: r[7] || ''
+            });
+          }
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ candidates }));
+        return;
+      }
+
+      // ── TRACKINGS 2/3 : extraction du bordereau par Claude ────
+      if (req.url === '/trackings-extract') {
+        const media = payload.media_type || 'image/png';
+        const isPdf = media === 'application/pdf';
+        const block = isPdf
+          ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: payload.file_b64 } }
+          : { type: 'image', source: { type: 'base64', media_type: media, data: payload.file_b64 } };
+        const prompt = `Voici un bordereau d'expédition transporteur (DPD : tableau avec colonnes Date/B.L./N° Colis/Client/C.P./Localité — ou DSV : liste de fret avec N° d'expédition et blocs DESTINATAIRE).
+Extrais TOUTES les expéditions du document.
+Règles :
+- DPD : tracking = N° Colis (13 chiffres). DSV : tracking = N° d'expédition (8 chiffres commençant par 0).
+- ville = nom de la localité SEULE (sans adresse, sans téléphone). cp = code postal 5 chiffres.
+- enseigne = SUPER U, HYPER U, U EXPRESS, INTERSPORT… telle qu'écrite.
+- date = la date d'expédition du bordereau au format JJ/MM/AAAA.
+Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
+{"transporteur":"DPD|DSV|AUTRE","date":"JJ/MM/AAAA","lignes":[{"tracking":"...","cp":"...","ville":"...","enseigne":"..."}]}`;
+        const aiData = await callAnthropic({
+          messages: [{ role: 'user', content: [ block, { type: 'text', text: prompt } ] }],
+          max_tokens: 3000
+        });
+        const raw = (aiData.content || []).map(b => b.text || '').join('');
+        let parsed = null;
+        try { parsed = JSON.parse(raw.replace(/```json|```/g, '').trim()); }
+        catch(e) {
+          const m = raw.match(/\{[\s\S]*\}/);
+          if (m) { try { parsed = JSON.parse(m[0]); } catch(e2) {} }
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(parsed || { error: 'Extraction illisible', raw: raw.slice(0, 300) }));
+        return;
+      }
+
+      // ── TRACKINGS 3/3 : écriture sécurisée dans le Sheet ──────
+      if (req.url === '/trackings-apply') {
+        if (!GOOGLE_SHEET_ID) { res.writeHead(500); res.end(JSON.stringify({ error: 'GOOGLE_SHEET_ID manquant' })); return; }
+        const items = Array.isArray(payload.items) ? payload.items : [];
+        const dateExpe = (payload.date_expe || '').trim();
+        if (!items.length || !dateExpe) { res.writeHead(400); res.end(JSON.stringify({ error: 'items et date_expe requis' })); return; }
+        const token = await getSheetsToken();
+        const applied = [], skipped = [];
+        const valueUpdates = [];
+
+        for (const it of items) {
+          const row = parseInt(it.row);
+          const trk = (it.tracking || '').toString().trim();
+          if (!row || !trk) { skipped.push({ row: it.row, reason: 'données incomplètes' }); continue; }
+          // GARDE-FOU : relire la ligne juste avant d'écrire
+          const check = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'SYSTEME U'!A" + row + ":I" + row)}`,
+            { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+          const cur = (check.values && check.values[0]) || [];
+          const curX = (cur[1] || '').toString().trim().toLowerCase();
+          const curTrk = (cur[6] || '').toString().trim();
+          if (curX !== 'x') { skipped.push({ row, reason: "la ligne ne porte plus le marqueur x" }); continue; }
+          if (curTrk && curTrk !== trk) { skipped.push({ row, reason: 'un tracking différent est déjà présent (' + curTrk + ')' }); continue; }
+          valueUpdates.push({ range: "'SYSTEME U'!B" + row, values: [[dateExpe]] });
+          valueUpdates.push({ range: "'SYSTEME U'!G" + row, values: [[trk]] });
+          applied.push({ row, tracking: trk, cnb: (cur[7] || '').toString().trim() });
+        }
+
+        // Écriture par lots : UNIQUEMENT les cellules B et G des lignes validées
+        if (valueUpdates.length) {
+          await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchUpdate`, {
+            method: 'POST',
+            headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ valueInputOption: 'USER_ENTERED', data: valueUpdates })
+          });
+        }
+
+        // Couleur EXPEDIE (copiée de la légende H2) sur les lignes écrites
+        if (applied.length) {
+          const gid = await getSheetGid(token, 'SYSTEME U');
+          if (gid !== null) {
+            const color = await getExpedieColor();
+            const requests = applied.map(a => ({
+              repeatCell: {
+                range: { sheetId: gid, startRowIndex: a.row - 1, endRowIndex: a.row, startColumnIndex: 0, endColumnIndex: 9 },
+                cell: { userEnteredFormat: { backgroundColor: color } },
+                fields: 'userEnteredFormat.backgroundColor'
+              }
+            }));
+            await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}:batchUpdate`, {
+              method: 'POST',
+              headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ requests })
+            });
+          }
+        }
+
+        // Synchro PostgreSQL (tracking + date d'envoi sur le dossier CNB)
+        let dbSync = 0;
+        if (pool) {
+          const parts = dateExpe.split('/');
+          const iso = parts.length === 3 ? parts[2] + '-' + parts[1] + '-' + parts[0] : dateExpe;
+          for (const a of applied) {
+            if (!a.cnb) continue;
+            try {
+              const r = await pool.query('UPDATE dossiers SET tracking = $1, date_envoi = $2 WHERE numero_dossier = $3', [a.tracking, iso, a.cnb]);
+              dbSync += r.rowCount || 0;
+            } catch(e) { console.warn('Sync DB tracking:', e.message); }
+          }
+        }
+        console.log('Trackings appliqués:', applied.length, '| ignorés:', skipped.length, '| sync DB:', dbSync);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ applied, skipped, db_sync: dbSync }));
+        return;
+      }
+
       // ── CERVEAU : état de la mémoire d'une référence ──────────
       if (req.url === '/kb-status') {
         if (!pool) { res.writeHead(200); res.end(JSON.stringify({ kb: null })); return; }
