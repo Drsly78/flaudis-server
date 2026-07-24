@@ -774,15 +774,26 @@ const server = http.createServer(async function(req, res) {
            LIMIT 500`, [ref + '%']);
         const rows = q.rows || [];
 
-        const stats = { ref, total: rows.length, envois: 0, remboursements: 0, top_pieces: [], par_mois: [], derniers: [] };
-        const pieces = {}, mois = {};
+        const stats = { ref, total: rows.length, envois: 0, remboursements: 0,
+                        top_pieces: [], par_mois: [], par_magasin: [], derniers: [] };
+        const pieces = {}, mois = {}, magasins = {};
         rows.forEach(r => {
           if (r.decision === 'remboursement') stats.remboursements++; else stats.envois++;
           const p = (r.piece || '').trim();
           if (p) pieces[p.toUpperCase()] = (pieces[p.toUpperCase()] || 0) + 1;
           const m = (r.date_reception || '').slice(0, 7);
           if (/^\d{4}-\d{2}$/.test(m)) mois[m] = (mois[m] || 0) + 1;
+          // Agrégation magasin sur l'INTÉGRALITÉ des dossiers (pas seulement l'échantillon détaillé)
+          const v = (r.departement_ville || '').trim().toUpperCase();
+          if (v) {
+            if (!magasins[v]) magasins[v] = { n: 0, envois: 0, remb: 0 };
+            magasins[v].n++;
+            if (r.decision === 'remboursement') magasins[v].remb++; else magasins[v].envois++;
+          }
         });
+        stats.par_magasin = Object.entries(magasins)
+          .sort((a, b) => b[1].n - a[1].n)
+          .map(([ville, o]) => ({ ville, n: o.n, envois: o.envois, remboursements: o.remb }));
         stats.top_pieces = Object.entries(pieces).sort((a, b) => b[1] - a[1]).slice(0, 10)
           .map(([piece, n]) => ({ piece, n }));
         stats.par_mois = Object.entries(mois).sort((a, b) => a[0].localeCompare(b[0]))
