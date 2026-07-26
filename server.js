@@ -903,9 +903,9 @@ const server = http.createServer(async function(req, res) {
 
         try {
           if (cible === 'su') {
-            let up = 0, skip = 0;
+            let up = 0, skip = 0, trk = 0;
             // SYSTEME U (envois) — clé CNB/FLA
-            const rows = await tail('SYSTEME U', 'H', 3000, 'I');
+            const rows = await tail('SYSTEME U', 'H', 12000, 'I');
             for (const r of rows) {
               const cnb = (r[7] || '').toString().trim(), fla = (r[8] || '').toString().trim();
               const key = cnb || fla;
@@ -923,6 +923,7 @@ const server = http.createServer(async function(req, res) {
               `, [key, (r[4] || '').toString().trim(), (r[5] || '').toString().trim(),
                   (r[2] || '').toString().trim(), (r[3] || '').toString().trim(), iso,
                   fla ? 'FLA:' + fla : '', (r[6] || '').toString().trim()]);
+              if ((r[6] || '').toString().trim()) trk++;
               up++;
             }
             // REMBOURSEMENT SU — clé CNB (I) / FLA (M)
@@ -944,9 +945,9 @@ const server = http.createServer(async function(req, res) {
                   (r[2] || '').toString().trim(), iso, fla ? 'FLA:' + fla : '']);
               up++;
             }
-            console.log('Sync SU:', up, 'dossiers,', skip, 'lignes sans clé/date');
+            console.log('Sync SU:', up, 'dossiers,', trk, 'trackings,', skip, 'lignes sans clé/date');
             res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: true, maj: up, ignorees: skip }));
+            res.end(JSON.stringify({ ok: true, maj: up, ignorees: skip, trackings: trk }));
             return;
           }
 
