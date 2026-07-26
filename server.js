@@ -1003,26 +1003,27 @@ const server = http.createServer(async function(req, res) {
       // ── INTERSPORT 1/2 : extraction mail + bon de retour ──────
       if (req.url === '/its-extract') {
         const content = [];
-        if (payload.file_b64) {
-          const media = payload.media_type || 'application/pdf';
-          content.push(media === 'application/pdf'
-            ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: payload.file_b64 } }
-            : { type: 'image', source: { type: 'base64', media_type: media, data: payload.file_b64 } });
+        const files = Array.isArray(payload.files) ? payload.files
+          : (payload.file_b64 ? [{ b64: payload.file_b64, media: payload.media_type || 'application/pdf' }] : []);
+        for (const f of files.slice(0, 3)) {
+          content.push(f.media === 'application/pdf'
+            ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: f.b64 } }
+            : { type: 'image', source: { type: 'base64', media_type: f.media || 'image/png', data: f.b64 } });
         }
-        content.push({ type: 'text', text: `Voici un dossier SAV Intersport : le texte du mail reçu, et si joint, le bon de retour (PDF ou image).
+        content.push({ type: 'text', text: `Voici un dossier SAV Intersport : le texte du mail reçu, et si joints, des documents (bon de retour PDF, photos du produit, ticket de caisse).
 
 TEXTE DU MAIL :
 ${(payload.mail_text || '(non fourni)').slice(0, 6000)}
 
 Extrais les informations suivantes. Règles :
 - date_mail : la date d'ENVOI DU MAIL (dans l'en-tête du mail, format "Envoyé : ..."), convertie en JJ/MM/AA. JAMAIS la date du bon de retour.
-- ville et cp : l'adresse du MAGASIN expéditeur, en haut à gauche du bon de retour (pas l'adresse Intersport France Longjumeau qui est le siège).
+- ville et cp : RÈGLE DE PRIORITÉ STRICTE. 1) Si un bon de retour est joint : le magasin est celui écrit dans le bloc en haut à gauche du bon — c'est LUI qui fait foi, ignore la signature du mail. 2) Sans bon de retour : lis attentivement le mail — l'expéditeur peut être la centrale Intersport France écrivant POUR un magasin ; le magasin concerné est alors celui NOMMÉ dans le texte du mail, pas l'expéditeur. N'utilise la signature que si l'expéditeur est manifestement le magasin lui-même. 3) Jamais l'adresse du siège (Intersport France, Longjumeau, 91).
 - magasin_nom : le nom du magasin (ex JAUDE SPORT, INTERSPORT JAUDE).
 - retour_no : le numéro de retour (ex 32-627), présent dans l'objet du mail ou le bon.
 - produits : la liste de TOUS les produits du bon de retour (il peut y en avoir plusieurs, une ligne de tableau chacun). Pour chaque produit : son NOM/désignation (ex E SWIM 10) et marque si visible — PAS la référence chiffrée qui est propre au magasin — sa quantité, et son motif propre s'il est indiqué sur sa ligne.
 - motif_global : la panne/le motif général s'il est écrit hors tableau (mail, haut du bon).
 Réponds UNIQUEMENT avec ce JSON, sans texte autour :
-{"date_mail":"JJ/MM/AA","cp":"63000","ville":"CLERMONT FERRAND","magasin_nom":"...","motif_global":"...","produits":[{"produit_nom":"...","marque":"...","quantite":1,"motif":"..."}]}` });
+{"date_mail":"JJ/MM/AA","cp":"63000","ville":"CLERMONT FERRAND","magasin_nom":"...","motif_global":"...","produits":[{"produit_nom":"...","marque":"...","quantite":1,"motif":"..."}],"incertitudes":["champ : explication courte"]}` });
 
         const aiData = await callAnthropic({
           model: process.env.MODEL_EXTRACT || MODEL_MAIN,
