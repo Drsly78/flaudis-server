@@ -1010,13 +1010,18 @@ const server = http.createServer(async function(req, res) {
             ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: f.b64 } }
             : { type: 'image', source: { type: 'base64', media_type: f.media || 'image/png', data: f.b64 } });
         }
-        content.push({ type: 'text', text: `Voici un dossier SAV Intersport : le texte du mail reçu, et si joints, des documents (bon de retour PDF, photos du produit, ticket de caisse).
+        const _now = new Date();
+        const _jours = ['dimanche','lundi','mardi','mercredi','jeudi','vendredi','samedi'];
+        const _aujourdhui = _jours[_now.getDay()] + ' ' + String(_now.getDate()).padStart(2,'0') + '/' + String(_now.getMonth()+1).padStart(2,'0') + '/' + _now.getFullYear();
+        content.push({ type: 'text', text: `NOUS SOMMES LE ${_aujourdhui}.
+
+Voici un dossier SAV Intersport : le texte du mail reçu, et si joints, des documents (bon de retour PDF, photos du produit, ticket de caisse).
 
 TEXTE DU MAIL :
 ${(payload.mail_text || '(non fourni)').slice(0, 6000)}
 
 Extrais les informations suivantes. Règles :
-- date_mail : la date d'ENVOI DU MAIL (dans l'en-tête du mail, format "Envoyé : ..."), convertie en JJ/MM/AA. JAMAIS la date du bon de retour.
+- date_mail : la date d'ENVOI DU MAIL, convertie en JJ/MM/AA. Le webmail l'affiche souvent en RELATIF — c'est NORMAL et ce n'est PAS une incertitude, convertis-la avec la date du jour donnée ci-dessus : "13:59" seul = aujourd'hui ; "hier" = la veille ; "jeu. 13:59" = le jeudi le plus récent (aujourd'hui inclus s'il tombe ce jour-là) ; "mar." = le mardi le plus récent, etc. ; une date complète type "Envoyé : mardi 14 avril 2026" se prend telle quelle. La date du bon de retour ne sert JAMAIS de date_mail (elle peut au mieux confirmer ta conversion). Ne mets date_mail en incertitude que si le mail n'affiche vraiment AUCUNE indication de date ou d'heure.
 - ville et cp : RÈGLE DE PRIORITÉ STRICTE. 1) Si un bon de retour est joint : le magasin est celui écrit dans le bloc en haut à gauche du bon — c'est LUI qui fait foi, ignore la signature du mail. 2) Sans bon de retour : lis attentivement le mail — l'expéditeur peut être la centrale Intersport France écrivant POUR un magasin ; le magasin concerné est alors celui NOMMÉ dans le texte du mail, pas l'expéditeur. N'utilise la signature que si l'expéditeur est manifestement le magasin lui-même. 3) Jamais l'adresse du siège (Intersport France, Longjumeau, 91).
 - magasin_nom : le nom du magasin (ex JAUDE SPORT, INTERSPORT JAUDE).
 - retour_no : le numéro de retour (ex 32-627), présent dans l'objet du mail ou le bon.
