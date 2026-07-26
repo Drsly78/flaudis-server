@@ -45,6 +45,21 @@ async function initDB() {
       )
     `);
     await pool.query(`
+      CREATE TABLE IF NOT EXISTS its_dossiers (
+        id SERIAL PRIMARY KEY,
+        date_reception TEXT,
+        reference TEXT,
+        pannes TEXT,
+        magasin TEXT,
+        decision TEXT,
+        accord TEXT,
+        tracking TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`ALTER TABLE its_dossiers ADD COLUMN IF NOT EXISTS tracking TEXT`).catch(() => {});
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS its_dossiers_uni ON its_dossiers (date_reception, reference, magasin)`);
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS notices_override (
         ref TEXT PRIMARY KEY,
         notice_file TEXT NOT NULL,
@@ -547,7 +562,122 @@ const server = http.createServer(async function(req, res) {
         return;
       }
 
-      // ── EXPORT VERS GOOGLE SHEET ─────────────────────────
+      // ── EXPORT U DIRECT : SYSTEME U / REMBOURSEMENT SU ────────
+      // Écrit sur la première ligne libre des feuilles réelles.
+      // SYSTEME U : append pur A:I (dates au format texte JJ/MM/AA maison).
+      // REMBOURSEMENT SU : écriture ciblée cellule par cellule (L = formule,
+      // jamais touchée), n° accord auto SUaamm### si non-DDP, vert A→L.
+      if (req.url === '/export-u-direct') {
+        if (!GOOGLE_SHEET_ID) { res.writeHead(200); res.end(JSON.stringify({ ok: false, error: 'GOOGLE_SHEET_ID manquant' })); return; }
+        const { mode, row } = payload;
+        if (!row || !Array.isArray(row)) { res.writeHead(400); res.end(JSON.stringify({ error: 'row requis' })); return; }
+        const token = await getSheetsToken();
+        const shortDate = v => {
+          const m = String(v || '').trim().match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})$/);
+          if (!m) return v;
+          return m[1].padStart(2,'0') + '/' + m[2].padStart(2,'0') + '/' + (m[3].length === 4 ? m[3].slice(2) : m[3].padStart(2,'0'));
+        };
+
+        if (mode === 'sav') {
+          // Anti-doublon CNB (H idx 7) / FLA (I idx 8) dans SYSTEME U
+          const key = (row[7] || '').trim() || (row[8] || '').trim();
+          if (key) {
+            const existing = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'SYSTEME U'!H:I")}`,
+              { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+            const dup = (existing.values || []).some(r2 =>
+              ((r2[0] || '').trim() === key) || ((r2[1] || '').trim() === key));
+            if (dup) { res.writeHead(200); res.end(JSON.stringify({ ok: true, duplicate: true, key })); return; }
+          }
+          const clean = row.slice(0, 9);
+          clean[0] = shortDate(clean[0]); clean[1] = shortDate(clean[1]);
+          const ap = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'SYSTEME U'!A:I")}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`, {
+            method: 'POST',
+            headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ values: [clean] })
+          }).then(r => r.json());
+          if (ap.error) { res.writeHead(500); res.end(JSON.stringify({ ok: false, error: ap.error.message })); return; }
+          console.log('Export direct SYSTEME U:', key);
+          res.writeHead(200); res.end(JSON.stringify({ ok: true }));
+          return;
+        }
+
+        if (mode === 'remb') {
+          // Anti-doublon CNB (I idx 8) / FLA (M idx 12) dans REMBOURSEMENT SU
+          const key = (row[8] || '').trim() || (row[12] || '').trim();
+          if (key) {
+            const existing = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'REMBOURSEMENT SU'!I:M")}`,
+              { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+            const dup = (existing.values || []).some(r2 =>
+              ((r2[0] || '').trim() === key) || ((r2[4] || '').trim() === key));
+            if (dup) { res.writeHead(200); res.end(JSON.stringify({ ok: true, duplicate: true, key })); return; }
+          }
+
+          // Première ligne libre (colonnes A, I, J les plus remplies)
+          const bg = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchGet?ranges=${encodeURIComponent("'REMBOURSEMENT SU'!A:A")}&ranges=${encodeURIComponent("'REMBOURSEMENT SU'!I:I")}&ranges=${encodeURIComponent("'REMBOURSEMENT SU'!J:J")}`,
+            { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+          const vr = bg.valueRanges || [];
+          const lens = vr.map(v => (v.values || []).length);
+          const target = Math.max(...lens, 1) + 1;
+
+          // N° accord auto : SU + aa + mm + ### (suivant du mois, colonne J)
+          let accord = (row[9] || '').trim();
+          const isDDP = !!payload.ddp;
+          if (!accord && !isDDP) {
+            const now = new Date();
+            const aa = String(now.getFullYear()).slice(2);
+            const mm = String(now.getMonth() + 1).padStart(2, '0');
+            const prefix = 'SU' + aa + mm;
+            const jvals = ((vr[2] || {}).values || []).map(x => (x[0] || '').toString().trim());
+            let maxSeq = 0;
+            const reNum = new RegExp('^' + prefix + '(\\d{3})$');
+            jvals.forEach(v => { const m = v.match(reNum); if (m) maxSeq = Math.max(maxSeq, parseInt(m[1])); });
+            accord = prefix + String(maxSeq + 1).padStart(3, '0');
+          }
+
+          // Écriture ciblée : A..K + M — la colonne L (formule) n'est JAMAIS touchée
+          const colsTexte = { C: row[2], D: row[3], F: row[5], G: row[6], H: row[7], I: row[8], J: accord, K: row[10], M: row[12] };
+          const colsTypes = { A: shortDate(row[0]), B: shortDate(row[1]), E: parseInt(row[4]) || 1 };
+          const mkUpdates = obj => Object.entries(obj)
+            .filter(([c, v]) => v !== '' && v !== null && v !== undefined)
+            .map(([c, v]) => ({ range: "'REMBOURSEMENT SU'!" + c + target, values: [[v]] }));
+          // Textes (EAN, refs, CNB…) en RAW pour préserver leur type texte
+          await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchUpdate`, {
+            method: 'POST',
+            headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ valueInputOption: 'RAW', data: mkUpdates(colsTexte) })
+          });
+          // Dates courtes + quantité en USER_ENTERED : vraies dates, vrai nombre
+          await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchUpdate`, {
+            method: 'POST',
+            headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ valueInputOption: 'USER_ENTERED', data: mkUpdates(colsTypes) })
+          });
+
+          // Vert #92d050 de A à L
+          const gid = await getSheetGid(token, 'REMBOURSEMENT SU');
+          if (gid !== null) {
+            await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}:batchUpdate`, {
+              method: 'POST',
+              headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ requests: [{
+                repeatCell: {
+                  range: { sheetId: gid, startRowIndex: target - 1, endRowIndex: target, startColumnIndex: 0, endColumnIndex: 12 },
+                  cell: { userEnteredFormat: { backgroundColor: { red: 146/255, green: 208/255, blue: 80/255 } } },
+                  fields: 'userEnteredFormat.backgroundColor'
+                }
+              }] })
+            });
+          }
+          console.log('Export direct REMBOURSEMENT SU: ligne', target, '| accord', accord || '(vide/DDP)');
+          res.writeHead(200); res.end(JSON.stringify({ ok: true, ligne: target, accord: accord || null }));
+          return;
+        }
+
+        res.writeHead(400); res.end(JSON.stringify({ error: 'mode inconnu' }));
+        return;
+      }
+
+      // ── EXPORT VERS GOOGLE SHEET (Import — conservé compat) ───
       if (req.url === '/export-to-sheet') {
         if (!GOOGLE_SHEET_ID) { res.writeHead(200); res.end(JSON.stringify({ ok: false, error: 'GOOGLE_SHEET_ID manquant' })); return; }
         const { mode, row } = payload;
@@ -697,6 +827,127 @@ const server = http.createServer(async function(req, res) {
       // ⛔ NOTICES TEMPORAIREMENT DÉSACTIVÉES (économie RAM Railway)
       // Pour réactiver : passer NOTICES_ENABLED à true (ou définir la
       // variable d'env NOTICES_ENABLED=true dans Railway).
+      // ── SYNC HISTORIQUE : Sheet → PostgreSQL ──────────────────
+      // Relit la fin des feuilles réelles et met à jour les bases
+      // historique (UPSERT — aucune suppression possible).
+      if (req.url === '/sync-historique') {
+        if (!pool || !GOOGLE_SHEET_ID) { res.writeHead(500); res.end(JSON.stringify({ error: 'base ou sheet manquant' })); return; }
+        const cible = payload.cible; // 'su' | 'its'
+        const token = await getSheetsToken();
+        const toIso = v => {
+          const m = String(v || '').trim().match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})$/);
+          if (!m) return null;
+          const y = m[3].length === 2 ? '20' + m[3] : m[3];
+          return y + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0');
+        };
+        const tail = async (sheet, keyCol, span, width) => {
+          const lenQ = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'" + sheet + "'!" + keyCol + ":" + keyCol)}`,
+            { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+          const last = (lenQ.values || []).length;
+          const from = Math.max(1, last - span);
+          const q = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'" + sheet + "'!A" + from + ":" + width + last)}`,
+            { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+          return q.values || [];
+        };
+
+        try {
+          if (cible === 'su') {
+            let up = 0, skip = 0;
+            // SYSTEME U (envois) — clé CNB/FLA
+            const rows = await tail('SYSTEME U', 'H', 3000, 'I');
+            for (const r of rows) {
+              const cnb = (r[7] || '').toString().trim(), fla = (r[8] || '').toString().trim();
+              const key = cnb || fla;
+              const iso = toIso(r[0]);
+              if (!key || !iso) { skip++; continue; }
+              await pool.query(`
+                INSERT INTO dossiers (numero_dossier, enseigne, departement_ville, ref_produit, piece, decision, date_reception, notes)
+                VALUES ($1,$2,$3,$4,$5,'envoi_piece',$6,$7)
+                ON CONFLICT (numero_dossier) DO UPDATE SET
+                  departement_ville = EXCLUDED.departement_ville,
+                  ref_produit = EXCLUDED.ref_produit,
+                  piece = EXCLUDED.piece,
+                  date_reception = EXCLUDED.date_reception
+              `, [key, (r[4] || '').toString().trim(), (r[5] || '').toString().trim(),
+                  (r[2] || '').toString().trim(), (r[3] || '').toString().trim(), iso,
+                  fla ? 'FLA:' + fla : '']);
+              up++;
+            }
+            // REMBOURSEMENT SU — clé CNB (I) / FLA (M)
+            const rrows = await tail('REMBOURSEMENT SU', 'I', 1500, 'M');
+            for (const r of rrows) {
+              const cnb = (r[8] || '').toString().trim(), fla = (r[12] || '').toString().trim();
+              const key = cnb || fla;
+              const iso = toIso(r[0]);
+              if (!key || !iso) { skip++; continue; }
+              await pool.query(`
+                INSERT INTO dossiers (numero_dossier, enseigne, departement_ville, ref_produit, piece, decision, date_reception, notes)
+                VALUES ($1,$2,$3,$4,'','remboursement',$5,$6)
+                ON CONFLICT (numero_dossier) DO UPDATE SET
+                  departement_ville = EXCLUDED.departement_ville,
+                  ref_produit = EXCLUDED.ref_produit,
+                  decision = 'remboursement',
+                  date_reception = EXCLUDED.date_reception
+              `, [key, (r[5] || '').toString().trim(), (r[6] || '').toString().trim(),
+                  (r[2] || '').toString().trim(), iso, fla ? 'FLA:' + fla : '']);
+              up++;
+            }
+            console.log('Sync SU:', up, 'dossiers,', skip, 'lignes sans clé/date');
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, maj: up, ignorees: skip }));
+            return;
+          }
+
+          if (cible === 'its') {
+            let up = 0, skip = 0;
+            const rows = await tail('INTERSPORT', 'A', 1500, 'J');
+            for (const r of rows) {
+              const date = (r[0] || '').toString().trim();
+              const ref = (r[1] || '').toString().trim();
+              const mag = (r[4] || '').toString().trim();
+              if (!date || !ref || !mag || !/\d/.test(date)) { skip++; continue; }
+              await pool.query(`
+                INSERT INTO its_dossiers (date_reception, reference, pannes, magasin, decision, tracking)
+                VALUES ($1,$2,$3,$4,$5,$6)
+                ON CONFLICT (date_reception, reference, magasin) DO UPDATE SET
+                  pannes = EXCLUDED.pannes,
+                  decision = EXCLUDED.decision,
+                  tracking = EXCLUDED.tracking
+              `, [date, ref, (r[3] || '').toString().trim(), mag, (r[8] || '').toString().trim(), (r[9] || '').toString().trim()]);
+              up++;
+            }
+            console.log('Sync ITS:', up, 'dossiers,', skip, 'lignes ignorées');
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, maj: up, ignorees: skip }));
+            return;
+          }
+
+          res.writeHead(400); res.end(JSON.stringify({ error: 'cible su ou its requise' }));
+        } catch(e) {
+          console.error('Sync historique:', e.message);
+          res.writeHead(500); res.end(JSON.stringify({ error: e.message }));
+        }
+        return;
+      }
+
+      // ── INTERSPORT : historique par magasin (4 mois) ──────────
+      if (req.url === '/its-historique') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ total: 0, dossiers: [] })); return; }
+        const mag = (payload.magasin || '').trim();
+        if (!mag) { res.writeHead(400); res.end(JSON.stringify({ error: 'magasin requis' })); return; }
+        // Match permissif sur le nom (sans le n° de département)
+        const magNom = mag.replace(/^\d{2,3}\s*/, '');
+        const q = await pool.query(`
+          SELECT date_reception, reference, pannes, decision, accord, tracking, created_at
+          FROM its_dossiers
+          WHERE magasin ILIKE $1 AND created_at > NOW() - INTERVAL '4 months'
+          ORDER BY created_at DESC LIMIT 60
+        `, ['%' + magNom + '%']);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ total: q.rows.length, dossiers: q.rows }));
+        return;
+      }
+
       // ── INTERSPORT 0/2 : référentiel produits lu DANS le Sheet ──
       // Feuilles CODE PRODUITS + PRIX AVOIR, jointes et mises en cache 30 min.
       // Toujours à jour : modifier le Sheet suffit, aucun fichier à régénérer.
@@ -878,13 +1129,18 @@ Réponds UNIQUEMENT avec ce JSON, sans texte autour :
           const reNum = new RegExp('^' + prefix + '(\\d{3})$');
           jvals.forEach(v => { const m = v.match(reNum); if (m) maxSeq = Math.max(maxSeq, parseInt(m[1])); });
 
+          // Date complète (JJ/MM/AAAA) + quantité numérique, écrites en
+          // USER_ENTERED : Sheets les enregistre en VRAIS date/nombre,
+          // alignés comme le reste de la feuille (pas d'apostrophe texte).
+          const dParts = (d.date || '').match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+          const dateFull = dParts ? dParts[1].padStart(2,'0') + '/' + dParts[2].padStart(2,'0') + '/' + (dParts[3].length === 4 ? dParts[3].slice(2) : dParts[3].padStart(2,'0')) : d.date;
           const updates = [];
           for (const p of avoirProds) {
             const isDDP = String(p.prix || '').toUpperCase().includes('DDP');
             let accord = '';
             if (!isDDP) { maxSeq++; accord = prefix + String(maxSeq).padStart(3, '0'); }
-            updates.push({ range: "'REMBOURSEMENT ITS'!B" + row, values: [[d.date]] });
-            updates.push({ range: "'REMBOURSEMENT ITS'!D" + row, values: [[p.quantite || '1']] });
+            updates.push({ range: "'REMBOURSEMENT ITS'!B" + row, values: [[dateFull]] });
+            updates.push({ range: "'REMBOURSEMENT ITS'!D" + row, values: [[parseInt(p.quantite) || 1]] });
             updates.push({ range: "'REMBOURSEMENT ITS'!G" + row, values: [[p.reference]] });
             updates.push({ range: "'REMBOURSEMENT ITS'!H" + row, values: [[d.magasin]] });
             if (accord) updates.push({ range: "'REMBOURSEMENT ITS'!J" + row, values: [[accord]] });
@@ -894,10 +1150,22 @@ Réponds UNIQUEMENT avec ce JSON, sans texte autour :
           await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchUpdate`, {
             method: 'POST',
             headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ valueInputOption: 'RAW', data: updates })
+            body: JSON.stringify({ valueInputOption: 'USER_ENTERED', data: updates })
           });
         }
 
+        // Historique ITS en base (arrière-plan, non bloquant)
+        if (pool && applied.length) {
+          const accordByRef = {};
+          remboursements.forEach(r => { accordByRef[r.reference] = r.accord; });
+          for (const a of applied) {
+            const pr = produits.find(p => (p.reference || '').trim() === a.reference) || {};
+            pool.query(
+              'INSERT INTO its_dossiers (date_reception, reference, pannes, magasin, decision, accord) VALUES ($1,$2,$3,$4,$5,$6)',
+              [d.date, a.reference, pr.pannes || '', d.magasin, a.etat || '', accordByRef[a.reference] || '']
+            ).catch(e => console.warn('Historique ITS:', e.message));
+          }
+        }
         console.log('Export ITS:', applied.length, 'ligne(s) INTERSPORT,', remboursements.length, 'remboursement(s),', skipped.length, 'ignorée(s)');
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ applied, skipped, remboursements }));
@@ -934,8 +1202,24 @@ Réponds UNIQUEMENT avec ce JSON, sans texte autour :
             });
           }
         });
+        // Candidats INTERSPORT : lignes marquées d'un x en colonne H
+        // (même convention que Système U — lève l'ambiguïté des villes en doublon)
+        let its_candidates = [];
+        try {
+          const itsData = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'INTERSPORT'!A:J")}`,
+            { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+          const itsRows = itsData.values || [];
+          itsRows.forEach((r, i) => {
+            const marque = (r[7] || '').toString().trim().toLowerCase() === 'x';
+            const mag = (r[4] || '').toString().trim();
+            if (marque && mag) {
+              its_candidates.push({ row: i + 1, date: r[0] || '', ref: r[1] || '',
+                pannes: r[3] || '', magasin: mag, etat: r[8] || '', tracking: r[9] || '' });
+            }
+          });
+        } catch(e) { console.warn('Candidats ITS:', e.message); }
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ candidates }));
+        res.end(JSON.stringify({ candidates, its_candidates }));
         return;
       }
 
@@ -1037,6 +1321,59 @@ Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
           }
         }
 
+        // ── Trackings INTERSPORT : colonne J + vert A→J ──────────
+        const itsItems = Array.isArray(payload.its_items) ? payload.its_items : [];
+        const itsApplied = [], itsSkipped = [];
+        if (itsItems.length) {
+          const itsUpdates = [];
+          for (const it of itsItems) {
+            const row = parseInt(it.row);
+            const trk = (it.tracking || '').toString().trim();
+            if (!row || !trk) { itsSkipped.push({ row: it.row, reason: 'données incomplètes' }); continue; }
+            // GARDE-FOU : relire la ligne avant d'écrire
+            const check = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'INTERSPORT'!A" + row + ":J" + row)}`,
+              { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+            const cur = (check.values && check.values[0]) || [];
+            const curX = (cur[7] || '').toString().trim().toLowerCase();
+            const curTrk = (cur[9] || '').toString().trim();
+            if (curX !== 'x') { itsSkipped.push({ row, reason: "la ligne ne porte plus le marqueur x" }); continue; }
+            if (curTrk && curTrk !== trk) { itsSkipped.push({ row, reason: 'un tracking différent est déjà présent (' + curTrk + ')' }); continue; }
+            itsUpdates.push({ range: "'INTERSPORT'!H" + row, values: [[dateExpe]] });
+            itsUpdates.push({ range: "'INTERSPORT'!J" + row, values: [[trk]] });
+            itsApplied.push({ row, tracking: trk, date: (cur[0] || '').toString().trim(),
+                              ref: (cur[1] || '').toString().trim(), magasin: (cur[4] || '').toString().trim() });
+          }
+          if (itsUpdates.length) {
+            await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchUpdate`, {
+              method: 'POST',
+              headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ valueInputOption: 'RAW', data: itsUpdates })
+            });
+            const itsGid = await getSheetGid(token, 'INTERSPORT');
+            if (itsGid !== null) {
+              const requests = itsApplied.map(a => ({
+                repeatCell: {
+                  range: { sheetId: itsGid, startRowIndex: a.row - 1, endRowIndex: a.row, startColumnIndex: 0, endColumnIndex: 10 },
+                  cell: { userEnteredFormat: { backgroundColor: { red: 146/255, green: 208/255, blue: 80/255 } } },
+                  fields: 'userEnteredFormat.backgroundColor'
+                }
+              }));
+              await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}:batchUpdate`, {
+                method: 'POST',
+                headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ requests })
+              });
+            }
+            // Sync base its_dossiers (clé date+ref+magasin)
+            if (pool) {
+              for (const a of itsApplied) {
+                pool.query('UPDATE its_dossiers SET tracking = $1 WHERE date_reception = $2 AND reference = $3 AND magasin = $4',
+                  [a.tracking, a.date, a.ref, a.magasin]).catch(() => {});
+              }
+            }
+          }
+        }
+
         // Synchro PostgreSQL (tracking + date d'envoi sur le dossier CNB)
         let dbSync = 0;
         if (pool) {
@@ -1052,7 +1389,7 @@ Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
         }
         console.log('Trackings appliqués:', applied.length, '| ignorés:', skipped.length, '| sync DB:', dbSync);
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ applied, skipped, db_sync: dbSync }));
+        res.end(JSON.stringify({ applied, skipped, db_sync: dbSync, its_applied: itsApplied, its_skipped: itsSkipped }));
         return;
       }
 
