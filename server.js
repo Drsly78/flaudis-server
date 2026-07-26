@@ -58,6 +58,14 @@ async function initDB() {
       )
     `);
     await pool.query(`ALTER TABLE its_dossiers ADD COLUMN IF NOT EXISTS tracking TEXT`).catch(() => {});
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS reponses_types (
+        id SERIAL PRIMARY KEY,
+        cat TEXT NOT NULL,
+        label TEXT NOT NULL,
+        msg TEXT NOT NULL
+      )
+    `);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS its_dossiers_uni ON its_dossiers (date_reception, reference, magasin)`);
     await pool.query(`
       CREATE TABLE IF NOT EXISTS notices_override (
@@ -274,9 +282,17 @@ const MODEL_MAIN  = process.env.MODEL_MAIN  || 'claude-sonnet-4-6';
 const MODEL_LIGHT = process.env.MODEL_LIGHT || 'claude-haiku-4-5-20251001';
 
 function callAnthropic(payload) {
+  // Règles statiques en "system" avec cache : mêmes instructions à chaque
+  // scan → l'API ne les refacture qu'au dixième du prix après la 1re requête.
+  let systemBlock;
+  if (payload.system_cached) {
+    systemBlock = [{ type: 'text', text: payload.system_cached, cache_control: { type: 'ephemeral' } }];
+    delete payload.system_cached;
+  }
   return new Promise((resolve, reject) => {
     const data = JSON.stringify({
       model: payload.model || MODEL_MAIN,
+      ...(systemBlock ? { system: systemBlock } : {}),
       max_tokens: payload.max_tokens || 2000,
       ...(payload.system ? { system: payload.system } : {}),
       messages: payload.messages
@@ -832,6 +848,90 @@ const server = http.createServer(async function(req, res) {
       // ⛔ NOTICES TEMPORAIREMENT DÉSACTIVÉES (économie RAM Railway)
       // Pour réactiver : passer NOTICES_ENABLED à true (ou définir la
       // variable d'env NOTICES_ENABLED=true dans Railway).
+      // ── RÉPONSES TYPES PARTAGÉES (tous postes) ────────────────
+      if (req.url === '/reponses-list') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ items: [] })); return; }
+        const q = await pool.query('SELECT id, cat, label, msg FROM reponses_types ORDER BY cat, label');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ items: q.rows }));
+        return;
+      }
+      if (req.url === '/reponses-add') {
+        if (!pool) { res.writeHead(500); res.end(JSON.stringify({ error: 'no db' })); return; }
+        const { cat, label, msg } = payload;
+        if (!label || !msg) { res.writeHead(400); res.end(JSON.stringify({ error: 'label et msg requis' })); return; }
+        await pool.query('INSERT INTO reponses_types (cat, label, msg) VALUES ($1,$2,$3)', [cat || 'Divers', label, msg]);
+        res.writeHead(200); res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      if (req.url === '/reponses-delete') {
+        if (!pool) { res.writeHead(500); res.end(JSON.stringify({ error: 'no db' })); return; }
+        await pool.query('DELETE FROM reponses_types WHERE id = $1', [parseInt(payload.id)]);
+        res.writeHead(200); res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      if (req.url === '/reponses-cat') {
+        if (!pool) { res.writeHead(500); res.end(JSON.stringify({ error: 'no db' })); return; }
+        if (payload.action === 'rename') {
+          await pool.query('UPDATE reponses_types SET cat = $1 WHERE cat = $2', [payload.nouveau, payload.cat]);
+        } else if (payload.action === 'delete') {
+          await pool.query('DELETE FROM reponses_types WHERE cat = $1', [payload.cat]);
+        }
+        res.writeHead(200); res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      if (req.url === '/reponses-seed') {
+        if (!pool) { res.writeHead(500); res.end(JSON.stringify({ error: 'no db' })); return; }
+        const count = await pool.query('SELECT COUNT(*) AS n FROM reponses_types');
+        if (parseInt(count.rows[0].n) === 0 && Array.isArray(payload.items)) {
+          for (const it of payload.items.slice(0, 60)) {
+            await pool.query('INSERT INTO reponses_types (cat, label, msg) VALUES ($1,$2,$3)',
+              [it.cat || 'Divers', it.label || '?', it.msg || '']);
+          }
+          console.log('Réponses types : seed initial de', payload.items.length, 'réponses');
+        }
+        res.writeHead(200); res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      // ── TABLEAU DE BORD : agrégats SU + ITS ───────────────────
+      if (req.url === '/dashboard') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ error: 'no db' })); return; }
+        const su7 = await pool.query(`SELECT COUNT(*) AS n FROM dossiers WHERE date_reception::date > NOW() - INTERVAL '7 days'`);
+        const su30 = await pool.query(`
+          SELECT COALESCE(SUM(CASE WHEN decision = 'remboursement' THEN 1 ELSE 0 END),0) AS remb,
+                 COALESCE(SUM(CASE WHEN decision <> 'remboursement' THEN 1 ELSE 0 END),0) AS envois
+          FROM dossiers WHERE date_reception::date > NOW() - INTERVAL '30 days'`);
+        const semaines = await pool.query(`
+          SELECT TO_CHAR(DATE_TRUNC('week', date_reception::date), 'DD/MM') AS sem,
+                 SUM(CASE WHEN decision = 'remboursement' THEN 1 ELSE 0 END) AS remb,
+                 SUM(CASE WHEN decision <> 'remboursement' THEN 1 ELSE 0 END) AS envois
+          FROM dossiers WHERE date_reception::date > NOW() - INTERVAL '8 weeks'
+          GROUP BY DATE_TRUNC('week', date_reception::date)
+          ORDER BY DATE_TRUNC('week', date_reception::date)`);
+        const topProduits = await pool.query(`
+          SELECT ref_produit AS ref, COUNT(*) AS n FROM dossiers
+          WHERE date_reception::date > NOW() - INTERVAL '30 days' AND ref_produit IS NOT NULL AND TRIM(ref_produit) <> ''
+          GROUP BY ref_produit ORDER BY n DESC LIMIT 6`);
+        const its30 = await pool.query(`
+          SELECT COALESCE(NULLIF(TRIM(decision), ''), 'À DÉCIDER') AS d, COUNT(*) AS n
+          FROM its_dossiers WHERE created_at > NOW() - INTERVAL '30 days'
+          GROUP BY 1 ORDER BY n DESC`);
+        const itsAvoirsMois = await pool.query(`
+          SELECT COUNT(*) AS n FROM its_dossiers
+          WHERE UPPER(COALESCE(decision,'')) = 'AVOIR' AND created_at > DATE_TRUNC('month', NOW())`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          su_7j: parseInt(su7.rows[0].n),
+          su_30j: { envois: parseInt(su30.rows[0].envois), remb: parseInt(su30.rows[0].remb) },
+          semaines: semaines.rows,
+          top_produits: topProduits.rows,
+          its_30j: its30.rows,
+          its_avoirs_mois: parseInt(itsAvoirsMois.rows[0].n)
+        }));
+        return;
+      }
+
       // ── RECHERCHE : bases SU / ITS (miroir des feuilles) ──────
       if (req.url === '/recherche') {
         if (!pool) { res.writeHead(200); res.end(JSON.stringify({ resultats: [] })); return; }
@@ -875,6 +975,119 @@ const server = http.createServer(async function(req, res) {
         const r = await pool.query(sql, params);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ resultats: r.rows, total: r.rows.length }));
+        return;
+      }
+
+      // ── IMPORT COMPLET : tout l'historique du Sheet, par tranches ──
+      // Appelé en boucle par l'app : chaque appel traite ~8000 lignes puis
+      // rend la main (progression affichée, aucun risque de timeout/RAM).
+      // Phases : 1 = SYSTEME U, 2 = REMBOURSEMENT SU, 3 = INTERSPORT.
+      if (req.url === '/sync-complet') {
+        if (!pool || !GOOGLE_SHEET_ID) { res.writeHead(500); res.end(JSON.stringify({ error: 'base ou sheet manquant' })); return; }
+        const phase = parseInt(payload.phase) || 1;
+        const from = Math.max(1, parseInt(payload.from) || 1);
+        const CHUNK = 8000;
+        const token = await getSheetsToken();
+        const toIso2 = v => {
+          const m = String(v || '').trim().match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})$/);
+          if (!m) return null;
+          return (m[3].length === 2 ? '20' + m[3] : m[3]) + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0');
+        };
+        const conf = {
+          1: { feuille: 'SYSTEME U', keyCol: 'H', width: 'I' },
+          2: { feuille: 'REMBOURSEMENT SU', keyCol: 'I', width: 'M' },
+          3: { feuille: 'INTERSPORT', keyCol: 'A', width: 'J' }
+        }[phase];
+        if (!conf) { res.writeHead(400); res.end(JSON.stringify({ error: 'phase inconnue' })); return; }
+
+        // Longueur totale de la feuille (colonne clé)
+        const lenQ = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'" + conf.feuille + "'!" + conf.keyCol + ":" + conf.keyCol)}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const total = (lenQ.values || []).length;
+        if (from > total) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ done_phase: true, phase, total, maj: 0, trk: 0, skip: 0 }));
+          return;
+        }
+        const to = Math.min(total, from + CHUNK - 1);
+        const q = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'" + conf.feuille + "'!A" + from + ":" + conf.width + to)}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const rows = q.values || [];
+
+        let maj = 0, skip = 0, trk = 0;
+
+        if (phase === 1 || phase === 2) {
+          // Dédoublonnage intra-lot par clé (le dernier gagne)
+          const parCle = new Map();
+          for (const r of rows) {
+            const cnb = phase === 1 ? (r[7] || '') : (r[8] || '');
+            const fla = phase === 1 ? (r[8] || '') : (r[12] || '');
+            const key = cnb.toString().trim() || fla.toString().trim();
+            const iso = toIso2(r[0]);
+            if (!key || !iso) { skip++; continue; }
+            parCle.set(key, { r, iso, fla: fla.toString().trim() });
+          }
+          const lot = [...parCle.entries()];
+          // Upsert par paquets de 400 lignes (rapide, léger pour la base)
+          for (let i = 0; i < lot.length; i += 400) {
+            const part = lot.slice(i, i + 400);
+            const vals = [], params = [];
+            part.forEach(([key, o], j) => {
+              const r = o.r, b = j * 9;
+              const tv = phase === 1 ? (r[6] || '').toString().trim() : '';
+              if (tv) trk++;
+              vals.push('($' + (b+1) + ',$' + (b+2) + ',$' + (b+3) + ',$' + (b+4) + ',$' + (b+5) + ',$' + (b+6) + ',$' + (b+7) + ',$' + (b+8) + ',$' + (b+9) + ')');
+              params.push(key,
+                (phase === 1 ? r[4] : r[5] || '').toString().trim(),
+                (phase === 1 ? r[5] : r[6] || '').toString().trim(),
+                (r[2] || '').toString().trim(),
+                (phase === 1 ? (r[3] || '') : '').toString().trim(),
+                phase === 1 ? 'envoi_piece' : 'remboursement',
+                o.iso,
+                o.fla ? 'FLA:' + o.fla : '',
+                tv);
+            });
+            await pool.query(`
+              INSERT INTO dossiers (numero_dossier, enseigne, departement_ville, ref_produit, piece, decision, date_reception, notes, tracking)
+              VALUES ` + vals.join(',') + `
+              ON CONFLICT (numero_dossier) DO UPDATE SET
+                enseigne = EXCLUDED.enseigne,
+                departement_ville = EXCLUDED.departement_ville,
+                ref_produit = EXCLUDED.ref_produit,
+                piece = CASE WHEN EXCLUDED.piece <> '' THEN EXCLUDED.piece ELSE dossiers.piece END,
+                decision = EXCLUDED.decision,
+                date_reception = EXCLUDED.date_reception,
+                tracking = CASE WHEN EXCLUDED.tracking <> '' THEN EXCLUDED.tracking ELSE dossiers.tracking END
+            `, params);
+            maj += part.length;
+          }
+        } else {
+          // Phase 3 : INTERSPORT → its_dossiers
+          const parCle = new Map();
+          for (const r of rows) {
+            const date = (r[0] || '').toString().trim();
+            const ref = (r[1] || '').toString().trim();
+            const mag = (r[4] || '').toString().trim();
+            if (!date || !ref || !mag || !/\d/.test(date)) { skip++; continue; }
+            parCle.set(date + '|' + ref + '|' + mag, r);
+          }
+          for (const [k, r] of parCle) {
+            const tv = (r[9] || '').toString().trim();
+            if (tv) trk++;
+            await pool.query(`
+              INSERT INTO its_dossiers (date_reception, reference, pannes, magasin, decision, tracking)
+              VALUES ($1,$2,$3,$4,$5,$6)
+              ON CONFLICT (date_reception, reference, magasin) DO UPDATE SET
+                pannes = EXCLUDED.pannes, decision = EXCLUDED.decision,
+                tracking = CASE WHEN EXCLUDED.tracking <> '' THEN EXCLUDED.tracking ELSE its_dossiers.tracking END
+            `, [(r[0]||'').toString().trim(), (r[1]||'').toString().trim(), (r[3]||'').toString().trim(),
+                (r[4]||'').toString().trim(), (r[8]||'').toString().trim(), tv]).catch(() => { skip++; });
+            maj++;
+          }
+        }
+        console.log('Sync complet phase', phase, ':', from + '-' + to, '/', total, '→', maj, 'maj');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ phase, from, to, total, maj, trk, skip, next: to + 1, done_phase: to >= total }));
         return;
       }
 
@@ -1674,6 +1887,24 @@ Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
           }
         }
         } // fin else kbHit (chemin lecture complète)
+      }
+
+      // ── 🧠 ÉTAGE 2 : contexte pannes pour la déduction (interne) ──
+      if (pool && payload.ref_produit && req.url === '/analyze-with-notice') {
+        try {
+          const h = await pool.query(`
+            SELECT UPPER(TRIM(piece)) AS p, COUNT(*) AS n FROM dossiers
+            WHERE ref_produit ILIKE $1 || '%' AND piece IS NOT NULL AND TRIM(piece) <> ''
+            GROUP BY 1 ORDER BY n DESC LIMIT 6`, [payload.ref_produit.trim()]);
+          if (h.rows.length >= 2) {
+            const topPannes = h.rows.map(r => r.p + ' (' + r.n + 'x)').join(', ');
+            const lastMsg2 = payload.messages[payload.messages.length - 1];
+            const orig2 = Array.isArray(lastMsg2.content) ? lastMsg2.content : [{ type: 'text', text: lastMsg2.content }];
+            lastMsg2.content = [{ type: 'text', text:
+              'CONTEXTE INTERNE (aide à ta déduction de pièces, à ne JAMAIS réciter ni mentionner dans ta réponse) — pièces historiquement les plus demandées sur ce produit : ' + topPannes + '. Si la panne décrite est ambiguë, ce contexte peut orienter ton choix de repères, mais la notice et les photos priment toujours.' },
+              ...orig2];
+          }
+        } catch(e) {}
       }
 
       // ── ANALYSE STANDARD ──────────────────────────────────
