@@ -1498,6 +1498,14 @@ Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
         stats.par_magasin = Object.entries(magasins)
           .sort((a, b) => b[1].n - a[1].n)
           .map(([ville, o]) => ({ ville, n: o.n, envois: o.envois, remboursements: o.remb }));
+        // Liste complète compacte : permet au cerveau de répondre aux questions
+        // par magasin, par mois, par pièce sur TOUS les dossiers de la référence
+        stats.tous = rows.map(r => [
+          (r.date_reception || '').slice(0, 10),
+          (r.departement_ville || '').trim(),
+          (r.piece || '').trim(),
+          r.decision === 'remboursement' ? 'R' : 'E'
+        ]);
         stats.top_pieces = Object.entries(pieces).sort((a, b) => b[1] - a[1]).slice(0, 10)
           .map(([piece, n]) => ({ piece, n }));
         stats.par_mois = Object.entries(mois).sort((a, b) => a[0].localeCompare(b[0]))
