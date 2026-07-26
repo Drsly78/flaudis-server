@@ -832,6 +832,52 @@ const server = http.createServer(async function(req, res) {
       // ⛔ NOTICES TEMPORAIREMENT DÉSACTIVÉES (économie RAM Railway)
       // Pour réactiver : passer NOTICES_ENABLED à true (ou définir la
       // variable d'env NOTICES_ENABLED=true dans Railway).
+      // ── RECHERCHE : bases SU / ITS (miroir des feuilles) ──────
+      if (req.url === '/recherche') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ resultats: [] })); return; }
+        const univers = payload.univers === 'its' ? 'its' : 'su';
+        const q = (payload.q || '').trim();
+        if (!q) { res.writeHead(400); res.end(JSON.stringify({ error: 'q requis' })); return; }
+        const mots = q.split(/\s+/).filter(Boolean).slice(0, 6);
+
+        // Un mot "date FR" (23/07 ou 23/07/26) doit matcher les deux conventions :
+        // ISO 2026-07-23 (base SU) et JJ/MM/AA (base ITS)
+        const variantes = (mot) => {
+          const v = ['%' + mot + '%'];
+          const m = mot.match(/^(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?$/);
+          if (m) {
+            const jj = m[1].padStart(2, '0'), mm = m[2].padStart(2, '0');
+            const aa = m[3] ? (m[3].length === 4 ? m[3].slice(2) : m[3]) : null;
+            v.push('%' + (aa ? '20' + aa : '') + '-' + mm + '-' + jj + '%'); // ISO
+            v.push('%' + jj + '/' + mm + (aa ? '/' + aa : '') + '%');        // JJ/MM/AA
+          }
+          return v;
+        };
+
+        const champs = univers === 'su'
+          ? ['numero_dossier', 'enseigne', 'departement_ville', 'ref_produit', 'piece', 'decision', 'date_reception', 'notes', 'tracking']
+          : ['date_reception', 'reference', 'pannes', 'magasin', 'decision', 'accord', 'tracking'];
+        const params = [];
+        const conds = mots.map(mot => {
+          const ors = [];
+          for (const v of variantes(mot)) {
+            for (const c of champs) {
+              params.push(v);
+              ors.push(c + ' ILIKE $' + params.length);
+            }
+          }
+          return '(' + ors.join(' OR ') + ')';
+        });
+        const table = univers === 'su' ? 'dossiers' : 'its_dossiers';
+        const orderCol = univers === 'su' ? 'date_reception' : 'created_at';
+        const sql = 'SELECT * FROM ' + table + ' WHERE ' + conds.join(' AND ') +
+                    ' ORDER BY ' + orderCol + ' DESC NULLS LAST LIMIT 50';
+        const r = await pool.query(sql, params);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ resultats: r.rows, total: r.rows.length }));
+        return;
+      }
+
       // ── SYNC HISTORIQUE : Sheet → PostgreSQL ──────────────────
       // Relit la fin des feuilles réelles et met à jour les bases
       // historique (UPSERT — aucune suppression possible).
@@ -866,16 +912,17 @@ const server = http.createServer(async function(req, res) {
               const iso = toIso(r[0]);
               if (!key || !iso) { skip++; continue; }
               await pool.query(`
-                INSERT INTO dossiers (numero_dossier, enseigne, departement_ville, ref_produit, piece, decision, date_reception, notes)
-                VALUES ($1,$2,$3,$4,$5,'envoi_piece',$6,$7)
+                INSERT INTO dossiers (numero_dossier, enseigne, departement_ville, ref_produit, piece, decision, date_reception, notes, tracking)
+                VALUES ($1,$2,$3,$4,$5,'envoi_piece',$6,$7,$8)
                 ON CONFLICT (numero_dossier) DO UPDATE SET
                   departement_ville = EXCLUDED.departement_ville,
                   ref_produit = EXCLUDED.ref_produit,
                   piece = EXCLUDED.piece,
-                  date_reception = EXCLUDED.date_reception
+                  date_reception = EXCLUDED.date_reception,
+                  tracking = CASE WHEN EXCLUDED.tracking <> '' THEN EXCLUDED.tracking ELSE dossiers.tracking END
               `, [key, (r[4] || '').toString().trim(), (r[5] || '').toString().trim(),
                   (r[2] || '').toString().trim(), (r[3] || '').toString().trim(), iso,
-                  fla ? 'FLA:' + fla : '']);
+                  fla ? 'FLA:' + fla : '', (r[6] || '').toString().trim()]);
               up++;
             }
             // REMBOURSEMENT SU — clé CNB (I) / FLA (M)
