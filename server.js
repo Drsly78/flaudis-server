@@ -250,10 +250,13 @@ async function pdfToImages(pdfBuffer, maxPages = 14) {
   } catch(e) { console.error('pdfToImages error:', e.message); return []; }
 }
 
+const MODEL_MAIN  = process.env.MODEL_MAIN  || 'claude-sonnet-4-6';
+const MODEL_LIGHT = process.env.MODEL_LIGHT || 'claude-haiku-4-5-20251001';
+
 function callAnthropic(payload) {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify({
-      model: 'claude-sonnet-4-6',
+      model: payload.model || MODEL_MAIN,
       max_tokens: payload.max_tokens || 2000,
       ...(payload.system ? { system: payload.system } : {}),
       messages: payload.messages
@@ -694,6 +697,134 @@ const server = http.createServer(async function(req, res) {
       // ⛔ NOTICES TEMPORAIREMENT DÉSACTIVÉES (économie RAM Railway)
       // Pour réactiver : passer NOTICES_ENABLED à true (ou définir la
       // variable d'env NOTICES_ENABLED=true dans Railway).
+      // ── INTERSPORT 0/2 : référentiel produits lu DANS le Sheet ──
+      // Feuilles CODE PRODUITS + PRIX AVOIR, jointes et mises en cache 30 min.
+      // Toujours à jour : modifier le Sheet suffit, aucun fichier à régénérer.
+      if (req.url === '/its-referentiel') {
+        if (!GOOGLE_SHEET_ID) { res.writeHead(500); res.end(JSON.stringify({ error: 'GOOGLE_SHEET_ID manquant' })); return; }
+        global._itsRefCache = global._itsRefCache || { ts: 0, items: [] };
+        const FRESH = 30 * 60 * 1000;
+        if (!payload.force && global._itsRefCache.items.length && Date.now() - global._itsRefCache.ts < FRESH) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ items: global._itsRefCache.items, cached: true }));
+          return;
+        }
+        const token = await getSheetsToken();
+        const bg = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchGet?ranges=${encodeURIComponent("'CODE PRODUITS'!A:G")}&ranges=${encodeURIComponent("'PRIX AVOIR'!A:F")}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        if (!bg.valueRanges) { res.writeHead(500); res.end(JSON.stringify({ error: 'Lecture des feuilles CODE PRODUITS / PRIX AVOIR impossible', detail: bg.error?.message })); return; }
+        const nrmJ = v => String(v || '').toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^A-Z0-9]/g, '');
+        const prixByCode = {}, prixByName = {};
+        (bg.valueRanges[1].values || []).slice(2).forEach(r => {
+          const code = (r[0] || '').toString().trim(), lib = (r[1] || '').toString().trim();
+          let v = r[4] !== undefined ? String(r[4]).trim() : '';
+          if (!v) return;
+          const num = parseFloat(v.replace(',', '.'));
+          if (!isNaN(num)) v = String(Math.round(num * 100) / 100);
+          if (code) prixByCode[nrmJ(code)] = v;
+          if (lib) prixByName[nrmJ(lib)] = v;
+        });
+        const items = [];
+        (bg.valueRanges[0].values || []).slice(2).forEach(r => {
+          const ref = (r[0] || '').toString().trim();
+          if (!ref) return;
+          const art = (r[3] || '').toString().trim();
+          items.push({
+            ref,
+            ean: (r[1] || '').toString().trim(),
+            action: (r[4] || '').toString().trim(),
+            famille: (r[6] || '').toString().trim(),
+            prix: prixByCode[nrmJ(art)] || prixByName[nrmJ(ref)] || ''
+          });
+        });
+        global._itsRefCache = { ts: Date.now(), items };
+        console.log('Référentiel ITS rechargé depuis le Sheet:', items.length, 'produits');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ items }));
+        return;
+      }
+
+      // ── INTERSPORT 1/2 : extraction mail + bon de retour ──────
+      if (req.url === '/its-extract') {
+        const content = [];
+        if (payload.file_b64) {
+          const media = payload.media_type || 'application/pdf';
+          content.push(media === 'application/pdf'
+            ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: payload.file_b64 } }
+            : { type: 'image', source: { type: 'base64', media_type: media, data: payload.file_b64 } });
+        }
+        content.push({ type: 'text', text: `Voici un dossier SAV Intersport : le texte du mail reçu, et si joint, le bon de retour (PDF ou image).
+
+TEXTE DU MAIL :
+${(payload.mail_text || '(non fourni)').slice(0, 6000)}
+
+Extrais les informations suivantes. Règles :
+- date_mail : la date d'ENVOI DU MAIL (dans l'en-tête du mail, format "Envoyé : ..."), convertie en JJ/MM/AA. JAMAIS la date du bon de retour.
+- ville et cp : l'adresse du MAGASIN expéditeur, en haut à gauche du bon de retour (pas l'adresse Intersport France Longjumeau qui est le siège).
+- magasin_nom : le nom du magasin (ex JAUDE SPORT, INTERSPORT JAUDE).
+- retour_no : le numéro de retour (ex 32-627), présent dans l'objet du mail ou le bon.
+- produits : la liste de TOUS les produits du bon de retour (il peut y en avoir plusieurs, une ligne de tableau chacun). Pour chaque produit : son NOM/désignation (ex E SWIM 10) et marque si visible — PAS la référence chiffrée qui est propre au magasin — sa quantité, et son motif propre s'il est indiqué sur sa ligne.
+- motif_global : la panne/le motif général s'il est écrit hors tableau (mail, haut du bon).
+Réponds UNIQUEMENT avec ce JSON, sans texte autour :
+{"date_mail":"JJ/MM/AA","cp":"63000","ville":"CLERMONT FERRAND","magasin_nom":"...","motif_global":"...","produits":[{"produit_nom":"...","marque":"...","quantite":1,"motif":"..."}]}` });
+
+        const aiData = await callAnthropic({
+          model: process.env.MODEL_EXTRACT || MODEL_MAIN,
+          messages: [{ role: 'user', content }],
+          max_tokens: 1200
+        });
+        const raw = (aiData.content || []).map(b => b.text || '').join('');
+        let parsed = null;
+        try { parsed = JSON.parse(raw.replace(/```json|```/g, '').trim()); }
+        catch(e) { const m = raw.match(/\{[\s\S]*\}/); if (m) { try { parsed = JSON.parse(m[0]); } catch(e2) {} } }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(parsed || { error: 'Extraction illisible', raw: raw.slice(0, 300) }));
+        return;
+      }
+
+      // ── INTERSPORT 2/2 : export vers la feuille INTERSPORT ────
+      // Accepte plusieurs produits : une ligne par produit, quantités
+      // multiples d'un même produit sur la même ligne.
+      if (req.url === '/its-export') {
+        if (!GOOGLE_SHEET_ID) { res.writeHead(500); res.end(JSON.stringify({ error: 'GOOGLE_SHEET_ID manquant' })); return; }
+        const d = payload;
+        const produits = Array.isArray(d.produits) ? d.produits : [];
+        if (!d.date || !d.magasin || !produits.length) { res.writeHead(400); res.end(JSON.stringify({ error: 'date, magasin et produits requis' })); return; }
+        const token = await getSheetsToken();
+
+        // Lignes existantes pour l'anti-doublon (date + référence + magasin)
+        const existing = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'INTERSPORT'!A:E")}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const nrm = v => String(v || '').toUpperCase().trim();
+        const exRows = existing.values || [];
+        const isDup = (ref) => exRows.some(row =>
+          nrm(row[0]) === nrm(d.date) && nrm(row[1]) === nrm(ref) &&
+          nrm(row[4]).includes(nrm(d.magasin).slice(0, 12)));
+
+        const values = [], applied = [], skipped = [];
+        for (const p of produits) {
+          const ref = (p.reference || '').trim();
+          if (!ref) { skipped.push({ reference: '?', reason: 'référence vide' }); continue; }
+          if (isDup(ref)) { skipped.push({ reference: ref, reason: 'déjà dans la feuille (même date/magasin)' }); continue; }
+          const commentaires = [p.quantite && parseInt(p.quantite) > 1 ? 'Qté ' + p.quantite : '',
+                                d.commentaires || ''].filter(Boolean).join(' — ');
+          // A DATE | B REFERENCE | C N° LOT | D PANNES | E MAGASIN | F COMMENTAIRES | G-J vides
+          values.push([d.date, ref, p.lot || '', p.pannes || '', d.magasin, commentaires, '', '', '', '']);
+          applied.push(ref);
+        }
+        if (values.length) {
+          await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'INTERSPORT'!A:J")}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`, {
+            method: 'POST',
+            headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ values })
+          });
+        }
+        console.log('Export INTERSPORT:', d.magasin, '|', applied.length, 'ligne(s),', skipped.length, 'ignorée(s)');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ applied, skipped }));
+        return;
+      }
+
       // ── TRACKINGS : helpers ───────────────────────────────────
       async function getSheetGid(token, sheetName) {
         const meta = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}?fields=sheets.properties`,
@@ -745,7 +876,10 @@ Règles :
 - date = la date d'expédition du bordereau au format JJ/MM/AAAA.
 Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
 {"transporteur":"DPD|DSV|AUTRE","date":"JJ/MM/AAAA","lignes":[{"tracking":"...","cp":"...","ville":"...","enseigne":"..."}]}`;
+        // Extraction bordereaux : les numéros ne sont PAS revérifiés par
+        // l'opérateur → modèle principal obligatoire (fiabilité des chiffres).
         const aiData = await callAnthropic({
+          model: process.env.MODEL_EXTRACT || MODEL_MAIN,
           messages: [{ role: 'user', content: [ block, { type: 'text', text: prompt } ] }],
           max_tokens: 3000
         });
@@ -1052,6 +1186,8 @@ Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
       }
 
       // ── ANALYSE STANDARD ──────────────────────────────────
+      if (payload.task === 'light') payload.model = MODEL_LIGHT;
+      delete payload.task;
       const data = await callAnthropic(payload);
 
       // ── 🧠 CERVEAU PRODUIT : mémoriser la transcription ───────
