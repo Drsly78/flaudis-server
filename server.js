@@ -782,9 +782,7 @@ Réponds UNIQUEMENT avec ce JSON, sans texte autour :
         return;
       }
 
-      // ── INTERSPORT 2/2 : export vers la feuille INTERSPORT ────
-      // Accepte plusieurs produits : une ligne par produit, quantités
-      // multiples d'un même produit sur la même ligne.
+      // ── INTERSPORT 2/2 : export INTERSPORT + bascule REMBOURSEMENT ITS ──
       if (req.url === '/its-export') {
         if (!GOOGLE_SHEET_ID) { res.writeHead(500); res.end(JSON.stringify({ error: 'GOOGLE_SHEET_ID manquant' })); return; }
         const d = payload;
@@ -792,36 +790,117 @@ Réponds UNIQUEMENT avec ce JSON, sans texte autour :
         if (!d.date || !d.magasin || !produits.length) { res.writeHead(400); res.end(JSON.stringify({ error: 'date, magasin et produits requis' })); return; }
         const token = await getSheetsToken();
 
-        // Lignes existantes pour l'anti-doublon (date + référence + magasin)
+        const now = new Date();
+        const jj = String(now.getDate()).padStart(2, '0');
+        const mm = String(now.getMonth() + 1).padStart(2, '0');
+        const aa = String(now.getFullYear()).slice(2);
+        const todayFR = jj + '/' + mm + '/' + aa;
+
+        // Anti-doublon (date + référence + magasin)
         const existing = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'INTERSPORT'!A:E")}`,
           { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
-        const nrm = v => String(v || '').toUpperCase().trim();
+        const nrmD = v => String(v || '').toUpperCase().trim();
         const exRows = existing.values || [];
         const isDup = (ref) => exRows.some(row =>
-          nrm(row[0]) === nrm(d.date) && nrm(row[1]) === nrm(ref) &&
-          nrm(row[4]).includes(nrm(d.magasin).slice(0, 12)));
+          nrmD(row[0]) === nrmD(d.date) && nrmD(row[1]) === nrmD(ref) &&
+          nrmD(row[4]).includes(nrmD(d.magasin).slice(0, 12)));
 
-        const values = [], applied = [], skipped = [];
+        const values = [], applied = [], skipped = [], avoirProds = [];
         for (const p of produits) {
           const ref = (p.reference || '').trim();
           if (!ref) { skipped.push({ reference: '?', reason: 'référence vide' }); continue; }
           if (isDup(ref)) { skipped.push({ reference: ref, reason: 'déjà dans la feuille (même date/magasin)' }); continue; }
+          const etat = (p.decision || '').trim();
+          const isAvoir = etat.toUpperCase() === 'AVOIR';
           const commentaires = [p.quantite && parseInt(p.quantite) > 1 ? 'Qté ' + p.quantite : '',
                                 d.commentaires || ''].filter(Boolean).join(' — ');
-          // A DATE | B REFERENCE | C N° LOT | D PANNES | E MAGASIN | F COMMENTAIRES | G-J vides
-          values.push([d.date, ref, p.lot || '', p.pannes || '', d.magasin, commentaires, '', '', '', '']);
-          applied.push(ref);
+          // A DATE | B REF | C LOT | D PANNES | E MAGASIN | F COMM | G DATE RECEP | H DATE EXPE | I ETAT | J TRACKING
+          values.push([d.date, ref, p.lot || '', p.pannes || '', d.magasin, commentaires, '', isAvoir ? todayFR : '', etat, '']);
+          applied.push({ reference: ref, etat });
+          if (isAvoir) avoirProds.push(p);
         }
+
+        // Écriture INTERSPORT (append = ajout pur) + couleurs selon décision
+        let firstRow = null;
         if (values.length) {
-          await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'INTERSPORT'!A:J")}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`, {
+          const ap = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'INTERSPORT'!A:J")}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`, {
             method: 'POST',
             headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
             body: JSON.stringify({ values })
+          }).then(r => r.json());
+          const ur = ap.updates && ap.updates.updatedRange;
+          const mrow = ur && ur.match(/![A-Z]+(\d+)/);
+          if (mrow) firstRow = parseInt(mrow[1]);
+
+          if (firstRow) {
+            const gid = await getSheetGid(token, 'INTERSPORT');
+            if (gid !== null) {
+              const requests = [];
+              values.forEach((row, i) => {
+                const etat = (row[8] || '').toUpperCase();
+                let color = null;
+                if (etat === 'AVOIR') color = { red: 146/255, green: 208/255, blue: 80/255 };          // #92d050
+                else if (etat === 'DEMANDE RENVOI') color = { red: 1, green: 153/255, blue: 1 };        // #ff99ff
+                if (color) requests.push({
+                  repeatCell: {
+                    range: { sheetId: gid, startRowIndex: firstRow - 1 + i, endRowIndex: firstRow + i, startColumnIndex: 0, endColumnIndex: 10 },
+                    cell: { userEnteredFormat: { backgroundColor: color } },
+                    fields: 'userEnteredFormat.backgroundColor'
+                  }
+                });
+              });
+              if (requests.length) {
+                await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}:batchUpdate`, {
+                  method: 'POST',
+                  headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ requests })
+                });
+              }
+            }
+          }
+        }
+
+        // ── Bascule des AVOIR vers REMBOURSEMENT ITS ─────────────
+        // Feuille dynamique : on n'écrit QUE B, D, G, H (et J si non-DDP).
+        // Les colonnes à formules (A, C, E, F, I, K) ne sont jamais touchées.
+        const remboursements = [];
+        if (avoirProds.length) {
+          const bg = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchGet?ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!B:B")}&ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!G:G")}&ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!J:J")}`,
+            { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+          const vr = bg.valueRanges || [];
+          const lens = vr.map(v => (v.values || []).length);
+          let row = Math.max(4, ...lens) + 1; // première ligne libre (données dès la ligne 5)
+
+          // Dernier numéro d'accord du mois courant (colonne J)
+          const jvals = ((vr[2] || {}).values || []).map(x => (x[0] || '').toString().trim());
+          const prefix = 'ITS' + aa + mm;
+          let maxSeq = 0;
+          const reNum = new RegExp('^' + prefix + '(\\d{3})$');
+          jvals.forEach(v => { const m = v.match(reNum); if (m) maxSeq = Math.max(maxSeq, parseInt(m[1])); });
+
+          const updates = [];
+          for (const p of avoirProds) {
+            const isDDP = String(p.prix || '').toUpperCase().includes('DDP');
+            let accord = '';
+            if (!isDDP) { maxSeq++; accord = prefix + String(maxSeq).padStart(3, '0'); }
+            updates.push({ range: "'REMBOURSEMENT ITS'!B" + row, values: [[d.date]] });
+            updates.push({ range: "'REMBOURSEMENT ITS'!D" + row, values: [[p.quantite || '1']] });
+            updates.push({ range: "'REMBOURSEMENT ITS'!G" + row, values: [[p.reference]] });
+            updates.push({ range: "'REMBOURSEMENT ITS'!H" + row, values: [[d.magasin]] });
+            if (accord) updates.push({ range: "'REMBOURSEMENT ITS'!J" + row, values: [[accord]] });
+            remboursements.push({ reference: p.reference, ligne: row, accord: accord || '(DDP — sans numéro)' });
+            row++;
+          }
+          await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchUpdate`, {
+            method: 'POST',
+            headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ valueInputOption: 'RAW', data: updates })
           });
         }
-        console.log('Export INTERSPORT:', d.magasin, '|', applied.length, 'ligne(s),', skipped.length, 'ignorée(s)');
+
+        console.log('Export ITS:', applied.length, 'ligne(s) INTERSPORT,', remboursements.length, 'remboursement(s),', skipped.length, 'ignorée(s)');
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ applied, skipped }));
+        res.end(JSON.stringify({ applied, skipped, remboursements }));
         return;
       }
 
