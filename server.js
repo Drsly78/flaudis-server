@@ -895,38 +895,55 @@ const server = http.createServer(async function(req, res) {
       }
 
       // ── TABLEAU DE BORD : agrégats SU + ITS ───────────────────
+      // Les stats ITS s'appuient sur la VRAIE date de réception (texte JJ/MM/AA
+      // converti), jamais sur la date d'insertion en base (faussée par l'import).
       if (req.url === '/dashboard') {
         if (!pool) { res.writeHead(200); res.end(JSON.stringify({ error: 'no db' })); return; }
-        const su7 = await pool.query(`SELECT COUNT(*) AS n FROM dossiers WHERE date_reception::date > NOW() - INTERVAL '7 days'`);
+        const ITS_DATE = `date_reception ~ '^\\d{1,2}/\\d{1,2}/\\d{2}$' AND TO_DATE(date_reception,'DD/MM/YY')`;
+
+        const su7 = await pool.query(`SELECT COUNT(*) AS n FROM dossiers WHERE date_reception::date > NOW()::date - 7`);
         const su30 = await pool.query(`
           SELECT COALESCE(SUM(CASE WHEN decision = 'remboursement' THEN 1 ELSE 0 END),0) AS remb,
                  COALESCE(SUM(CASE WHEN decision <> 'remboursement' THEN 1 ELSE 0 END),0) AS envois
-          FROM dossiers WHERE date_reception::date > NOW() - INTERVAL '30 days'`);
+          FROM dossiers WHERE date_reception::date > NOW()::date - 30`);
+        const suTotal = await pool.query(`
+          SELECT COALESCE(SUM(CASE WHEN decision = 'remboursement' THEN 1 ELSE 0 END),0) AS remb,
+                 COALESCE(SUM(CASE WHEN decision <> 'remboursement' THEN 1 ELSE 0 END),0) AS envois
+          FROM dossiers`);
         const semaines = await pool.query(`
           SELECT TO_CHAR(DATE_TRUNC('week', date_reception::date), 'DD/MM') AS sem,
                  SUM(CASE WHEN decision = 'remboursement' THEN 1 ELSE 0 END) AS remb,
                  SUM(CASE WHEN decision <> 'remboursement' THEN 1 ELSE 0 END) AS envois
-          FROM dossiers WHERE date_reception::date > NOW() - INTERVAL '8 weeks'
+          FROM dossiers WHERE date_reception::date > NOW()::date - 56
           GROUP BY DATE_TRUNC('week', date_reception::date)
           ORDER BY DATE_TRUNC('week', date_reception::date)`);
         const topProduits = await pool.query(`
           SELECT ref_produit AS ref, COUNT(*) AS n FROM dossiers
-          WHERE date_reception::date > NOW() - INTERVAL '30 days' AND ref_produit IS NOT NULL AND TRIM(ref_produit) <> ''
+          WHERE date_reception::date > NOW()::date - 30 AND ref_produit IS NOT NULL AND TRIM(ref_produit) <> ''
           GROUP BY ref_produit ORDER BY n DESC LIMIT 6`);
+
         const its30 = await pool.query(`
           SELECT COALESCE(NULLIF(TRIM(decision), ''), 'À DÉCIDER') AS d, COUNT(*) AS n
-          FROM its_dossiers WHERE created_at > NOW() - INTERVAL '30 days'
+          FROM its_dossiers WHERE ${ITS_DATE} > NOW()::date - 30
           GROUP BY 1 ORDER BY n DESC`);
+        const its30Total = its30.rows.reduce((a, r) => a + parseInt(r.n), 0);
+        const itsTotal = await pool.query(`
+          SELECT COALESCE(NULLIF(TRIM(decision), ''), 'À DÉCIDER') AS d, COUNT(*) AS n
+          FROM its_dossiers GROUP BY 1 ORDER BY n DESC`);
         const itsAvoirsMois = await pool.query(`
           SELECT COUNT(*) AS n FROM its_dossiers
-          WHERE UPPER(COALESCE(decision,'')) = 'AVOIR' AND created_at > DATE_TRUNC('month', NOW())`);
+          WHERE UPPER(COALESCE(decision,'')) = 'AVOIR' AND ${ITS_DATE} >= DATE_TRUNC('month', NOW())::date`);
+
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           su_7j: parseInt(su7.rows[0].n),
           su_30j: { envois: parseInt(su30.rows[0].envois), remb: parseInt(su30.rows[0].remb) },
+          su_total: { envois: parseInt(suTotal.rows[0].envois), remb: parseInt(suTotal.rows[0].remb) },
           semaines: semaines.rows,
           top_produits: topProduits.rows,
           its_30j: its30.rows,
+          its_30j_total: its30Total,
+          its_total: itsTotal.rows,
           its_avoirs_mois: parseInt(itsAvoirsMois.rows[0].n)
         }));
         return;
