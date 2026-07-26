@@ -74,6 +74,11 @@ async function initDB() {
         updated_at TIMESTAMP DEFAULT NOW()
       )
     `);
+    // Lever la limite VARCHAR(100) héritée de la création initiale :
+    // les désignations de pièces / villes longues du Sheet la dépassent.
+    for (const col of ['numero_dossier', 'enseigne', 'departement_ville', 'ref_produit', 'piece', 'decision', 'notes']) {
+      await pool.query('ALTER TABLE dossiers ALTER COLUMN ' + col + ' TYPE TEXT').catch(() => {});
+    }
     console.log('Table dossiers OK');
   } catch(e) { console.error('DB init error:', e.message); }
 }
