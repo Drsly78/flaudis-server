@@ -1038,6 +1038,15 @@ Réponds UNIQUEMENT avec ce JSON, sans texte autour :
         let parsed = null;
         try { parsed = JSON.parse(raw.replace(/```json|```/g, '').trim()); }
         catch(e) { const m = raw.match(/\{[\s\S]*\}/); if (m) { try { parsed = JSON.parse(m[0]); } catch(e2) {} } }
+        // Filtre dur : une incertitude n'est recevable QUE sur les champs utiles
+        // (magasin/ville/cp, produit, quantité, motif/panne, date). Tout le reste
+        // (marque, numéros de retour, références internes…) est écarté d'office.
+        if (parsed && Array.isArray(parsed.incertitudes)) {
+          const champsUtiles = /^(magasin|ville|cp|produit|quantit|motif|panne|date)/i;
+          parsed.incertitudes = parsed.incertitudes
+            .map(x => String(x || '').trim())
+            .filter(x => champsUtiles.test(x));
+        }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(parsed || { error: 'Extraction illisible', raw: raw.slice(0, 300) }));
         return;
