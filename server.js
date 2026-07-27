@@ -1213,6 +1213,36 @@ const server = http.createServer(async function(req, res) {
         return;
       }
 
+      // ── INTERSPORT : données de réponse mail (relecture des lignes
+      // exportées dans REMBOURSEMENT ITS — les formules C/E/F/I y ont
+      // calculé prix, code article, EAN et code sociétaire) ──────────
+      if (req.url === '/its-reply-data') {
+        if (!GOOGLE_SHEET_ID) { res.writeHead(500); res.end(JSON.stringify({ error: 'GOOGLE_SHEET_ID manquant' })); return; }
+        const rows = (Array.isArray(payload.rows) ? payload.rows : []).map(n => parseInt(n)).filter(n => n > 0).slice(0, 20);
+        if (!rows.length) { res.writeHead(400); res.end(JSON.stringify({ error: 'rows requis' })); return; }
+        const token = await getSheetsToken();
+        const ranges = rows.map(n => 'ranges=' + encodeURIComponent("'REMBOURSEMENT ITS'!A" + n + ":K" + n)).join('&');
+        const bg = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchGet?${ranges}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const data = (bg.valueRanges || []).map((vr, i) => {
+          const r = (vr.values && vr.values[0]) || [];
+          return {
+            ligne: rows[i],
+            prix: (r[2] || '').toString().trim(),
+            qte: (r[3] || '').toString().trim(),
+            code_article: (r[4] || '').toString().trim(),
+            ean: (r[5] || '').toString().trim(),
+            ref: (r[6] || '').toString().trim(),
+            dept_ville: (r[7] || '').toString().trim(),
+            code_societaire: (r[8] || '').toString().trim(),
+            accord: (r[9] || '').toString().trim()
+          };
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ data }));
+        return;
+      }
+
       // ── INTERSPORT : historique par magasin (4 mois) ──────────
       if (req.url === '/its-historique') {
         if (!pool) { res.writeHead(200); res.end(JSON.stringify({ total: 0, dossiers: [] })); return; }
