@@ -1146,15 +1146,17 @@ const server = http.createServer(async function(req, res) {
           .replace(/[^A-Z0-9]/g, '').replace(/SAINT/g, 'ST');
         const univers = payload.univers === 'su' ? 'su' : 'its';
         const q = univers === 'su'
-          ? await pool.query('SELECT departement_ville AS magasin, COUNT(*) AS n FROM dossiers GROUP BY departement_ville')
-          : await pool.query('SELECT magasin, COUNT(*) AS n FROM its_dossiers GROUP BY magasin');
+          ? await pool.query(`SELECT departement_ville AS magasin, COUNT(*) AS n,
+                MAX(date_reception::date) AS dernier FROM dossiers GROUP BY departement_ville`)
+          : await pool.query(`SELECT magasin, COUNT(*) AS n,
+                MAX(COALESCE(created_at::date, NOW()::date)) AS dernier FROM its_dossiers GROUP BY magasin`);
         const groupes = {};
         for (const r of q.rows) {
           const mag = String(r.magasin || '').trim();
           if (!mag) continue;
           const dept = (mag.match(/^(\d{2,3})/) || [])[1] || '?';
           const cle = dept + '|' + normV(mag.replace(/^\d{2,3}\s*/, ''));
-          (groupes[cle] = groupes[cle] || []).push({ nom: mag, n: parseInt(r.n) });
+          (groupes[cle] = groupes[cle] || []).push({ nom: mag, n: parseInt(r.n), dernier: r.dernier ? String(r.dernier).slice(0, 10) : null });
         }
         const variantes = Object.values(groupes)
           .filter(g => g.length >= 2)
