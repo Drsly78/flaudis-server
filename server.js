@@ -583,6 +583,27 @@ const server = http.createServer(async function(req, res) {
         return;
       }
 
+      // ── ACCORD SUIVANT : prochain numéro SUaamm### (affichage) ──
+      if (req.url === '/accord-suivant') {
+        if (!GOOGLE_SHEET_ID) { res.writeHead(200); res.end(JSON.stringify({ accord: null })); return; }
+        const token = await getSheetsToken();
+        const now = new Date();
+        const aa = String(now.getFullYear()).slice(2);
+        const mm = String(now.getMonth() + 1).padStart(2, '0');
+        const prefix = 'SU' + aa + mm;
+        const q = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'REMBOURSEMENT SU'!J:J")}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        let maxSeq = 0;
+        const reNum = new RegExp('^' + prefix + '(\\d{3})$');
+        ((q.values || []).flat()).forEach(v => {
+          const m = String(v || '').trim().match(reNum);
+          if (m) maxSeq = Math.max(maxSeq, parseInt(m[1]));
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ accord: prefix + String(maxSeq + 1).padStart(3, '0') }));
+        return;
+      }
+
       // ── EXPORT U DIRECT : SYSTEME U / REMBOURSEMENT SU ────────
       // Écrit sur la première ligne libre des feuilles réelles.
       // SYSTEME U : append pur A:I (dates au format texte JJ/MM/AA maison).
@@ -1108,6 +1129,84 @@ const server = http.createServer(async function(req, res) {
         return;
       }
 
+      // ── HARMONISATION MAGASINS ITS 1/2 : détection des variantes ──
+      // Groupées par département + nom normalisé (accents/tirets/SAINT-ST).
+      if (req.url === '/magasins-variantes') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ groupes: [] })); return; }
+        const normV = v => String(v || '').toUpperCase()
+          .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+          .replace(/[^A-Z0-9]/g, '').replace(/SAINT/g, 'ST');
+        const q = await pool.query('SELECT magasin, COUNT(*) AS n FROM its_dossiers GROUP BY magasin');
+        const groupes = {};
+        for (const r of q.rows) {
+          const mag = String(r.magasin || '').trim();
+          if (!mag) continue;
+          const dept = (mag.match(/^(\d{2,3})/) || [])[1] || '?';
+          const cle = dept + '|' + normV(mag.replace(/^\d{2,3}\s*/, ''));
+          (groupes[cle] = groupes[cle] || []).push({ nom: mag, n: parseInt(r.n) });
+        }
+        const variantes = Object.values(groupes)
+          .filter(g => g.length >= 2)
+          .map(g => g.sort((a, b) => b.n - a.n))
+          .sort((a, b) => (b[0].n + (b[1] ? b[1].n : 0)) - (a[0].n + (a[1] ? a[1].n : 0)));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ groupes: variantes }));
+        return;
+      }
+
+      // ── HARMONISATION MAGASINS ITS 2/2 : fusion VALIDÉE ───────────
+      // Remplace UNIQUEMENT les cellules dont le contenu est EXACTEMENT
+      // une variante à fusionner (comparaison stricte après trim), dans :
+      // INTERSPORT col E, REMBOURSEMENT ITS col H, base its_dossiers.
+      if (req.url === '/magasins-fusion') {
+        if (!pool || !GOOGLE_SHEET_ID) { res.writeHead(500); res.end(JSON.stringify({ error: 'base ou sheet manquant' })); return; }
+        if (payload.confirme !== true) { res.writeHead(400); res.end(JSON.stringify({ error: 'confirmation requise' })); return; }
+        const fusions = (Array.isArray(payload.fusions) ? payload.fusions : []).slice(0, 15)
+          .map(f => ({ garder: String(f.garder || '').trim(), remplacer: (f.remplacer || []).map(x => String(x).trim()).filter(x => x && x !== String(f.garder || '').trim()) }))
+          .filter(f => f.garder && f.remplacer.length);
+        if (!fusions.length) { res.writeHead(400); res.end(JSON.stringify({ error: 'aucune fusion valide' })); return; }
+        const token = await getSheetsToken();
+        const rapport = [];
+
+        // Lecture unique des deux colonnes concernées
+        const bg = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchGet?ranges=${encodeURIComponent("'INTERSPORT'!E:E")}&ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!H:H")}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const colE = ((bg.valueRanges || [])[0] || {}).values || [];
+        const colH = ((bg.valueRanges || [])[1] || {}).values || [];
+
+        const updates = [];
+        for (const f of fusions) {
+          let sheetE = 0, sheetH = 0;
+          colE.forEach((row, i) => {
+            if (f.remplacer.includes(String(row[0] || '').trim())) {
+              updates.push({ range: "'INTERSPORT'!E" + (i + 1), values: [[f.garder]] });
+              sheetE++;
+            }
+          });
+          colH.forEach((row, i) => {
+            if (f.remplacer.includes(String(row[0] || '').trim())) {
+              updates.push({ range: "'REMBOURSEMENT ITS'!H" + (i + 1), values: [[f.garder]] });
+              sheetH++;
+            }
+          });
+          const db = await pool.query('UPDATE its_dossiers SET magasin = $1 WHERE TRIM(magasin) = ANY($2)',
+            [f.garder, f.remplacer]);
+          rapport.push({ garder: f.garder, base: db.rowCount, sheet_intersport: sheetE, sheet_remboursement: sheetH });
+        }
+        // Écriture en paquets de 200 cellules
+        for (let i = 0; i < updates.length; i += 200) {
+          await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchUpdate`, {
+            method: 'POST',
+            headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ valueInputOption: 'RAW', data: updates.slice(i, i + 200) })
+          });
+        }
+        console.log('Fusion magasins:', JSON.stringify(rapport));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, rapport }));
+        return;
+      }
+
       // ── SYNC HISTORIQUE : Sheet → PostgreSQL ──────────────────
       // Relit la fin des feuilles réelles et met à jour les bases
       // historique (UPSERT — aucune suppression possible).
@@ -1248,16 +1347,25 @@ const server = http.createServer(async function(req, res) {
         if (!pool) { res.writeHead(200); res.end(JSON.stringify({ total: 0, dossiers: [] })); return; }
         const mag = (payload.magasin || '').trim();
         if (!mag) { res.writeHead(400); res.end(JSON.stringify({ error: 'magasin requis' })); return; }
-        // Match permissif sur le nom (sans le n° de département)
-        const magNom = mag.replace(/^\d{2,3}\s*/, '');
+        // Matching TOLÉRANT : accents, tirets, points, espaces et SAINT/ST
+        // sont neutralisés — "85 ST-JEAN-DE-MONTS" ≡ "85 SAINT JEAN DE MONTS"
+        const normMag = v => String(v || '').toUpperCase()
+          .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+          .replace(/[^A-Z0-9]/g, '').replace(/SAINT/g, 'ST');
+        const dept = (mag.match(/^(\d{2,3})/) || [])[1] || '';
+        const cible = normMag(mag.replace(/^\d{2,3}\s*/, ''));
         const q = await pool.query(`
-          SELECT date_reception, reference, pannes, decision, accord, tracking, created_at
+          SELECT magasin, date_reception, reference, pannes, decision, accord, tracking, created_at
           FROM its_dossiers
           WHERE magasin ILIKE $1 AND created_at > NOW() - INTERVAL '4 months'
-          ORDER BY created_at DESC LIMIT 60
-        `, ['%' + magNom + '%']);
+          ORDER BY created_at DESC LIMIT 500
+        `, [dept ? dept + '%' : '%']);
+        const dossiers = q.rows.filter(r => {
+          const n = normMag(String(r.magasin || '').replace(/^\d{2,3}\s*/, ''));
+          return n === cible || n.includes(cible) || cible.includes(n);
+        }).slice(0, 60);
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ total: q.rows.length, dossiers: q.rows }));
+        res.end(JSON.stringify({ total: dossiers.length, dossiers }));
         return;
       }
 
