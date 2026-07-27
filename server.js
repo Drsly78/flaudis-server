@@ -403,11 +403,17 @@ const server = http.createServer(async function(req, res) {
         if (!pool) { res.writeHead(200); res.end(JSON.stringify({ par_ref: [], complet: [] })); return; }
         const { enseigne, departement_ville, ref_produit } = payload;
 
-        // Extraire le nom de ville seul (sans département) et normaliser
-        const ville = (departement_ville||'')
-          .replace(/^\d+\s*/, '').trim()
+        // Normalisation TOLÉRANTE : accents, tirets, points, espaces, SAINT/ST
+        const normU = v => String(v || '').toUpperCase()
           .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-          .replace(/-/g, ' ').replace(/\s+/g, ' ').trim();
+          .replace(/[^A-Z0-9]/g, '').replace(/SAINT/g, 'ST');
+        const deptU = ((departement_ville || '').match(/^(\d{2,3})/) || [])[1] || '';
+        const villeCible = normU((departement_ville || '').replace(/^\d+\s*/, ''));
+        const matchVille = r => {
+          const n = normU(String(r.departement_ville || '').replace(/^\d+\s*/, ''));
+          return n === villeCible || n.includes(villeCible) || villeCible.includes(n);
+        };
+        const ville = villeCible; // compat
 
         const HIST_MOIS = 4; // fenêtre d'historique magasin affichée dans l'app
         const sixMoisAvant = new Date();
@@ -417,32 +423,34 @@ const server = http.createServer(async function(req, res) {
         // Tableau 1 : même magasin + même ref, sur la fenêtre HIST_MOIS
         const resRef = await pool.query(`
           SELECT * FROM dossiers
-          WHERE UPPER(departement_ville) LIKE $1
+          WHERE departement_ville ILIKE $1
           AND UPPER(enseigne) LIKE $2
           AND UPPER(ref_produit) = $3
           AND date_reception >= $4
           ORDER BY date_reception DESC
-          LIMIT 20
+          LIMIT 200
         `, [
-          '%' + ville.toUpperCase() + '%',
+          (deptU ? deptU : '') + '%',
           '%' + (enseigne||'').toUpperCase() + '%',
           (ref_produit||'').toUpperCase(),
           dateLimit
         ]);
+        resRef.rows = resRef.rows.filter(matchVille).slice(0, 20);
 
         // Tableau 2 : même magasin tous produits, sur la fenêtre HIST_MOIS
         const resComplet = await pool.query(`
           SELECT * FROM dossiers
-          WHERE UPPER(departement_ville) LIKE $1
+          WHERE departement_ville ILIKE $1
           AND UPPER(enseigne) LIKE $2
           AND date_reception >= $3
           ORDER BY date_reception DESC
-          LIMIT 150
+          LIMIT 600
         `, [
-          '%' + ville.toUpperCase() + '%',
+          (deptU ? deptU : '') + '%',
           '%' + (enseigne||'').toUpperCase() + '%',
           dateLimit
         ]);
+        resComplet.rows = resComplet.rows.filter(matchVille).slice(0, 150);
 
         // Pour chaque dossier avec CNB, tenter de récupérer tracking + date_envoi depuis Sheet
         const enrichir = async (rows) => {
@@ -1136,7 +1144,10 @@ const server = http.createServer(async function(req, res) {
         const normV = v => String(v || '').toUpperCase()
           .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
           .replace(/[^A-Z0-9]/g, '').replace(/SAINT/g, 'ST');
-        const q = await pool.query('SELECT magasin, COUNT(*) AS n FROM its_dossiers GROUP BY magasin');
+        const univers = payload.univers === 'su' ? 'su' : 'its';
+        const q = univers === 'su'
+          ? await pool.query('SELECT departement_ville AS magasin, COUNT(*) AS n FROM dossiers GROUP BY departement_ville')
+          : await pool.query('SELECT magasin, COUNT(*) AS n FROM its_dossiers GROUP BY magasin');
         const groupes = {};
         for (const r of q.rows) {
           const mag = String(r.magasin || '').trim();
@@ -1165,33 +1176,35 @@ const server = http.createServer(async function(req, res) {
           .map(f => ({ garder: String(f.garder || '').trim(), remplacer: (f.remplacer || []).map(x => String(x).trim()).filter(x => x && x !== String(f.garder || '').trim()) }))
           .filter(f => f.garder && f.remplacer.length);
         if (!fusions.length) { res.writeHead(400); res.end(JSON.stringify({ error: 'aucune fusion valide' })); return; }
+        const univers = payload.univers === 'su' ? 'su' : 'its';
         const token = await getSheetsToken();
         const rapport = [];
 
-        // Lecture unique des deux colonnes concernées
-        const bg = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchGet?ranges=${encodeURIComponent("'INTERSPORT'!E:E")}&ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!H:H")}`,
+        // Colonnes concernées selon l'univers (et rien d'autre)
+        const feuilles = univers === 'su'
+          ? [{ nom: 'SYSTEME U', col: 'F' }, { nom: 'REMBOURSEMENT SU', col: 'G' }]
+          : [{ nom: 'INTERSPORT', col: 'E' }, { nom: 'REMBOURSEMENT ITS', col: 'H' }];
+        const ranges = feuilles.map(f2 => 'ranges=' + encodeURIComponent("'" + f2.nom + "'!" + f2.col + ':' + f2.col)).join('&');
+        const bg = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchGet?${ranges}`,
           { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
-        const colE = ((bg.valueRanges || [])[0] || {}).values || [];
-        const colH = ((bg.valueRanges || [])[1] || {}).values || [];
+        const cols = feuilles.map((f2, i) => ({ ...f2, values: ((bg.valueRanges || [])[i] || {}).values || [] }));
 
         const updates = [];
         for (const f of fusions) {
-          let sheetE = 0, sheetH = 0;
-          colE.forEach((row, i) => {
-            if (f.remplacer.includes(String(row[0] || '').trim())) {
-              updates.push({ range: "'INTERSPORT'!E" + (i + 1), values: [[f.garder]] });
-              sheetE++;
-            }
+          const compte = {};
+          cols.forEach(c => {
+            compte[c.nom] = 0;
+            c.values.forEach((row, i) => {
+              if (f.remplacer.includes(String(row[0] || '').trim())) {
+                updates.push({ range: "'" + c.nom + "'!" + c.col + (i + 1), values: [[f.garder]] });
+                compte[c.nom]++;
+              }
+            });
           });
-          colH.forEach((row, i) => {
-            if (f.remplacer.includes(String(row[0] || '').trim())) {
-              updates.push({ range: "'REMBOURSEMENT ITS'!H" + (i + 1), values: [[f.garder]] });
-              sheetH++;
-            }
-          });
-          const db = await pool.query('UPDATE its_dossiers SET magasin = $1 WHERE TRIM(magasin) = ANY($2)',
-            [f.garder, f.remplacer]);
-          rapport.push({ garder: f.garder, base: db.rowCount, sheet_intersport: sheetE, sheet_remboursement: sheetH });
+          const db = univers === 'su'
+            ? await pool.query('UPDATE dossiers SET departement_ville = $1 WHERE TRIM(departement_ville) = ANY($2)', [f.garder, f.remplacer])
+            : await pool.query('UPDATE its_dossiers SET magasin = $1 WHERE TRIM(magasin) = ANY($2)', [f.garder, f.remplacer]);
+          rapport.push({ garder: f.garder, base: db.rowCount, feuilles: compte });
         }
         // Écriture en paquets de 200 cellules
         for (let i = 0; i < updates.length; i += 200) {
