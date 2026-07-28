@@ -62,6 +62,13 @@ async function initDB() {
     await pool.query(`ALTER TABLE dossiers ADD COLUMN IF NOT EXISTS date_envoi TEXT`).catch(() => {});
     await pool.query(`ALTER TABLE dossiers ADD COLUMN IF NOT EXISTS revers_url TEXT`).catch(() => {});
     await pool.query(`
+      CREATE TABLE IF NOT EXISTS villes_ref (
+        norm TEXT PRIMARY KEY,
+        format TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS reponses_types (
         id SERIAL PRIMARY KEY,
         cat TEXT NOT NULL,
@@ -1429,8 +1436,36 @@ const server = http.createServer(async function(req, res) {
         return;
       }
 
+      // ── VILLES VALIDÉES : le format choisi par l'opérateur fait foi ──
+      if (req.url === '/ville-ref-get' || req.url === '/ville-ref-set') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ format: null })); return; }
+        const normV2 = v => String(v || '').toUpperCase()
+          .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+          .replace(/[^A-Z0-9]/g, '').replace(/SAINT/g, 'ST');
+        if (req.url === '/ville-ref-set') {
+          const format = (payload.format || '').trim();
+          if (!format) { res.writeHead(400); res.end(JSON.stringify({ error: 'format requis' })); return; }
+          const cle = normV2(format.replace(/^\d{2,3}\s*/, ''));
+          if (!cle) { res.writeHead(400); res.end(JSON.stringify({ error: 'format invalide' })); return; }
+          await pool.query(`
+            INSERT INTO villes_ref (norm, format) VALUES ($1, $2)
+            ON CONFLICT (norm) DO UPDATE SET format = EXCLUDED.format, created_at = NOW()
+          `, [cle, format]);
+          console.log('Ville validée:', format);
+          res.writeHead(200); res.end(JSON.stringify({ ok: true }));
+          return;
+        }
+        // GET : retrouver le format validé pour un nom scanné
+        const cle = normV2((payload.nom || '').replace(/^\d{2,3}\s*/, ''));
+        if (!cle) { res.writeHead(200); res.end(JSON.stringify({ format: null })); return; }
+        const q = await pool.query('SELECT format FROM villes_ref WHERE norm = $1', [cle]);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ format: q.rows.length ? q.rows[0].format : null }));
+        return;
+      }
+
       // ── INTERSPORT : retrouver le "NN VILLE" connu d'un magasin ──
-      if (req.url === '/its-magasin-lookup') {
+      if (req.url === '/its-magasin-lookup' || req.url === '/magasin-lookup') {
         if (!pool) { res.writeHead(200); res.end(JSON.stringify({ magasin: null })); return; }
         const nomBrut = (payload.nom || '').trim();
         if (!nomBrut) { res.writeHead(400); res.end(JSON.stringify({ error: 'nom requis' })); return; }
@@ -1439,9 +1474,13 @@ const server = http.createServer(async function(req, res) {
           .replace(/[^A-Z0-9]/g, '').replace(/SAINT/g, 'ST');
         const cible = normL(nomBrut.replace(/^\d{2,3}\s*/, ''));
         if (!cible) { res.writeHead(200); res.end(JSON.stringify({ magasin: null })); return; }
-        const q = await pool.query(`
-          SELECT magasin, MAX(created_at) AS dernier FROM its_dossiers
-          WHERE magasin ~ '^\\d{2,3} ' GROUP BY magasin ORDER BY dernier DESC LIMIT 400`);
+        const q = payload.univers === 'su'
+          ? await pool.query(`
+              SELECT departement_ville AS magasin, MAX(date_reception) AS dernier FROM dossiers
+              WHERE departement_ville ~ '^\\d{2,3} ' GROUP BY departement_ville ORDER BY dernier DESC NULLS LAST LIMIT 600`)
+          : await pool.query(`
+              SELECT magasin, MAX(created_at) AS dernier FROM its_dossiers
+              WHERE magasin ~ '^\\d{2,3} ' GROUP BY magasin ORDER BY dernier DESC LIMIT 400`);
         const hit = q.rows.find(r => {
           const n = normL(String(r.magasin).replace(/^\d{2,3}\s*/, ''));
           return n === cible || n.includes(cible) || cible.includes(n);
