@@ -1352,6 +1352,28 @@ const server = http.createServer(async function(req, res) {
         return;
       }
 
+      // ── SUPPRESSION d'un dossier de l'historique (base seule) ─────
+      // Garde-fous : confirmation explicite requise, clé exacte, le Sheet
+      // n'est JAMAIS touché par cet endpoint.
+      if (req.url === '/dossier-delete') {
+        if (!pool) { res.writeHead(500); res.end(JSON.stringify({ error: 'base indisponible' })); return; }
+        if (payload.confirme !== true) { res.writeHead(400); res.end(JSON.stringify({ error: 'confirmation requise' })); return; }
+        let q;
+        if (payload.univers === 'its') {
+          const { date, ref, magasin } = payload;
+          if (!date || !ref || !magasin) { res.writeHead(400); res.end(JSON.stringify({ error: 'clé ITS incomplète' })); return; }
+          q = await pool.query('DELETE FROM its_dossiers WHERE date_reception = $1 AND reference = $2 AND magasin = $3', [date, ref, magasin]);
+        } else {
+          const usv = (payload.usv || '').trim();
+          if (!usv) { res.writeHead(400); res.end(JSON.stringify({ error: 'usv requis' })); return; }
+          q = await pool.query('DELETE FROM dossiers WHERE numero_dossier = $1', [usv]);
+        }
+        console.log('Dossier supprimé de la base:', JSON.stringify(payload));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, supprimes: q.rowCount }));
+        return;
+      }
+
       // ── LIVRAISONS : jours d'expédition + détail d'un jour ────────
       if (req.url === '/livraisons-jours') {
         if (!pool) { res.writeHead(200); res.end(JSON.stringify({ jours: [] })); return; }
