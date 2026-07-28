@@ -939,60 +939,61 @@ const server = http.createServer(async function(req, res) {
         if (!pool) { res.writeHead(200); res.end(JSON.stringify({ error: 'no db' })); return; }
         const ITS_DATE = `date_reception ~ '^\\d{1,2}/\\d{1,2}/\\d{2}$' AND TO_DATE(date_reception,'DD/MM/YY')`;
 
-        const su7 = await pool.query(`SELECT COUNT(*) AS n FROM dossiers WHERE date_reception::date > NOW()::date - 7`);
+        const su7 = await pool.query(`SELECT COUNT(*) AS n FROM dossiers WHERE date_reception::date BETWEEN NOW()::date - 7 AND NOW()::date`);
         const su30 = await pool.query(`
           SELECT COALESCE(SUM(CASE WHEN decision = 'remboursement' THEN 1 ELSE 0 END),0) AS remb,
                  COALESCE(SUM(CASE WHEN decision <> 'remboursement' THEN 1 ELSE 0 END),0) AS envois
-          FROM dossiers WHERE date_reception::date > NOW()::date - 30`);
+          FROM dossiers WHERE date_reception::date BETWEEN NOW()::date - 30 AND NOW()::date`);
         const su12m = await pool.query(`
           SELECT COALESCE(SUM(CASE WHEN decision = 'remboursement' THEN 1 ELSE 0 END),0) AS remb,
                  COALESCE(SUM(CASE WHEN decision <> 'remboursement' THEN 1 ELSE 0 END),0) AS envois
-          FROM dossiers WHERE date_reception::date > NOW()::date - 365`);
+          FROM dossiers WHERE date_reception::date BETWEEN NOW()::date - 365 AND NOW()::date`);
         const moisSu = await pool.query(`
           SELECT TO_CHAR(DATE_TRUNC('month', date_reception::date), 'MM/YY') AS mois,
                  SUM(CASE WHEN decision = 'remboursement' THEN 1 ELSE 0 END) AS remb,
                  SUM(CASE WHEN decision <> 'remboursement' THEN 1 ELSE 0 END) AS envois
-          FROM dossiers WHERE date_reception::date > NOW()::date - 365
+          FROM dossiers WHERE date_reception::date BETWEEN NOW()::date - 365 AND NOW()::date
           GROUP BY DATE_TRUNC('month', date_reception::date)
           ORDER BY DATE_TRUNC('month', date_reception::date)`);
         const topQ = (table, col, jours, dateCond) => pool.query(`
           SELECT ${col} AS ref, COUNT(*) AS n FROM ${table}
           WHERE ${dateCond} AND ${col} IS NOT NULL AND TRIM(${col}) <> ''
           GROUP BY ${col} ORDER BY n DESC LIMIT 6`);
-        const topSu30  = await topQ('dossiers', 'ref_produit', 30, `date_reception::date > NOW()::date - 30`);
-        const topSu12  = await topQ('dossiers', 'ref_produit', 365, `date_reception::date > NOW()::date - 365`);
-        const topIts30 = await topQ('its_dossiers', 'reference', 30, `${ITS_DATE} > NOW()::date - 30`);
-        const topIts12 = await topQ('its_dossiers', 'reference', 365, `${ITS_DATE} > NOW()::date - 365`);
+        const topSu30  = await topQ('dossiers', 'ref_produit', 30, `date_reception::date BETWEEN NOW()::date - 30 AND NOW()::date`);
+        const topSu12  = await topQ('dossiers', 'ref_produit', 365, `date_reception::date BETWEEN NOW()::date - 365 AND NOW()::date`);
+        const topIts30 = await topQ('its_dossiers', 'reference', 30, `${ITS_DATE} BETWEEN NOW()::date - 30 AND NOW()::date`);
+        const topIts12 = await topQ('its_dossiers', 'reference', 365, `${ITS_DATE} BETWEEN NOW()::date - 365 AND NOW()::date`);
 
-        const its7 = await pool.query(`SELECT COUNT(*) AS n FROM its_dossiers WHERE ${ITS_DATE} > NOW()::date - 7`);
+        const its7 = await pool.query(`SELECT COUNT(*) AS n FROM its_dossiers WHERE ${ITS_DATE} BETWEEN NOW()::date - 7 AND NOW()::date`);
         const its30 = await pool.query(`
           SELECT COALESCE(NULLIF(TRIM(decision), ''), 'À DÉCIDER') AS d, COUNT(*) AS n
-          FROM its_dossiers WHERE ${ITS_DATE} > NOW()::date - 30
+          FROM its_dossiers WHERE ${ITS_DATE} BETWEEN NOW()::date - 30 AND NOW()::date
           GROUP BY 1 ORDER BY n DESC`);
         const its30Total = its30.rows.reduce((a, r) => a + parseInt(r.n), 0);
         const its12m = await pool.query(`
           SELECT COALESCE(NULLIF(TRIM(decision), ''), 'À DÉCIDER') AS d, COUNT(*) AS n
-          FROM its_dossiers WHERE ${ITS_DATE} > NOW()::date - 365
+          FROM its_dossiers WHERE ${ITS_DATE} BETWEEN NOW()::date - 365 AND NOW()::date
           GROUP BY 1 ORDER BY n DESC`);
         const moisIts = await pool.query(`
           SELECT TO_CHAR(DATE_TRUNC('month', TO_DATE(date_reception,'DD/MM/YY')), 'MM/YY') AS mois,
                  SUM(CASE WHEN UPPER(COALESCE(decision,'')) = 'AVOIR' THEN 1 ELSE 0 END) AS avoirs,
                  SUM(CASE WHEN UPPER(COALESCE(decision,'')) <> 'AVOIR' THEN 1 ELSE 0 END) AS autres
-          FROM its_dossiers WHERE ${ITS_DATE} > NOW()::date - 365
+          FROM its_dossiers WHERE ${ITS_DATE} BETWEEN NOW()::date - 365 AND NOW()::date
           GROUP BY DATE_TRUNC('month', TO_DATE(date_reception,'DD/MM/YY'))
           ORDER BY DATE_TRUNC('month', TO_DATE(date_reception,'DD/MM/YY'))`);
         const itsAvoirsMois = await pool.query(`
           SELECT COUNT(*) AS n FROM its_dossiers
-          WHERE UPPER(COALESCE(decision,'')) = 'AVOIR' AND ${ITS_DATE} >= DATE_TRUNC('month', NOW())::date`);
+          WHERE UPPER(COALESCE(decision,'')) = 'AVOIR' AND ${ITS_DATE} BETWEEN DATE_TRUNC('month', NOW())::date AND NOW()::date`);
 
         // ── Montants € : lignes AVEC CLÉ uniquement (CNB / référence),
         //    fenêtre 12 mois, cache 10 min ──
         if (!global.EUR_CACHE || (Date.now() - global.EUR_CACHE.t) > 10 * 60 * 1000) {
           try {
             const token = await getSheetsToken();
+            // NB : REMBOURSEMENT SU n'a PAS de colonne montant (C = référence
+            // produit !) — les € ne sont donc calculés que pour ITS (C = prix).
             const bg = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchGet` +
-              `?ranges=${encodeURIComponent("'REMBOURSEMENT SU'!A:A")}&ranges=${encodeURIComponent("'REMBOURSEMENT SU'!C:C")}&ranges=${encodeURIComponent("'REMBOURSEMENT SU'!I:I")}` +
-              `&ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!B:B")}&ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!C:C")}&ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!G:G")}`,
+              `?ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!B:B")}&ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!C:C")}&ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!G:G")}`,
               { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
             const vr2 = bg.valueRanges || [];
             const col = i => (vr2[i] || {}).values || [];
@@ -1031,8 +1032,8 @@ const server = http.createServer(async function(req, res) {
               return { total: Math.round(total), mois, mois_courant: mois[11].somme };
             };
             global.EUR_CACHE = { t: Date.now(), data: {
-              su: agreger(col(0), col(1), col(2)),
-              its: agreger(col(3), col(4), col(5))
+              su: null, // pas de montants dans le tableau U — rien à sommer
+              its: agreger(col(0), col(1), col(2))
             } };
           } catch(e) {
             console.warn('Montants €:', e.message);
@@ -1067,9 +1068,8 @@ const server = http.createServer(async function(req, res) {
         const univers = payload.univers === 'its' ? 'its' : 'su';
         const moisCible = (payload.mois || '').trim(); // 'MM/AA'
         const token = await getSheetsToken();
-        const conf = univers === 'su'
-          ? { d: "'REMBOURSEMENT SU'!A:A", p: "'REMBOURSEMENT SU'!C:C", k: "'REMBOURSEMENT SU'!I:I" }
-          : { d: "'REMBOURSEMENT ITS'!B:B", p: "'REMBOURSEMENT ITS'!C:C", k: "'REMBOURSEMENT ITS'!G:G" };
+        if (univers === 'su') { res.writeHead(200); res.end(JSON.stringify({ info: "REMBOURSEMENT SU n'a pas de colonne montant — aucun € côté U" })); return; }
+        const conf = { d: "'REMBOURSEMENT ITS'!B:B", p: "'REMBOURSEMENT ITS'!C:C", k: "'REMBOURSEMENT ITS'!G:G" };
         const bg = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchGet?ranges=${encodeURIComponent(conf.d)}&ranges=${encodeURIComponent(conf.p)}&ranges=${encodeURIComponent(conf.k)}`,
           { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
         const [cd, cp2, ck] = (bg.valueRanges || []).map(v => v.values || []);
