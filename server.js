@@ -612,14 +612,23 @@ const server = http.createServer(async function(req, res) {
         const prefix = 'SU' + aa + mm;
         const q = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'REMBOURSEMENT SU'!J:J")}`,
           { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
-        let maxSeq = 0, padLen = 2;
+        // Règle Sly : chaque mois repart à 00 (SU260700), le plus haut du mois
+        // + 1 ensuite (les gestes co insérés après coup comptent aussi — on
+        // scanne TOUTE la colonne, pas seulement la fin), anti-doublon strict.
+        const existants = new Set();
+        let maxSeq = -1, padLen = 2;
         const reNum = new RegExp('^SU[\\s.-]*' + aa + '[\\s.-]*' + mm + '[\\s.-]*(\\d{1,4})$', 'i');
         ((q.values || []).flat()).forEach(v => {
           const m = String(v || '').trim().match(reNum);
-          if (m && parseInt(m[1]) > maxSeq) { maxSeq = parseInt(m[1]); padLen = m[1].length; }
+          if (m) {
+            existants.add(parseInt(m[1]));
+            if (parseInt(m[1]) > maxSeq) { maxSeq = parseInt(m[1]); padLen = Math.max(2, m[1].length); }
+          }
         });
+        let seq = maxSeq + 1; // colonne vierge ce mois → -1 + 1 = 0 → SUaamm00
+        while (existants.has(seq)) seq++;
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ accord: prefix + String(maxSeq + 1).padStart(padLen, '0') }));
+        res.end(JSON.stringify({ accord: prefix + String(seq).padStart(padLen, '0') }));
         return;
       }
 
@@ -689,10 +698,13 @@ const server = http.createServer(async function(req, res) {
             const mm = String(now.getMonth() + 1).padStart(2, '0');
             const prefix = 'SU' + aa + mm;
             const jvals = ((vr[2] || {}).values || []).map(x => (x[0] || '').toString().trim());
-            let maxSeq = 0, padLen = 2;
+            const existants = new Set();
+            let maxSeq = -1, padLen = 2;
             const reNum = new RegExp('^SU[\\s.-]*' + aa + '[\\s.-]*' + mm + '[\\s.-]*(\\d{1,4})$', 'i');
-            jvals.forEach(v => { const m = v.match(reNum); if (m && parseInt(m[1]) > maxSeq) { maxSeq = parseInt(m[1]); padLen = m[1].length; } });
-            accord = prefix + String(maxSeq + 1).padStart(padLen, '0');
+            jvals.forEach(v => { const m = v.match(reNum); if (m) { existants.add(parseInt(m[1])); if (parseInt(m[1]) > maxSeq) { maxSeq = parseInt(m[1]); padLen = Math.max(2, m[1].length); } } });
+            let seq = maxSeq + 1; // mois vierge → 00
+            while (existants.has(seq)) seq++;
+            accord = prefix + String(seq).padStart(padLen, '0');
           }
 
           // Écriture ciblée : A..K + M — la colonne L (formule) n'est JAMAIS touchée
@@ -1340,6 +1352,60 @@ const server = http.createServer(async function(req, res) {
         return;
       }
 
+      // ── LIVRAISONS : jours d'expédition + détail d'un jour ────────
+      if (req.url === '/livraisons-jours') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ jours: [] })); return; }
+        const q = await pool.query(`
+          SELECT date_envoi, COUNT(*) AS n FROM dossiers
+          WHERE COALESCE(tracking,'') <> '' AND COALESCE(date_envoi,'') <> '' AND LOWER(date_envoi) <> 'x'
+          GROUP BY date_envoi`);
+        // La base mélange ISO (sync) et JJ/MM/AA (app) → on regroupe par jour réel
+        const toISO3 = v => {
+          const t = String(v || '').trim();
+          let m = t.match(/^(\d{4})-(\d{2})-(\d{2})/);
+          if (m) return m[1] + '-' + m[2] + '-' + m[3];
+          m = t.match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})$/);
+          if (m) return (m[3].length === 2 ? '20' + m[3] : m[3]) + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0');
+          return null;
+        };
+        const parJour = {};
+        q.rows.forEach(r => {
+          const iso = toISO3(r.date_envoi);
+          if (!iso) return;
+          parJour[iso] = (parJour[iso] || 0) + parseInt(r.n);
+        });
+        const jours = Object.entries(parJour)
+          .sort((a, b) => b[0].localeCompare(a[0]))
+          .slice(0, 90)
+          .map(([iso, n]) => ({ iso, fr: iso.slice(8, 10) + '/' + iso.slice(5, 7) + '/' + iso.slice(2, 4), n }));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ jours }));
+        return;
+      }
+      if (req.url === '/livraisons-jour') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ lignes: [] })); return; }
+        const iso = (payload.iso || '').trim();
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(iso)) { res.writeHead(400); res.end(JSON.stringify({ error: 'iso requis' })); return; }
+        const fr = iso.slice(8, 10) + '/' + iso.slice(5, 7) + '/' + iso.slice(2, 4);
+        const q = await pool.query(`
+          SELECT numero_dossier, enseigne, departement_ville, tracking, date_envoi, notes, revers_url
+          FROM dossiers
+          WHERE COALESCE(tracking,'') <> '' AND (date_envoi = $1 OR date_envoi = $2)
+          ORDER BY departement_ville`, [iso, fr]);
+        const lignes = q.rows.map(r => ({
+          tracking: r.tracking,
+          usv: r.numero_dossier,
+          fla: ((r.notes || '').match(/FLA:([^\s]+)/) || [])[1] || '',
+          date_envoi: fr,
+          magasin: r.departement_ville || '',
+          enseigne: r.enseigne || '',
+          revers_url: r.revers_url || null
+        }));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ jour: fr, lignes }));
+        return;
+      }
+
       // ── SYNC HISTORIQUE : Sheet → PostgreSQL ──────────────────
       // Relit la fin des feuilles réelles et met à jour les bases
       // historique (UPSERT — aucune suppression possible).
@@ -1919,7 +1985,12 @@ Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
           if (curTrk && curTrk !== trk) { skipped.push({ row, reason: 'un tracking différent est déjà présent (' + curTrk + ')' }); continue; }
           valueUpdates.push({ range: "'SYSTEME U'!B" + row, values: [[dateExpe]] });
           valueUpdates.push({ range: "'SYSTEME U'!G" + row, values: [[trk]] });
-          applied.push({ row, tracking: trk, cnb: (cur[7] || '').toString().trim() });
+          applied.push({ row, tracking: trk,
+            cnb: (cur[7] || '').toString().trim(),
+            fla: (cur[8] || '').toString().trim(),
+            enseigne: (cur[4] || '').toString().trim(),
+            magasin: (cur[5] || '').toString().trim(),
+            date_envoi: dateExpe });
         }
 
         // Écriture par lots : UNIQUEMENT les cellules B et G des lignes validées
@@ -2002,6 +2073,19 @@ Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
               }
             }
           }
+        }
+
+        // URL Revers.io de chaque dossier (pour les boutons du tableau livraison)
+        if (pool && applied.length) {
+          try {
+            const cles = [...new Set(applied.flatMap(a => [a.cnb, a.fla].filter(Boolean)))];
+            if (cles.length) {
+              const qUrl = await pool.query('SELECT numero_dossier, revers_url FROM dossiers WHERE numero_dossier = ANY($1) AND revers_url IS NOT NULL', [cles]);
+              const parCle = {};
+              qUrl.rows.forEach(r => { parCle[r.numero_dossier] = r.revers_url; });
+              applied.forEach(a => { a.revers_url = parCle[a.cnb] || parCle[a.fla] || null; });
+            }
+          } catch(e) {}
         }
 
         // Synchro PostgreSQL (tracking + date d'envoi sur le dossier CNB)
