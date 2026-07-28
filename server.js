@@ -934,9 +934,7 @@ const server = http.createServer(async function(req, res) {
         return;
       }
 
-      // ── TABLEAU DE BORD : agrégats SU + ITS ───────────────────
-      // Les stats ITS s'appuient sur la VRAIE date de réception (texte JJ/MM/AA
-      // converti), jamais sur la date d'insertion en base (faussée par l'import).
+      // ── TABLEAU DE BORD : agrégats SU + ITS (fenêtre 12 mois) ─────
       if (req.url === '/dashboard') {
         if (!pool) { res.writeHead(200); res.end(JSON.stringify({ error: 'no db' })); return; }
         const ITS_DATE = `date_reception ~ '^\\d{1,2}/\\d{1,2}/\\d{2}$' AND TO_DATE(date_reception,'DD/MM/YY')`;
@@ -946,41 +944,55 @@ const server = http.createServer(async function(req, res) {
           SELECT COALESCE(SUM(CASE WHEN decision = 'remboursement' THEN 1 ELSE 0 END),0) AS remb,
                  COALESCE(SUM(CASE WHEN decision <> 'remboursement' THEN 1 ELSE 0 END),0) AS envois
           FROM dossiers WHERE date_reception::date > NOW()::date - 30`);
-        const suTotal = await pool.query(`
+        const su12m = await pool.query(`
           SELECT COALESCE(SUM(CASE WHEN decision = 'remboursement' THEN 1 ELSE 0 END),0) AS remb,
                  COALESCE(SUM(CASE WHEN decision <> 'remboursement' THEN 1 ELSE 0 END),0) AS envois
-          FROM dossiers`);
-        const semaines = await pool.query(`
-          SELECT TO_CHAR(DATE_TRUNC('week', date_reception::date), 'DD/MM') AS sem,
+          FROM dossiers WHERE date_reception::date > NOW()::date - 365`);
+        const moisSu = await pool.query(`
+          SELECT TO_CHAR(DATE_TRUNC('month', date_reception::date), 'MM/YY') AS mois,
                  SUM(CASE WHEN decision = 'remboursement' THEN 1 ELSE 0 END) AS remb,
                  SUM(CASE WHEN decision <> 'remboursement' THEN 1 ELSE 0 END) AS envois
-          FROM dossiers WHERE date_reception::date > NOW()::date - 56
-          GROUP BY DATE_TRUNC('week', date_reception::date)
-          ORDER BY DATE_TRUNC('week', date_reception::date)`);
-        const topProduits = await pool.query(`
-          SELECT ref_produit AS ref, COUNT(*) AS n FROM dossiers
-          WHERE date_reception::date > NOW()::date - 30 AND ref_produit IS NOT NULL AND TRIM(ref_produit) <> ''
-          GROUP BY ref_produit ORDER BY n DESC LIMIT 6`);
+          FROM dossiers WHERE date_reception::date > NOW()::date - 365
+          GROUP BY DATE_TRUNC('month', date_reception::date)
+          ORDER BY DATE_TRUNC('month', date_reception::date)`);
+        const topQ = (table, col, jours, dateCond) => pool.query(`
+          SELECT ${col} AS ref, COUNT(*) AS n FROM ${table}
+          WHERE ${dateCond} AND ${col} IS NOT NULL AND TRIM(${col}) <> ''
+          GROUP BY ${col} ORDER BY n DESC LIMIT 6`);
+        const topSu30  = await topQ('dossiers', 'ref_produit', 30, `date_reception::date > NOW()::date - 30`);
+        const topSu12  = await topQ('dossiers', 'ref_produit', 365, `date_reception::date > NOW()::date - 365`);
+        const topIts30 = await topQ('its_dossiers', 'reference', 30, `${ITS_DATE} > NOW()::date - 30`);
+        const topIts12 = await topQ('its_dossiers', 'reference', 365, `${ITS_DATE} > NOW()::date - 365`);
 
-        const its7 = await pool.query(`
-          SELECT COUNT(*) AS n FROM its_dossiers WHERE ${ITS_DATE} > NOW()::date - 7`);
+        const its7 = await pool.query(`SELECT COUNT(*) AS n FROM its_dossiers WHERE ${ITS_DATE} > NOW()::date - 7`);
         const its30 = await pool.query(`
           SELECT COALESCE(NULLIF(TRIM(decision), ''), 'À DÉCIDER') AS d, COUNT(*) AS n
           FROM its_dossiers WHERE ${ITS_DATE} > NOW()::date - 30
           GROUP BY 1 ORDER BY n DESC`);
         const its30Total = its30.rows.reduce((a, r) => a + parseInt(r.n), 0);
-        const itsTotal = await pool.query(`
+        const its12m = await pool.query(`
           SELECT COALESCE(NULLIF(TRIM(decision), ''), 'À DÉCIDER') AS d, COUNT(*) AS n
-          FROM its_dossiers GROUP BY 1 ORDER BY n DESC`);
+          FROM its_dossiers WHERE ${ITS_DATE} > NOW()::date - 365
+          GROUP BY 1 ORDER BY n DESC`);
+        const moisIts = await pool.query(`
+          SELECT TO_CHAR(DATE_TRUNC('month', TO_DATE(date_reception,'DD/MM/YY')), 'MM/YY') AS mois,
+                 SUM(CASE WHEN UPPER(COALESCE(decision,'')) = 'AVOIR' THEN 1 ELSE 0 END) AS avoirs,
+                 SUM(CASE WHEN UPPER(COALESCE(decision,'')) <> 'AVOIR' THEN 1 ELSE 0 END) AS autres
+          FROM its_dossiers WHERE ${ITS_DATE} > NOW()::date - 365
+          GROUP BY DATE_TRUNC('month', TO_DATE(date_reception,'DD/MM/YY'))
+          ORDER BY DATE_TRUNC('month', TO_DATE(date_reception,'DD/MM/YY'))`);
         const itsAvoirsMois = await pool.query(`
           SELECT COUNT(*) AS n FROM its_dossiers
           WHERE UPPER(COALESCE(decision,'')) = 'AVOIR' AND ${ITS_DATE} >= DATE_TRUNC('month', NOW())::date`);
 
-        // ── Montants € : lus dans les feuilles remboursement (cache 10 min) ──
+        // ── Montants € : lignes AVEC CLÉ uniquement (CNB / référence),
+        //    fenêtre 12 mois, cache 10 min ──
         if (!global.EUR_CACHE || (Date.now() - global.EUR_CACHE.t) > 10 * 60 * 1000) {
           try {
             const token = await getSheetsToken();
-            const bg = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchGet?ranges=${encodeURIComponent("'REMBOURSEMENT SU'!A:A")}&ranges=${encodeURIComponent("'REMBOURSEMENT SU'!C:C")}&ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!B:B")}&ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!C:C")}`,
+            const bg = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchGet` +
+              `?ranges=${encodeURIComponent("'REMBOURSEMENT SU'!A:A")}&ranges=${encodeURIComponent("'REMBOURSEMENT SU'!C:C")}&ranges=${encodeURIComponent("'REMBOURSEMENT SU'!I:I")}` +
+              `&ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!B:B")}&ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!C:C")}&ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!G:G")}`,
               { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
             const vr2 = bg.valueRanges || [];
             const col = i => (vr2[i] || {}).values || [];
@@ -988,8 +1000,6 @@ const server = http.createServer(async function(req, res) {
               const t = String(v || '').replace(/[€\s]/g, '').replace(',', '.');
               if (!t || /DDP/i.test(t)) return 0;
               const f = parseFloat(t);
-              // Vraisemblance : un remboursement unitaire vaut entre 1 ct et 10 000 €.
-              // Au-delà = valeur parasite (code, cellule hors données) → ignorée.
               return (isFinite(f) && f >= 0.01 && f <= 10000) ? f : 0;
             };
             const cleMois = v => {
@@ -997,30 +1007,32 @@ const server = http.createServer(async function(req, res) {
               if (!m) return null;
               return m[2].padStart(2, '0') + '/' + (m[3].length === 4 ? m[3].slice(2) : m[3]);
             };
-            const agreger = (dates, prix) => {
+            const moisKeys = [];
+            const d0 = new Date();
+            for (let j = 11; j >= 0; j--) {
+              const d2 = new Date(d0.getFullYear(), d0.getMonth() - j, 1);
+              moisKeys.push(String(d2.getMonth() + 1).padStart(2, '0') + '/' + String(d2.getFullYear()).slice(2));
+            }
+            const agreger = (dates, prix, cles) => {
+              const set = new Set(moisKeys);
               const parMois = {};
               let total = 0;
               const n = Math.max(dates.length, prix.length);
               for (let i = 0; i < n; i++) {
+                if (!((cles[i] || [])[0] || '').toString().trim()) continue; // pas de clé → hors données
                 const montant = parseMontant((prix[i] || [])[0]);
                 if (!montant) continue;
-                total += montant;
                 const k = cleMois((dates[i] || [])[0]);
-                if (k) parMois[k] = (parMois[k] || 0) + montant;
+                if (!k || !set.has(k)) continue; // fenêtre 12 mois
+                parMois[k] = (parMois[k] || 0) + montant;
+                total += montant;
               }
-              // 6 derniers mois calendaires, du plus ancien au plus récent
-              const mois = [];
-              const d0 = new Date();
-              for (let j = 5; j >= 0; j--) {
-                const d2 = new Date(d0.getFullYear(), d0.getMonth() - j, 1);
-                const k = String(d2.getMonth() + 1).padStart(2, '0') + '/' + String(d2.getFullYear()).slice(2);
-                mois.push({ mois: k, somme: Math.round(parMois[k] || 0) });
-              }
-              return { total: Math.round(total), mois, mois_courant: mois[5].somme };
+              const mois = moisKeys.map(k => ({ mois: k, somme: Math.round(parMois[k] || 0) }));
+              return { total: Math.round(total), mois, mois_courant: mois[11].somme };
             };
             global.EUR_CACHE = { t: Date.now(), data: {
-              su: agreger(col(0), col(1)),
-              its: agreger(col(2), col(3))
+              su: agreger(col(0), col(1), col(2)),
+              its: agreger(col(3), col(4), col(5))
             } };
           } catch(e) {
             console.warn('Montants €:', e.message);
@@ -1033,17 +1045,49 @@ const server = http.createServer(async function(req, res) {
         res.end(JSON.stringify({
           su_7j: parseInt(su7.rows[0].n),
           su_30j: { envois: parseInt(su30.rows[0].envois), remb: parseInt(su30.rows[0].remb) },
-          su_total: { envois: parseInt(suTotal.rows[0].envois), remb: parseInt(suTotal.rows[0].remb) },
-          semaines: semaines.rows,
-          top_produits: topProduits.rows,
+          su_12m: { envois: parseInt(su12m.rows[0].envois), remb: parseInt(su12m.rows[0].remb) },
+          mois_su: moisSu.rows,
+          top_su_30: topSu30.rows, top_su_12: topSu12.rows,
+          top_its_30: topIts30.rows, top_its_12: topIts12.rows,
           its_7j: parseInt(its7.rows[0].n),
           its_30j: its30.rows,
           its_30j_total: its30Total,
-          its_total: itsTotal.rows,
+          its_12m: its12m.rows,
+          mois_its: moisIts.rows,
           its_avoirs_mois: parseInt(itsAvoirsMois.rows[0].n),
           euros,
           euros_erreur: (global.EUR_CACHE || {}).err || null
         }));
+        return;
+      }
+
+      // ── DIAG € : plus grosses lignes d'un mois (vérification Sheet) ──
+      if (req.url === '/euros-diag') {
+        if (!GOOGLE_SHEET_ID) { res.writeHead(500); res.end(JSON.stringify({ error: 'sheet manquant' })); return; }
+        const univers = payload.univers === 'its' ? 'its' : 'su';
+        const moisCible = (payload.mois || '').trim(); // 'MM/AA'
+        const token = await getSheetsToken();
+        const conf = univers === 'su'
+          ? { d: "'REMBOURSEMENT SU'!A:A", p: "'REMBOURSEMENT SU'!C:C", k: "'REMBOURSEMENT SU'!I:I" }
+          : { d: "'REMBOURSEMENT ITS'!B:B", p: "'REMBOURSEMENT ITS'!C:C", k: "'REMBOURSEMENT ITS'!G:G" };
+        const bg = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchGet?ranges=${encodeURIComponent(conf.d)}&ranges=${encodeURIComponent(conf.p)}&ranges=${encodeURIComponent(conf.k)}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const [cd, cp2, ck] = (bg.valueRanges || []).map(v => v.values || []);
+        const lignes = [];
+        for (let i = 0; i < Math.max(cd.length, cp2.length); i++) {
+          const t = String((cp2[i] || [])[0] || '').replace(/[€\s]/g, '').replace(',', '.');
+          const f = parseFloat(t);
+          if (!isFinite(f) || f < 0.01) continue;
+          const dm = String((cd[i] || [])[0] || '').trim().match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})/);
+          const mk = dm ? dm[2].padStart(2, '0') + '/' + (dm[3].length === 4 ? dm[3].slice(2) : dm[3]) : null;
+          if (moisCible && mk !== moisCible) continue;
+          lignes.push({ ligne: i + 1, date: (cd[i] || [])[0] || '', montant: Math.round(f * 100) / 100,
+                        cle: ((ck[i] || [])[0] || '').toString().trim() || '(sans clé — ignorée des stats)' });
+        }
+        lignes.sort((a, b) => b.montant - a.montant);
+        const somme = Math.round(lignes.filter(l => !l.cle.startsWith('(')).reduce((a, l) => a + Math.min(l.montant, 10000), 0));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ mois: moisCible || 'tous', somme_comptee: somme, top: lignes.slice(0, 15) }));
         return;
       }
 
