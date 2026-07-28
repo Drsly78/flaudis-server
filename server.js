@@ -60,6 +60,7 @@ async function initDB() {
     await pool.query(`ALTER TABLE its_dossiers ADD COLUMN IF NOT EXISTS tracking TEXT`).catch(() => {});
     await pool.query(`ALTER TABLE its_dossiers ADD COLUMN IF NOT EXISTS date_expe TEXT`).catch(() => {});
     await pool.query(`ALTER TABLE dossiers ADD COLUMN IF NOT EXISTS date_envoi TEXT`).catch(() => {});
+    await pool.query(`ALTER TABLE dossiers ADD COLUMN IF NOT EXISTS revers_url TEXT`).catch(() => {});
     await pool.query(`
       CREATE TABLE IF NOT EXISTS reponses_types (
         id SERIAL PRIMARY KEY,
@@ -373,16 +374,17 @@ const server = http.createServer(async function(req, res) {
         if (!pool) { res.writeHead(200); res.end(JSON.stringify({ ok: true, msg: 'no db' })); return; }
         const d = payload;
         await pool.query(`
-          INSERT INTO dossiers (numero_dossier, enseigne, departement_ville, ref_produit, piece, decision, date_reception, tracking, date_envoi)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+          INSERT INTO dossiers (numero_dossier, enseigne, departement_ville, ref_produit, piece, decision, date_reception, tracking, date_envoi, revers_url)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
           ON CONFLICT (numero_dossier) DO UPDATE SET
             enseigne=$2, departement_ville=$3, ref_produit=$4, piece=$5,
             decision=$6, date_reception=$7, date_traitement=NOW(),
             tracking=COALESCE(EXCLUDED.tracking, dossiers.tracking),
-            date_envoi=COALESCE(EXCLUDED.date_envoi, dossiers.date_envoi)
+            date_envoi=COALESCE(EXCLUDED.date_envoi, dossiers.date_envoi),
+            revers_url=COALESCE(EXCLUDED.revers_url, dossiers.revers_url)
         `, [d.numero_dossier||null, d.enseigne||null, d.departement_ville||null,
             d.ref_produit||null, d.piece||null, d.decision||null, d.date_reception||null,
-            d.tracking||null, d.date_envoi||null]);
+            d.tracking||null, d.date_envoi||null, d.revers_url||null]);
         res.writeHead(200); res.end(JSON.stringify({ ok: true }));
         return;
       }
@@ -953,6 +955,8 @@ const server = http.createServer(async function(req, res) {
           WHERE date_reception::date > NOW()::date - 30 AND ref_produit IS NOT NULL AND TRIM(ref_produit) <> ''
           GROUP BY ref_produit ORDER BY n DESC LIMIT 6`);
 
+        const its7 = await pool.query(`
+          SELECT COUNT(*) AS n FROM its_dossiers WHERE ${ITS_DATE} > NOW()::date - 7`);
         const its30 = await pool.query(`
           SELECT COALESCE(NULLIF(TRIM(decision), ''), 'À DÉCIDER') AS d, COUNT(*) AS n
           FROM its_dossiers WHERE ${ITS_DATE} > NOW()::date - 30
@@ -977,7 +981,9 @@ const server = http.createServer(async function(req, res) {
               const t = String(v || '').replace(/[€\s]/g, '').replace(',', '.');
               if (!t || /DDP/i.test(t)) return 0;
               const f = parseFloat(t);
-              return isFinite(f) ? f : 0;
+              // Vraisemblance : un remboursement unitaire vaut entre 1 ct et 10 000 €.
+              // Au-delà = valeur parasite (code, cellule hors données) → ignorée.
+              return (isFinite(f) && f >= 0.01 && f <= 10000) ? f : 0;
             };
             const cleMois = v => {
               const m = String(v || '').trim().match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})/);
@@ -1023,6 +1029,7 @@ const server = http.createServer(async function(req, res) {
           su_total: { envois: parseInt(suTotal.rows[0].envois), remb: parseInt(suTotal.rows[0].remb) },
           semaines: semaines.rows,
           top_produits: topProduits.rows,
+          its_7j: parseInt(its7.rows[0].n),
           its_30j: its30.rows,
           its_30j_total: its30Total,
           its_total: itsTotal.rows,
