@@ -58,6 +58,8 @@ async function initDB() {
       )
     `);
     await pool.query(`ALTER TABLE its_dossiers ADD COLUMN IF NOT EXISTS tracking TEXT`).catch(() => {});
+    await pool.query(`ALTER TABLE its_dossiers ADD COLUMN IF NOT EXISTS date_expe TEXT`).catch(() => {});
+    await pool.query(`ALTER TABLE dossiers ADD COLUMN IF NOT EXISTS date_envoi TEXT`).catch(() => {});
     await pool.query(`
       CREATE TABLE IF NOT EXISTS reponses_types (
         id SERIAL PRIMARY KEY,
@@ -601,14 +603,14 @@ const server = http.createServer(async function(req, res) {
         const prefix = 'SU' + aa + mm;
         const q = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'REMBOURSEMENT SU'!J:J")}`,
           { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
-        let maxSeq = 0;
-        const reNum = new RegExp('^' + prefix + '(\\d{3})$');
+        let maxSeq = 0, padLen = 2;
+        const reNum = new RegExp('^SU[\\s.-]*' + aa + '[\\s.-]*' + mm + '[\\s.-]*(\\d{1,4})$', 'i');
         ((q.values || []).flat()).forEach(v => {
           const m = String(v || '').trim().match(reNum);
-          if (m) maxSeq = Math.max(maxSeq, parseInt(m[1]));
+          if (m && parseInt(m[1]) > maxSeq) { maxSeq = parseInt(m[1]); padLen = m[1].length; }
         });
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ accord: prefix + String(maxSeq + 1).padStart(3, '0') }));
+        res.end(JSON.stringify({ accord: prefix + String(maxSeq + 1).padStart(padLen, '0') }));
         return;
       }
 
@@ -678,10 +680,10 @@ const server = http.createServer(async function(req, res) {
             const mm = String(now.getMonth() + 1).padStart(2, '0');
             const prefix = 'SU' + aa + mm;
             const jvals = ((vr[2] || {}).values || []).map(x => (x[0] || '').toString().trim());
-            let maxSeq = 0;
-            const reNum = new RegExp('^' + prefix + '(\\d{3})$');
-            jvals.forEach(v => { const m = v.match(reNum); if (m) maxSeq = Math.max(maxSeq, parseInt(m[1])); });
-            accord = prefix + String(maxSeq + 1).padStart(3, '0');
+            let maxSeq = 0, padLen = 2;
+            const reNum = new RegExp('^SU[\\s.-]*' + aa + '[\\s.-]*' + mm + '[\\s.-]*(\\d{1,4})$', 'i');
+            jvals.forEach(v => { const m = v.match(reNum); if (m && parseInt(m[1]) > maxSeq) { maxSeq = parseInt(m[1]); padLen = m[1].length; } });
+            accord = prefix + String(maxSeq + 1).padStart(padLen, '0');
           }
 
           // Écriture ciblée : A..K + M — la colonne L (formule) n'est JAMAIS touchée
@@ -963,6 +965,57 @@ const server = http.createServer(async function(req, res) {
           SELECT COUNT(*) AS n FROM its_dossiers
           WHERE UPPER(COALESCE(decision,'')) = 'AVOIR' AND ${ITS_DATE} >= DATE_TRUNC('month', NOW())::date`);
 
+        // ── Montants € : lus dans les feuilles remboursement (cache 10 min) ──
+        if (!global.EUR_CACHE || (Date.now() - global.EUR_CACHE.t) > 10 * 60 * 1000) {
+          try {
+            const token = await getSheetsToken();
+            const bg = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchGet?ranges=${encodeURIComponent("'REMBOURSEMENT SU'!A:A")}&ranges=${encodeURIComponent("'REMBOURSEMENT SU'!C:C")}&ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!B:B")}&ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!C:C")}`,
+              { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+            const vr2 = bg.valueRanges || [];
+            const col = i => (vr2[i] || {}).values || [];
+            const parseMontant = v => {
+              const t = String(v || '').replace(/[€\s]/g, '').replace(',', '.');
+              if (!t || /DDP/i.test(t)) return 0;
+              const f = parseFloat(t);
+              return isFinite(f) ? f : 0;
+            };
+            const cleMois = v => {
+              const m = String(v || '').trim().match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})/);
+              if (!m) return null;
+              return m[2].padStart(2, '0') + '/' + (m[3].length === 4 ? m[3].slice(2) : m[3]);
+            };
+            const agreger = (dates, prix) => {
+              const parMois = {};
+              let total = 0;
+              const n = Math.max(dates.length, prix.length);
+              for (let i = 0; i < n; i++) {
+                const montant = parseMontant((prix[i] || [])[0]);
+                if (!montant) continue;
+                total += montant;
+                const k = cleMois((dates[i] || [])[0]);
+                if (k) parMois[k] = (parMois[k] || 0) + montant;
+              }
+              // 6 derniers mois calendaires, du plus ancien au plus récent
+              const mois = [];
+              const d0 = new Date();
+              for (let j = 5; j >= 0; j--) {
+                const d2 = new Date(d0.getFullYear(), d0.getMonth() - j, 1);
+                const k = String(d2.getMonth() + 1).padStart(2, '0') + '/' + String(d2.getFullYear()).slice(2);
+                mois.push({ mois: k, somme: Math.round(parMois[k] || 0) });
+              }
+              return { total: Math.round(total), mois, mois_courant: mois[5].somme };
+            };
+            global.EUR_CACHE = { t: Date.now(), data: {
+              su: agreger(col(0), col(1)),
+              its: agreger(col(2), col(3))
+            } };
+          } catch(e) {
+            console.warn('Montants €:', e.message);
+            global.EUR_CACHE = { t: Date.now(), data: null, err: e.message };
+          }
+        }
+        const euros = (global.EUR_CACHE || {}).data || null;
+
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           su_7j: parseInt(su7.rows[0].n),
@@ -973,7 +1026,9 @@ const server = http.createServer(async function(req, res) {
           its_30j: its30.rows,
           its_30j_total: its30Total,
           its_total: itsTotal.rows,
-          its_avoirs_mois: parseInt(itsAvoirsMois.rows[0].n)
+          its_avoirs_mois: parseInt(itsAvoirsMois.rows[0].n),
+          euros,
+          euros_erreur: (global.EUR_CACHE || {}).err || null
         }));
         return;
       }
@@ -1079,10 +1134,11 @@ const server = http.createServer(async function(req, res) {
             const part = lot.slice(i, i + 400);
             const vals = [], params = [];
             part.forEach(([key, o], j) => {
-              const r = o.r, b = j * 9;
+              const r = o.r, b = j * 10;
               const tv = phase === 1 ? (r[6] || '').toString().trim() : '';
               if (tv) trk++;
-              vals.push('($' + (b+1) + ',$' + (b+2) + ',$' + (b+3) + ',$' + (b+4) + ',$' + (b+5) + ',$' + (b+6) + ',$' + (b+7) + ',$' + (b+8) + ',$' + (b+9) + ')');
+              const dEnv = (() => { if (phase !== 1) return ''; const v = (r[1] || '').toString().trim(); return (v && v.toLowerCase() !== 'x') ? (toIso2(v) || v) : ''; })();
+              vals.push('($' + (b+1) + ',$' + (b+2) + ',$' + (b+3) + ',$' + (b+4) + ',$' + (b+5) + ',$' + (b+6) + ',$' + (b+7) + ',$' + (b+8) + ',$' + (b+9) + ',$' + (b+10) + ')');
               params.push(key,
                 (phase === 1 ? r[4] : r[5] || '').toString().trim(),
                 (phase === 1 ? r[5] : r[6] || '').toString().trim(),
@@ -1091,10 +1147,11 @@ const server = http.createServer(async function(req, res) {
                 phase === 1 ? 'envoi_piece' : 'remboursement',
                 o.iso,
                 o.fla ? 'FLA:' + o.fla : '',
-                tv);
+                tv,
+                dEnv);
             });
             await pool.query(`
-              INSERT INTO dossiers (numero_dossier, enseigne, departement_ville, ref_produit, piece, decision, date_reception, notes, tracking)
+              INSERT INTO dossiers (numero_dossier, enseigne, departement_ville, ref_produit, piece, decision, date_reception, notes, tracking, date_envoi)
               VALUES ` + vals.join(',') + `
               ON CONFLICT (numero_dossier) DO UPDATE SET
                 enseigne = EXCLUDED.enseigne,
@@ -1103,7 +1160,8 @@ const server = http.createServer(async function(req, res) {
                 piece = CASE WHEN EXCLUDED.piece <> '' THEN EXCLUDED.piece ELSE dossiers.piece END,
                 decision = EXCLUDED.decision,
                 date_reception = EXCLUDED.date_reception,
-                tracking = CASE WHEN EXCLUDED.tracking <> '' THEN EXCLUDED.tracking ELSE dossiers.tracking END
+                tracking = CASE WHEN EXCLUDED.tracking <> '' THEN EXCLUDED.tracking ELSE dossiers.tracking END,
+                date_envoi = CASE WHEN EXCLUDED.date_envoi <> '' THEN EXCLUDED.date_envoi ELSE dossiers.date_envoi END
             `, params);
             maj += part.length;
           }
@@ -1120,14 +1178,16 @@ const server = http.createServer(async function(req, res) {
           for (const [k, r] of parCle) {
             const tv = (r[9] || '').toString().trim();
             if (tv) trk++;
+            const dEx = (() => { const v = (r[7] || '').toString().trim(); return (v && v.toLowerCase() !== 'x') ? v : ''; })();
             await pool.query(`
-              INSERT INTO its_dossiers (date_reception, reference, pannes, magasin, decision, tracking)
-              VALUES ($1,$2,$3,$4,$5,$6)
+              INSERT INTO its_dossiers (date_reception, reference, pannes, magasin, decision, tracking, date_expe)
+              VALUES ($1,$2,$3,$4,$5,$6,$7)
               ON CONFLICT (date_reception, reference, magasin) DO UPDATE SET
                 pannes = EXCLUDED.pannes, decision = EXCLUDED.decision,
-                tracking = CASE WHEN EXCLUDED.tracking <> '' THEN EXCLUDED.tracking ELSE its_dossiers.tracking END
+                tracking = CASE WHEN EXCLUDED.tracking <> '' THEN EXCLUDED.tracking ELSE its_dossiers.tracking END,
+                date_expe = CASE WHEN EXCLUDED.date_expe <> '' THEN EXCLUDED.date_expe ELSE its_dossiers.date_expe END
             `, [(r[0]||'').toString().trim(), (r[1]||'').toString().trim(), (r[3]||'').toString().trim(),
-                (r[4]||'').toString().trim(), (r[8]||'').toString().trim(), tv]).catch(() => { skip++; });
+                (r[4]||'').toString().trim(), (r[8]||'').toString().trim(), tv, dEx]).catch(() => { skip++; });
             maj++;
           }
         }
@@ -1255,18 +1315,21 @@ const server = http.createServer(async function(req, res) {
               const key = cnb || fla;
               const iso = toIso(r[0]);
               if (!key || !iso) { skip++; continue; }
+              const dateEnvoiT = (() => { const v = (r[1] || '').toString().trim(); return (v && v.toLowerCase() !== 'x') ? (toIso(v) || v) : ''; })();
               await pool.query(`
-                INSERT INTO dossiers (numero_dossier, enseigne, departement_ville, ref_produit, piece, decision, date_reception, notes, tracking)
-                VALUES ($1,$2,$3,$4,$5,'envoi_piece',$6,$7,$8)
+                INSERT INTO dossiers (numero_dossier, enseigne, departement_ville, ref_produit, piece, decision, date_reception, notes, tracking, date_envoi)
+                VALUES ($1,$2,$3,$4,$5,'envoi_piece',$6,$7,$8,$9)
                 ON CONFLICT (numero_dossier) DO UPDATE SET
+                  enseigne = EXCLUDED.enseigne,
                   departement_ville = EXCLUDED.departement_ville,
                   ref_produit = EXCLUDED.ref_produit,
                   piece = EXCLUDED.piece,
                   date_reception = EXCLUDED.date_reception,
-                  tracking = CASE WHEN EXCLUDED.tracking <> '' THEN EXCLUDED.tracking ELSE dossiers.tracking END
+                  tracking = CASE WHEN EXCLUDED.tracking <> '' THEN EXCLUDED.tracking ELSE dossiers.tracking END,
+                  date_envoi = CASE WHEN EXCLUDED.date_envoi <> '' THEN EXCLUDED.date_envoi ELSE dossiers.date_envoi END
               `, [key, (r[4] || '').toString().trim(), (r[5] || '').toString().trim(),
                   (r[2] || '').toString().trim(), (r[3] || '').toString().trim(), iso,
-                  fla ? 'FLA:' + fla : '', (r[6] || '').toString().trim()]);
+                  fla ? 'FLA:' + fla : '', (r[6] || '').toString().trim(), dateEnvoiT]);
               if ((r[6] || '').toString().trim()) trk++;
               up++;
             }
@@ -1303,14 +1366,16 @@ const server = http.createServer(async function(req, res) {
               const ref = (r[1] || '').toString().trim();
               const mag = (r[4] || '').toString().trim();
               if (!date || !ref || !mag || !/\d/.test(date)) { skip++; continue; }
+              const dExpeT = (() => { const v = (r[7] || '').toString().trim(); return (v && v.toLowerCase() !== 'x') ? v : ''; })();
               await pool.query(`
-                INSERT INTO its_dossiers (date_reception, reference, pannes, magasin, decision, tracking)
-                VALUES ($1,$2,$3,$4,$5,$6)
+                INSERT INTO its_dossiers (date_reception, reference, pannes, magasin, decision, tracking, date_expe)
+                VALUES ($1,$2,$3,$4,$5,$6,$7)
                 ON CONFLICT (date_reception, reference, magasin) DO UPDATE SET
                   pannes = EXCLUDED.pannes,
                   decision = EXCLUDED.decision,
-                  tracking = EXCLUDED.tracking
-              `, [date, ref, (r[3] || '').toString().trim(), mag, (r[8] || '').toString().trim(), (r[9] || '').toString().trim()]);
+                  tracking = EXCLUDED.tracking,
+                  date_expe = CASE WHEN EXCLUDED.date_expe <> '' THEN EXCLUDED.date_expe ELSE its_dossiers.date_expe END
+              `, [date, ref, (r[3] || '').toString().trim(), mag, (r[8] || '').toString().trim(), (r[9] || '').toString().trim(), dExpeT]);
               up++;
             }
             console.log('Sync ITS:', up, 'dossiers,', skip, 'lignes ignorées');
@@ -1354,6 +1419,28 @@ const server = http.createServer(async function(req, res) {
         });
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ data }));
+        return;
+      }
+
+      // ── INTERSPORT : retrouver le "NN VILLE" connu d'un magasin ──
+      if (req.url === '/its-magasin-lookup') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ magasin: null })); return; }
+        const nomBrut = (payload.nom || '').trim();
+        if (!nomBrut) { res.writeHead(400); res.end(JSON.stringify({ error: 'nom requis' })); return; }
+        const normL = v => String(v || '').toUpperCase()
+          .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+          .replace(/[^A-Z0-9]/g, '').replace(/SAINT/g, 'ST');
+        const cible = normL(nomBrut.replace(/^\d{2,3}\s*/, ''));
+        if (!cible) { res.writeHead(200); res.end(JSON.stringify({ magasin: null })); return; }
+        const q = await pool.query(`
+          SELECT magasin, MAX(created_at) AS dernier FROM its_dossiers
+          WHERE magasin ~ '^\\d{2,3} ' GROUP BY magasin ORDER BY dernier DESC LIMIT 400`);
+        const hit = q.rows.find(r => {
+          const n = normL(String(r.magasin).replace(/^\d{2,3}\s*/, ''));
+          return n === cible || n.includes(cible) || cible.includes(n);
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ magasin: hit ? hit.magasin : null }));
         return;
       }
 
@@ -1539,7 +1626,9 @@ Réponds UNIQUEMENT avec ce JSON, sans texte autour :
               const requests = [];
               values.forEach((row, i) => {
                 const etat = (row[8] || '').toUpperCase();
-                let color = null;
+                // Blanc EXPLICITE par défaut : l'append hérite parfois du fond
+                // de la ligne précédente (ex : verte) — on force la couleur voulue.
+                let color = { red: 1, green: 1, blue: 1 };
                 if (etat === 'AVOIR') color = { red: 146/255, green: 208/255, blue: 80/255 };          // #92d050
                 else if (etat === 'DEMANDE RENVOI') color = { red: 1, green: 153/255, blue: 1 };        // #ff99ff
                 if (color) requests.push({
@@ -1611,8 +1700,9 @@ Réponds UNIQUEMENT avec ce JSON, sans texte autour :
           for (const a of applied) {
             const pr = produits.find(p => (p.reference || '').trim() === a.reference) || {};
             pool.query(
-              'INSERT INTO its_dossiers (date_reception, reference, pannes, magasin, decision, accord) VALUES ($1,$2,$3,$4,$5,$6)',
-              [d.date, a.reference, pr.pannes || '', d.magasin, a.etat || '', accordByRef[a.reference] || '']
+              'INSERT INTO its_dossiers (date_reception, reference, pannes, magasin, decision, accord, date_expe) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+              [d.date, a.reference, pr.pannes || '', d.magasin, a.etat || '', accordByRef[a.reference] || '',
+               (a.etat || '').toUpperCase() === 'AVOIR' ? todayFR : '']
             ).catch(e => console.warn('Historique ITS:', e.message));
           }
         }
@@ -1817,8 +1907,8 @@ Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
             // Sync base its_dossiers (clé date+ref+magasin)
             if (pool) {
               for (const a of itsApplied) {
-                pool.query('UPDATE its_dossiers SET tracking = $1 WHERE date_reception = $2 AND reference = $3 AND magasin = $4',
-                  [a.tracking, a.date, a.ref, a.magasin]).catch(() => {});
+                pool.query('UPDATE its_dossiers SET tracking = $1, date_expe = $2 WHERE date_reception = $3 AND reference = $4 AND magasin = $5',
+                  [a.tracking, dateExpe, a.date, a.ref, a.magasin]).catch(() => {});
               }
             }
           }
