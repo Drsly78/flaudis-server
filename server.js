@@ -2004,7 +2004,10 @@ Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
           const curX = (cur[1] || '').toString().trim().toLowerCase();
           const curTrk = (cur[6] || '').toString().trim();
           if (curX !== 'x') { skipped.push({ row, reason: "la ligne ne porte plus le marqueur x" }); continue; }
-          if (curTrk && curTrk !== trk) { skipped.push({ row, reason: 'un tracking différent est déjà présent (' + curTrk + ')' }); continue; }
+          // x présent → la colonne G ne contient que des notes de préparation
+          // (emplacements entrepôt, rappels…) : l'écrasement par le tracking
+          // est LE comportement attendu. Le garde-fou anti-écrasement ne vaut
+          // que pour les lignes sans x (déjà traitées) — bloquées ci-dessus.
           valueUpdates.push({ range: "'SYSTEME U'!B" + row, values: [[dateExpe]] });
           valueUpdates.push({ range: "'SYSTEME U'!G" + row, values: [[trk]] });
           applied.push({ row, tracking: trk,
