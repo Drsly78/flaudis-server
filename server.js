@@ -61,6 +61,10 @@ async function initDB() {
     await pool.query(`ALTER TABLE its_dossiers ADD COLUMN IF NOT EXISTS date_expe TEXT`).catch(() => {});
     await pool.query(`ALTER TABLE dossiers ADD COLUMN IF NOT EXISTS date_envoi TEXT`).catch(() => {});
     await pool.query(`ALTER TABLE dossiers ADD COLUMN IF NOT EXISTS revers_url TEXT`).catch(() => {});
+    await pool.query(`ALTER TABLE dossiers ADD COLUMN IF NOT EXISTS fla TEXT`).catch(() => {});
+    // Migration : récupérer les FLA déjà présents dans les notes
+    await pool.query(`UPDATE dossiers SET fla = SUBSTRING(notes FROM 'FLA:([^ ]+)')
+      WHERE COALESCE(fla,'') = '' AND notes LIKE 'FLA:%' AND notes <> 'FLA:'`).catch(() => {});
     await pool.query(`
       CREATE TABLE IF NOT EXISTS villes_ref (
         norm TEXT PRIMARY KEY,
@@ -381,17 +385,20 @@ const server = http.createServer(async function(req, res) {
         if (!pool) { res.writeHead(200); res.end(JSON.stringify({ ok: true, msg: 'no db' })); return; }
         const d = payload;
         await pool.query(`
-          INSERT INTO dossiers (numero_dossier, enseigne, departement_ville, ref_produit, piece, decision, date_reception, tracking, date_envoi, revers_url)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+          INSERT INTO dossiers (numero_dossier, enseigne, departement_ville, ref_produit, piece, decision, date_reception, tracking, date_envoi, revers_url, notes, fla)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
           ON CONFLICT (numero_dossier) DO UPDATE SET
             enseigne=$2, departement_ville=$3, ref_produit=$4, piece=$5,
             decision=$6, date_reception=$7, date_traitement=NOW(),
             tracking=COALESCE(EXCLUDED.tracking, dossiers.tracking),
             date_envoi=COALESCE(EXCLUDED.date_envoi, dossiers.date_envoi),
-            revers_url=COALESCE(EXCLUDED.revers_url, dossiers.revers_url)
+            revers_url=COALESCE(EXCLUDED.revers_url, dossiers.revers_url),
+            notes=CASE WHEN EXCLUDED.notes ~ 'FLA:.' THEN EXCLUDED.notes ELSE dossiers.notes END,
+            fla=CASE WHEN EXCLUDED.fla <> '' THEN EXCLUDED.fla ELSE dossiers.fla END
         `, [d.numero_dossier||null, d.enseigne||null, d.departement_ville||null,
             d.ref_produit||null, d.piece||null, d.decision||null, d.date_reception||null,
-            d.tracking||null, d.date_envoi||null, d.revers_url||null]);
+            d.tracking||null, d.date_envoi||null, d.revers_url||null,
+            d.notes||'', ((String(d.notes||'').match(/FLA:(\S+)/) || [])[1] || '')]);
         res.writeHead(200); res.end(JSON.stringify({ ok: true }));
         return;
       }
@@ -1204,11 +1211,11 @@ const server = http.createServer(async function(req, res) {
             const part = lot.slice(i, i + 400);
             const vals = [], params = [];
             part.forEach(([key, o], j) => {
-              const r = o.r, b = j * 10;
+              const r = o.r, b = j * 11;
               const tv = phase === 1 ? (r[6] || '').toString().trim() : '';
               if (tv) trk++;
               const dEnv = (() => { if (phase !== 1) return ''; const v = (r[1] || '').toString().trim(); return (v && v.toLowerCase() !== 'x') ? (toIso2(v) || v) : ''; })();
-              vals.push('($' + (b+1) + ',$' + (b+2) + ',$' + (b+3) + ',$' + (b+4) + ',$' + (b+5) + ',$' + (b+6) + ',$' + (b+7) + ',$' + (b+8) + ',$' + (b+9) + ',$' + (b+10) + ')');
+              vals.push('($' + (b+1) + ',$' + (b+2) + ',$' + (b+3) + ',$' + (b+4) + ',$' + (b+5) + ',$' + (b+6) + ',$' + (b+7) + ',$' + (b+8) + ',$' + (b+9) + ',$' + (b+10) + ',$' + (b+11) + ')');
               params.push(key,
                 (phase === 1 ? r[4] : r[5] || '').toString().trim(),
                 (phase === 1 ? r[5] : r[6] || '').toString().trim(),
@@ -1218,10 +1225,11 @@ const server = http.createServer(async function(req, res) {
                 o.iso,
                 o.fla ? 'FLA:' + o.fla : '',
                 tv,
-                dEnv);
+                dEnv,
+                (o.fla || '').toString().trim());
             });
             await pool.query(`
-              INSERT INTO dossiers (numero_dossier, enseigne, departement_ville, ref_produit, piece, decision, date_reception, notes, tracking, date_envoi)
+              INSERT INTO dossiers (numero_dossier, enseigne, departement_ville, ref_produit, piece, decision, date_reception, notes, tracking, date_envoi, fla)
               VALUES ` + vals.join(',') + `
               ON CONFLICT (numero_dossier) DO UPDATE SET
                 enseigne = EXCLUDED.enseigne,
@@ -1232,7 +1240,8 @@ const server = http.createServer(async function(req, res) {
                 date_reception = EXCLUDED.date_reception,
                 tracking = CASE WHEN EXCLUDED.tracking <> '' THEN EXCLUDED.tracking ELSE dossiers.tracking END,
                 date_envoi = CASE WHEN EXCLUDED.date_envoi <> '' THEN EXCLUDED.date_envoi ELSE dossiers.date_envoi END,
-                notes = CASE WHEN EXCLUDED.notes ~ 'FLA:.' THEN EXCLUDED.notes ELSE dossiers.notes END
+                notes = CASE WHEN EXCLUDED.notes ~ 'FLA:.' THEN EXCLUDED.notes ELSE dossiers.notes END,
+                fla = CASE WHEN EXCLUDED.fla <> '' THEN EXCLUDED.fla ELSE dossiers.fla END
             `, params);
             maj += part.length;
           }
@@ -1411,14 +1420,14 @@ const server = http.createServer(async function(req, res) {
         if (!/^\d{4}-\d{2}-\d{2}$/.test(iso)) { res.writeHead(400); res.end(JSON.stringify({ error: 'iso requis' })); return; }
         const fr = iso.slice(8, 10) + '/' + iso.slice(5, 7) + '/' + iso.slice(2, 4);
         const q = await pool.query(`
-          SELECT numero_dossier, enseigne, departement_ville, ref_produit, piece, tracking, date_envoi, notes, revers_url
+          SELECT numero_dossier, enseigne, departement_ville, ref_produit, piece, tracking, date_envoi, notes, fla, revers_url
           FROM dossiers
           WHERE COALESCE(tracking,'') <> '' AND (date_envoi = $1 OR date_envoi = $2)
           ORDER BY departement_ville`, [iso, fr]);
         const lignes = q.rows.map(r => ({
           tracking: r.tracking,
           usv: r.numero_dossier,
-          fla: ((r.notes || '').match(/FLA:([^\s]+)/) || [])[1] || '',
+          fla: r.fla || (((r.notes || '').match(/FLA:([^\s]+)/) || [])[1] || ''),
           date_envoi: fr,
           magasin: r.departement_ville || '',
           enseigne: r.enseigne || '',
@@ -1466,8 +1475,8 @@ const server = http.createServer(async function(req, res) {
               if (!key || !iso) { skip++; continue; }
               const dateEnvoiT = (() => { const v = (r[1] || '').toString().trim(); return (v && v.toLowerCase() !== 'x') ? (toIso(v) || v) : ''; })();
               await pool.query(`
-                INSERT INTO dossiers (numero_dossier, enseigne, departement_ville, ref_produit, piece, decision, date_reception, notes, tracking, date_envoi)
-                VALUES ($1,$2,$3,$4,$5,'envoi_piece',$6,$7,$8,$9)
+                INSERT INTO dossiers (numero_dossier, enseigne, departement_ville, ref_produit, piece, decision, date_reception, notes, tracking, date_envoi, fla)
+                VALUES ($1,$2,$3,$4,$5,'envoi_piece',$6,$7,$8,$9,$10)
                 ON CONFLICT (numero_dossier) DO UPDATE SET
                   enseigne = EXCLUDED.enseigne,
                   departement_ville = EXCLUDED.departement_ville,
@@ -1476,10 +1485,11 @@ const server = http.createServer(async function(req, res) {
                   date_reception = EXCLUDED.date_reception,
                   tracking = CASE WHEN EXCLUDED.tracking <> '' THEN EXCLUDED.tracking ELSE dossiers.tracking END,
                   date_envoi = CASE WHEN EXCLUDED.date_envoi <> '' THEN EXCLUDED.date_envoi ELSE dossiers.date_envoi END,
-                  notes = CASE WHEN EXCLUDED.notes ~ 'FLA:.' THEN EXCLUDED.notes ELSE dossiers.notes END
+                  notes = CASE WHEN EXCLUDED.notes ~ 'FLA:.' THEN EXCLUDED.notes ELSE dossiers.notes END,
+                  fla = CASE WHEN EXCLUDED.fla <> '' THEN EXCLUDED.fla ELSE dossiers.fla END
               `, [key, (r[4] || '').toString().trim(), (r[5] || '').toString().trim(),
                   (r[2] || '').toString().trim(), (r[3] || '').toString().trim(), iso,
-                  fla ? 'FLA:' + fla : '', (r[6] || '').toString().trim(), dateEnvoiT]);
+                  fla ? 'FLA:' + fla : '', (r[6] || '').toString().trim(), dateEnvoiT, fla]);
               if ((r[6] || '').toString().trim()) trk++;
               up++;
             }
