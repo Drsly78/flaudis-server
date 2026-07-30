@@ -1231,7 +1231,8 @@ const server = http.createServer(async function(req, res) {
                 decision = EXCLUDED.decision,
                 date_reception = EXCLUDED.date_reception,
                 tracking = CASE WHEN EXCLUDED.tracking <> '' THEN EXCLUDED.tracking ELSE dossiers.tracking END,
-                date_envoi = CASE WHEN EXCLUDED.date_envoi <> '' THEN EXCLUDED.date_envoi ELSE dossiers.date_envoi END
+                date_envoi = CASE WHEN EXCLUDED.date_envoi <> '' THEN EXCLUDED.date_envoi ELSE dossiers.date_envoi END,
+                notes = CASE WHEN EXCLUDED.notes ~ 'FLA:.' THEN EXCLUDED.notes ELSE dossiers.notes END
             `, params);
             maj += part.length;
           }
@@ -1410,7 +1411,7 @@ const server = http.createServer(async function(req, res) {
         if (!/^\d{4}-\d{2}-\d{2}$/.test(iso)) { res.writeHead(400); res.end(JSON.stringify({ error: 'iso requis' })); return; }
         const fr = iso.slice(8, 10) + '/' + iso.slice(5, 7) + '/' + iso.slice(2, 4);
         const q = await pool.query(`
-          SELECT numero_dossier, enseigne, departement_ville, tracking, date_envoi, notes, revers_url
+          SELECT numero_dossier, enseigne, departement_ville, ref_produit, piece, tracking, date_envoi, notes, revers_url
           FROM dossiers
           WHERE COALESCE(tracking,'') <> '' AND (date_envoi = $1 OR date_envoi = $2)
           ORDER BY departement_ville`, [iso, fr]);
@@ -1421,6 +1422,8 @@ const server = http.createServer(async function(req, res) {
           date_envoi: fr,
           magasin: r.departement_ville || '',
           enseigne: r.enseigne || '',
+          ref: r.ref_produit || '',
+          piece: r.piece || '',
           revers_url: r.revers_url || null
         }));
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1472,7 +1475,8 @@ const server = http.createServer(async function(req, res) {
                   piece = EXCLUDED.piece,
                   date_reception = EXCLUDED.date_reception,
                   tracking = CASE WHEN EXCLUDED.tracking <> '' THEN EXCLUDED.tracking ELSE dossiers.tracking END,
-                  date_envoi = CASE WHEN EXCLUDED.date_envoi <> '' THEN EXCLUDED.date_envoi ELSE dossiers.date_envoi END
+                  date_envoi = CASE WHEN EXCLUDED.date_envoi <> '' THEN EXCLUDED.date_envoi ELSE dossiers.date_envoi END,
+                  notes = CASE WHEN EXCLUDED.notes ~ 'FLA:.' THEN EXCLUDED.notes ELSE dossiers.notes END
               `, [key, (r[4] || '').toString().trim(), (r[5] || '').toString().trim(),
                   (r[2] || '').toString().trim(), (r[3] || '').toString().trim(), iso,
                   fla ? 'FLA:' + fla : '', (r[6] || '').toString().trim(), dateEnvoiT]);
@@ -2015,6 +2019,8 @@ Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
             fla: (cur[8] || '').toString().trim(),
             enseigne: (cur[4] || '').toString().trim(),
             magasin: (cur[5] || '').toString().trim(),
+            ref: (cur[2] || '').toString().trim(),
+            piece: (cur[3] || '').toString().trim(),
             date_envoi: dateExpe });
         }
 
