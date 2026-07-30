@@ -1995,7 +1995,10 @@ Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
         if (!GOOGLE_SHEET_ID) { res.writeHead(500); res.end(JSON.stringify({ error: 'GOOGLE_SHEET_ID manquant' })); return; }
         const items = Array.isArray(payload.items) ? payload.items : [];
         let dateExpe = (payload.date_expe || '').trim();
-        if (!items.length || !dateExpe) { res.writeHead(400); res.end(JSON.stringify({ error: 'items et date_expe requis' })); return; }
+        // Un envoi peut être 100 % Intersport (aucune ligne SU) : il faut la
+        // date et AU MOINS une ligne, tous univers confondus.
+        const itemsIts0 = Array.isArray(payload.its_items) ? payload.its_items : [];
+        if ((!items.length && !itemsIts0.length) || !dateExpe) { res.writeHead(400); res.end(JSON.stringify({ error: 'date d\u2019expédition et au moins une ligne (SU ou ITS) requis' })); return; }
         // Format maison du tableau : JJ/MM/AA (ex 22/07/26)
         const dm = dateExpe.match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})$/);
         if (dm) {
