@@ -552,9 +552,18 @@ const server = http.createServer(async function(req, res) {
         const { ref } = payload;
         if (!ref) { res.writeHead(200); res.end(JSON.stringify({ found: false })); return; }
 
-        // Chercher d'abord la clé exacte, sinon chercher par préfixe
-        let key = getKey(ref);
+        // 1. Association manuelle du Cerveau (ref → notice) : elle fait foi
+        let ficheNom = null;
+        if (pool) {
+          try {
+            const ov = await pool.query('SELECT notice_file FROM notices_override WHERE UPPER(ref) = UPPER($1)', [String(ref).trim()]);
+            if (ov.rows.length) ficheNom = String(ov.rows[0].notice_file).replace(/\.pdf$/i, '');
+          } catch(e) {}
+        }
+        // 2. Sinon clé exacte, sinon matching flou
+        let key = getKey(ficheNom || ref);
         let data = await firebaseGet('produits/' + key);
+        if (data && ficheNom) { /* fiche trouvée via association */ }
 
         if (!data) {
           // Matching flou contre les clés Firebase réelles — même algorithme
@@ -615,6 +624,7 @@ const server = http.createServer(async function(req, res) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           found: true,
+          fiche: key,                            // nom EXACT de la fiche entrepôt (clé Firebase)
           emplacements,                          // ['Allée 1 G R2 H1', 'Allée 3 D R1 H0']
           emplacements_str: emplacements.join(' / ') || 'Non renseigné',
           visserie: data.visserie ?? null,        // true / false / null
