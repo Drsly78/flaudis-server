@@ -330,7 +330,7 @@ function callAnthropic(payload) {
         if (res.statusCode !== 200) {
           return reject(new Error('API Claude HTTP ' + res.statusCode + ' : ' + response.slice(0, 200)));
         }
-        try { resolve(JSON.parse(response)); }
+        try { resolve(JSON.parse(stripCircled(response))); }
         catch(e) { reject(new Error('Réponse API illisible : ' + response.slice(0, 120))); }
       });
     });
@@ -338,6 +338,23 @@ function callAnthropic(payload) {
     req.on('error', reject);
     req.write(data);
     req.end();
+  });
+}
+
+// Chiffres cerclés des notices (①②…❶❷…) → chiffres simples, plus lisibles
+function stripCircled(t) {
+  return String(t).replace(/[\u2460-\u24FF\u2776-\u2793]/g, ch => {
+    const c = ch.codePointAt(0);
+    if (c >= 0x2460 && c <= 0x2473) return String(c - 0x245F);      // ①-⑳
+    if (c >= 0x2474 && c <= 0x2487) return String(c - 0x2473);      // ⑴-⒇
+    if (c >= 0x2488 && c <= 0x249B) return String(c - 0x2487);      // ⒈-⒛
+    if (c === 0x24EA) return '0';                                    // ⓪
+    if (c >= 0x24EB && c <= 0x24F4) return String(c - 0x24EB + 11); // ⓫-⓴
+    if (c >= 0x24F5 && c <= 0x24FE) return String(c - 0x24F4);      // ⓵-⓾
+    if (c >= 0x2776 && c <= 0x277F) return String(c - 0x2775);      // ❶-❿
+    if (c >= 0x2780 && c <= 0x2789) return String(c - 0x277F);      // ➀-➉
+    if (c >= 0x278A && c <= 0x2793) return String(c - 0x2789);      // ➊-➓
+    return ch;
   });
 }
 
@@ -609,6 +626,104 @@ const server = http.createServer(async function(req, res) {
         return;
       }
 
+      // ── STOCK ENTREPÔT : toutes les fiches de l'app notices ────────
+      if (req.url === '/stock-liste') {
+        const allProduits = await firebaseGet('produits');
+        if (!allProduits) { res.writeHead(200); res.end(JSON.stringify({ fiches: [] })); return; }
+        const fiches = Object.entries(allProduits).map(([nom, data]) => {
+          // Emplacements (loc, loc2, loc3…)
+          const emplacements = [];
+          let i = 0;
+          while (i <= 10) {
+            const loc = data[i === 0 ? 'loc' : 'loc' + (i + 1)];
+            if (!loc && i > 0) break;
+            if (loc && loc.allee) {
+              let label = '';
+              if (loc.allee === 'AREA') label = 'Zone AREA';
+              else if (loc.cote === 'SOL') label = 'Allée ' + loc.allee + ' SOL';
+              else {
+                label = 'Allée ' + loc.allee;
+                if (loc.cote) label += ' ' + loc.cote;
+                if (loc.rack != null) label += ' R' + loc.rack;
+                if (loc.hauteur != null) label += ' H' + loc.hauteur;
+              }
+              emplacements.push(label);
+            }
+            i++;
+          }
+          // Cartons : transverses aux pièces, comme dans l'app
+          const pieces = data.pieces || {};
+          const pids = Object.keys(pieces);
+          const cidSet = new Set();
+          pids.forEach(pid => Object.keys(pieces[pid].cartons || {}).forEach(cid => cidSet.add(cid)));
+          const cids = [...cidSet].sort((a, b) => {
+            const na = /^c(\d+)$/.exec(a), nb2 = /^c(\d+)$/.exec(b);
+            if (na && nb2) return parseInt(na[1]) - parseInt(nb2[1]);
+            if (na) return -1; if (nb2) return 1;
+            return a.localeCompare(b);
+          });
+          const firstNPid = pids.find(pid => pieces[pid] && pieces[pid].totalCartons);
+          const totalC = firstNPid ? pieces[firstNPid].totalCartons : cids.filter(c => /^c\d+$/.test(c)).length;
+          let numIdx = 0;
+          const cartons = cids.map(cid => {
+            const isCustom = cid.startsWith('custom_');
+            const label = isCustom
+              ? cid.replace(/^custom_/, '').replace(/_\d+$/, '').replace(/_/g, ' ').toUpperCase()
+              : 'Carton ' + (++numIdx);
+            const sealed = pids.some(pid => pieces[pid].cartons && pieces[pid].cartons[cid] && pieces[pid].cartons[cid].sealed === true);
+            const contenu = pids.map(pid => {
+              const cart = (pieces[pid].cartons || {})[cid];
+              if (!cart) return null;
+              const qte = cart.qte || 0;
+              return { nom: pieces[pid].nom || pid, qte, initial: cart.initial || qte };
+            }).filter(Boolean);
+            return { id: cid, label, custom: isCustom, sealed, contenu };
+          });
+          return {
+            ref: nom,
+            emplacements,
+            visserie: data.visserie ?? null,
+            qty: data.qty ?? null,
+            note: data.note || '',
+            cartons_total: totalC,
+            cartons_fermes: cartons.filter(c => c.sealed).length,
+            cartons_ouverts: cartons.filter(c => !c.sealed)
+          };
+        }).sort((a, b) => a.ref.localeCompare(b.ref));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ fiches }));
+        return;
+      }
+
+      // ── MAGASINS ITS : liste (feuille CODE SOCIETAIRE) ──────────────
+      if (req.url === '/its-magasins-liste') {
+        if (!GOOGLE_SHEET_ID) { res.writeHead(200); res.end(JSON.stringify({ magasins: [] })); return; }
+        if (global.MAG_ITS_CACHE && (Date.now() - global.MAG_ITS_CACHE.t) < 10 * 60 * 1000) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ magasins: global.MAG_ITS_CACHE.liste }));
+          return;
+        }
+        const token = await getSheetsToken();
+        const q = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'CODE SOCIETAIRE'!A:D")}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const rows = q.values || [];
+        // La colonne des magasins = celle qui contient le plus de "NN VILLE"
+        let best = 0, bestScore = -1;
+        for (let c = 0; c < 4; c++) {
+          const score = rows.filter(r => /^\d{2,3}\s+\S/.test(((r[c] || '') + '').trim())).length;
+          if (score > bestScore) { bestScore = score; best = c; }
+        }
+        const seen = new Set();
+        const magasins = rows.map(r => ((r[best] || '') + '').trim())
+          .filter(v => /^\d{2,3}\s+\S/.test(v))
+          .filter(v => { const k = v.toUpperCase(); if (seen.has(k)) return false; seen.add(k); return true; })
+          .sort();
+        global.MAG_ITS_CACHE = { t: Date.now(), liste: magasins };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ magasins }));
+        return;
+      }
+
       // ── ACCORD SUIVANT : prochain numéro SUaamm### (affichage) ──
       if (req.url === '/accord-suivant') {
         if (!GOOGLE_SHEET_ID) { res.writeHead(200); res.end(JSON.stringify({ accord: null })); return; }
@@ -696,22 +811,30 @@ const server = http.createServer(async function(req, res) {
           const lens = vr.map(v => (v.values || []).length);
           const target = Math.max(...lens, 1) + 1;
 
-          // N° accord auto : SU + aa + mm + ### (suivant du mois, colonne J)
+          // N° accord : SU + aa + mm + séquence (mois repart à 00)
           let accord = (row[9] || '').trim();
           const isDDP = !!payload.ddp;
-          if (!accord && !isDDP) {
-            const now = new Date();
-            const aa = String(now.getFullYear()).slice(2);
-            const mm = String(now.getMonth() + 1).padStart(2, '0');
-            const prefix = 'SU' + aa + mm;
-            const jvals = ((vr[2] || {}).values || []).map(x => (x[0] || '').toString().trim());
-            const existants = new Set();
-            let maxSeq = -1, padLen = 2;
-            const reNum = new RegExp('^SU[\\s.-]*' + aa + '[\\s.-]*' + mm + '[\\s.-]*(\\d{1,4})$', 'i');
-            jvals.forEach(v => { const m = v.match(reNum); if (m) { existants.add(parseInt(m[1])); if (parseInt(m[1]) > maxSeq) { maxSeq = parseInt(m[1]); padLen = Math.max(2, m[1].length); } } });
+          const now = new Date();
+          const aa = String(now.getFullYear()).slice(2);
+          const mm = String(now.getMonth() + 1).padStart(2, '0');
+          const prefix = 'SU' + aa + mm;
+          const jvals = ((vr[2] || {}).values || []).map(x => (x[0] || '').toString().trim());
+          const existants = new Set();
+          let maxSeq = -1, padLen = 2;
+          const reNum = new RegExp('^SU[\\s.-]*' + aa + '[\\s.-]*' + mm + '[\\s.-]*(\\d{1,4})$', 'i');
+          jvals.forEach(v => { const m = v.match(reNum); if (m) { existants.add(parseInt(m[1])); if (parseInt(m[1]) > maxSeq) { maxSeq = parseInt(m[1]); padLen = Math.max(2, m[1].length); } } });
+          const suivantLibre = () => {
             let seq = maxSeq + 1; // mois vierge → 00
             while (existants.has(seq)) seq++;
-            accord = prefix + String(seq).padStart(padLen, '0');
+            return prefix + String(seq).padStart(padLen, '0');
+          };
+          if (!accord && !isDDP) {
+            accord = suivantLibre();
+          } else if (accord) {
+            // Numéro pré-rempli par l'app : s'il est déjà pris entre-temps
+            // (autre export), on bascule sur le suivant libre — jamais de doublon
+            const m = accord.match(reNum);
+            if (m && existants.has(parseInt(m[1]))) accord = suivantLibre();
           }
 
           // Écriture ciblée : A..K + M — la colonne L (formule) n'est JAMAIS touchée
@@ -836,7 +959,7 @@ const server = http.createServer(async function(req, res) {
             }]}]
           })
         });
-        const claudeData = await claudeRes.json();
+        const claudeData = JSON.parse(stripCircled(JSON.stringify(await claudeRes.json())));
         const text = claudeData.content?.map(b => b.text || '').join('') || '';
         const jsonMatch = text.match(/\{[\s\S]*\}/);
         const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : text);
@@ -1731,8 +1854,8 @@ TEXTE DU MAIL :
 ${(payload.mail_text || '(non fourni)').slice(0, 6000)}
 
 Extrais les informations suivantes. Règles :
-- date_mail : la date d'ENVOI DU MAIL, convertie en JJ/MM/AA. Le webmail l'affiche souvent en RELATIF — c'est NORMAL et ce n'est PAS une incertitude, convertis-la avec la date du jour donnée ci-dessus. CAS LE PLUS COURANT sur ce webmail : "jeu. 23/07, 13:59" → la date est ÉCRITE (23/07), prends-la telle quelle et complète avec l'année en cours (si elle tombait dans le futur, c'est l'année précédente) → 23/07/26. Autres formats : "13:59" seul = aujourd'hui ; "hier" = la veille ; "jeu. 13:59" sans jour/mois = le jeudi le plus récent ; une date complète type "Envoyé : mardi 14 avril 2026" se prend telle quelle. La date du bon de retour ne sert JAMAIS de date_mail (elle peut au mieux confirmer ta conversion). Ne mets date_mail en incertitude que si le mail n'affiche vraiment AUCUNE indication de date ou d'heure.
-- ville et cp : RÈGLE DE PRIORITÉ STRICTE. 1) Si un bon de retour est joint : le magasin est celui écrit dans le bloc en haut à gauche du bon — c'est LUI qui fait foi, ignore la signature du mail. 2) Sans bon de retour : lis attentivement le mail — l'expéditeur peut être la centrale Intersport France écrivant POUR un magasin ; le magasin concerné est alors celui NOMMÉ dans le texte du mail, pas l'expéditeur. N'utilise la signature que si l'expéditeur est manifestement le magasin lui-même. 3) Jamais l'adresse du siège (Intersport France, Longjumeau, 91).
+- date_mail : la date d'ENVOI DU MAIL, convertie en JJ/MM/AA. Le webmail l'affiche souvent en RELATIF — c'est NORMAL et ce n'est PAS une incertitude, convertis-la avec la date du jour donnée ci-dessus. CAS LE PLUS COURANT sur ce webmail : "jeu. 23/07, 13:59" → la date est ÉCRITE (23/07), prends-la telle quelle et complète avec l'année en cours (si elle tombait dans le futur, c'est l'année précédente) → 23/07/26. Autres formats : "13:59" seul = aujourd'hui ; "hier" = la veille ; "jeu. 13:59" sans jour/mois = le jeudi le plus récent ; une date complète type "Envoyé : mardi 14 avril 2026" se prend telle quelle. La date du bon de retour ne sert JAMAIS de date_mail (elle peut au mieux confirmer ta conversion). Ne mets date_mail en incertitude que si le mail n'affiche vraiment AUCUNE indication de date ou d'heure — et dans ce cas mets null : n'invente JAMAIS une date.
+- ville et cp : RÈGLE DE PRIORITÉ STRICTE. 1) Si un bon de retour est joint : le magasin est celui écrit dans le bloc en haut à gauche du bon — c'est LUI qui fait foi, ignore la signature du mail. 2) Sans bon de retour : lis attentivement le mail — l'expéditeur peut être la centrale Intersport France écrivant POUR un magasin ; le magasin concerné est alors celui NOMMÉ dans le texte du mail, pas l'expéditeur. N'utilise la signature que si l'expéditeur est manifestement le magasin lui-même. 3) Jamais l'adresse du siège (Intersport France, Longjumeau, 91). 4) INTERDICTION ABSOLUE d'inventer : si le magasin n'est LISIBLE ni sur le bon ni dans le mail, mets null et signale-le en incertitude — ne fournis JAMAIS un magasin de mémoire, par habitude ou par ressemblance avec un autre dossier. Recopie le nom depuis le document, ne le reconstruis pas.
 - magasin_nom : le nom du magasin (ex JAUDE SPORT, INTERSPORT JAUDE).
 - produits : la liste de TOUS les produits du bon de retour (il peut y en avoir plusieurs, une ligne de tableau chacun). Pour chaque produit : son NOM/désignation (ex E SWIM 10) et marque si visible — PAS la référence chiffrée qui est propre au magasin — sa quantité, et son motif propre s'il est indiqué sur sa ligne.
 - motif_global : la panne/le motif général s'il est écrit hors tableau (mail, haut du bon).
