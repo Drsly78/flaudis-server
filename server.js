@@ -341,6 +341,16 @@ function callAnthropic(payload) {
   });
 }
 
+// Parse tolérant du JSON renvoyé par le modèle
+function parseJsonModel(raw) {
+  try { return JSON.parse(raw.replace(/```json|```/g, '').trim()); }
+  catch(e) {
+    const m = raw.match(/\{[\s\S]*\}/);
+    if (m) { try { return JSON.parse(m[0]); } catch(e2) {} }
+  }
+  return null;
+}
+
 // Chiffres cerclés des notices (①②…❶❷…) → chiffres simples, plus lisibles
 function stripCircled(t) {
   return String(t).replace(/[\u2460-\u24FF\u2776-\u2793]/g, ch => {
@@ -1872,15 +1882,24 @@ Extrais les informations suivantes. Règles :
 Réponds UNIQUEMENT avec ce JSON, sans texte autour :
 {"date_mail":"JJ/MM/AA","cp":"63000","ville":"CLERMONT FERRAND","magasin_nom":"...","motif_global":"...","produits":[{"produit_nom":"...","marque":"...","quantite":1,"motif":"..."}],"incertitudes":["champ : explication courte"]}` });
 
-        const aiData = await callAnthropic({
+        let aiData = await callAnthropic({
           model: process.env.MODEL_EXTRACT || MODEL_MAIN,
           messages: [{ role: 'user', content }],
-          max_tokens: 1200
+          max_tokens: 2500
         });
-        const raw = (aiData.content || []).map(b => b.text || '').join('');
-        let parsed = null;
-        try { parsed = JSON.parse(raw.replace(/```json|```/g, '').trim()); }
-        catch(e) { const m = raw.match(/\{[\s\S]*\}/); if (m) { try { parsed = JSON.parse(m[0]); } catch(e2) {} } }
+        let raw = (aiData.content || []).map(b => b.text || '').join('');
+        let parsed = parseJsonModel(raw);
+        // Réponse coupée en plein JSON (gros bon multi-produits) → relance élargie
+        if (!parsed && aiData.stop_reason === 'max_tokens') {
+          aiData = await callAnthropic({
+            model: process.env.MODEL_EXTRACT || MODEL_MAIN,
+            messages: [{ role: 'user', content }],
+            max_tokens: 6000
+          });
+          raw = (aiData.content || []).map(b => b.text || '').join('');
+          parsed = parseJsonModel(raw);
+        }
+        if (!parsed) console.warn('Extraction ITS illisible — stop:', aiData.stop_reason, '— raw:', raw.slice(0, 600));
         // Filtre dur : une incertitude n'est recevable QUE sur les champs utiles
         // (magasin/ville/cp, produit, quantité, motif/panne, date). Tout le reste
         // (marque, numéros de retour, références internes…) est écarté d'office.
@@ -2106,18 +2125,23 @@ Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
 {"transporteur":"DPD|DSV|AUTRE","date":"JJ/MM/AAAA","lignes":[{"tracking":"...","cp":"...","ville":"...","enseigne":"..."}]}`;
         // Extraction bordereaux : les numéros ne sont PAS revérifiés par
         // l'opérateur → modèle principal obligatoire (fiabilité des chiffres).
-        const aiData = await callAnthropic({
+        let aiData = await callAnthropic({
           model: process.env.MODEL_EXTRACT || MODEL_MAIN,
           messages: [{ role: 'user', content: [ block, { type: 'text', text: prompt } ] }],
-          max_tokens: 3000
+          max_tokens: 4000
         });
-        const raw = (aiData.content || []).map(b => b.text || '').join('');
-        let parsed = null;
-        try { parsed = JSON.parse(raw.replace(/```json|```/g, '').trim()); }
-        catch(e) {
-          const m = raw.match(/\{[\s\S]*\}/);
-          if (m) { try { parsed = JSON.parse(m[0]); } catch(e2) {} }
+        let raw = (aiData.content || []).map(b => b.text || '').join('');
+        let parsed = parseJsonModel(raw);
+        if (!parsed && aiData.stop_reason === 'max_tokens') {
+          aiData = await callAnthropic({
+            model: process.env.MODEL_EXTRACT || MODEL_MAIN,
+            messages: [{ role: 'user', content: [ block, { type: 'text', text: prompt } ] }],
+            max_tokens: 8000
+          });
+          raw = (aiData.content || []).map(b => b.text || '').join('');
+          parsed = parseJsonModel(raw);
         }
+        if (!parsed) console.warn('Extraction bordereau illisible — stop:', aiData.stop_reason, '— raw:', raw.slice(0, 600));
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(parsed || { error: 'Extraction illisible', raw: raw.slice(0, 300) }));
         return;
