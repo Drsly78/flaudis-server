@@ -62,6 +62,9 @@ async function initDB() {
     await pool.query(`ALTER TABLE dossiers ADD COLUMN IF NOT EXISTS date_envoi TEXT`).catch(() => {});
     await pool.query(`ALTER TABLE dossiers ADD COLUMN IF NOT EXISTS revers_url TEXT`).catch(() => {});
     await pool.query(`ALTER TABLE dossiers ADD COLUMN IF NOT EXISTS fla TEXT`).catch(() => {});
+    // Migration : dates d'envoi estropiées 'AA-MM-JJ' → 'AAAA-MM-JJ'
+    await pool.query(`UPDATE dossiers SET date_envoi = '20' || date_envoi
+      WHERE date_envoi ~ '^[0-9]{2}-[0-9]{2}-[0-9]{2}$'`).catch(() => {});
     // Migration : récupérer les FLA déjà présents dans les notes
     await pool.query(`UPDATE dossiers SET fla = SUBSTRING(notes FROM 'FLA:([^ ]+)')
       WHERE COALESCE(fla,'') = '' AND notes LIKE 'FLA:%' AND notes <> 'FLA:'`).catch(() => {});
@@ -1216,6 +1219,14 @@ const server = http.createServer(async function(req, res) {
         const topSu30  = await topQ('dossiers', 'ref_produit', 30, `date_reception::date BETWEEN NOW()::date - 30 AND NOW()::date`);
         const topSu12  = await topQ('dossiers', 'ref_produit', 365, `date_reception::date BETWEEN NOW()::date - 365 AND NOW()::date`);
         const topIts30 = await topQ('its_dossiers', 'reference', 30, `${ITS_DATE} BETWEEN NOW()::date - 30 AND NOW()::date`);
+        const topQ8 = (table, col, dateCond) => pool.query(`
+          SELECT ${col} AS ref, COUNT(*) AS n FROM ${table}
+          WHERE ${dateCond} AND ${col} IS NOT NULL AND TRIM(${col}) <> ''
+          GROUP BY ${col} ORDER BY n DESC LIMIT 8`);
+        const magSu12  = await topQ8('dossiers', 'departement_ville', `date_reception::date BETWEEN NOW()::date - 365 AND NOW()::date`);
+        const magSu30  = await topQ8('dossiers', 'departement_ville', `date_reception::date BETWEEN NOW()::date - 30 AND NOW()::date`);
+        const magIts12 = await topQ8('its_dossiers', 'magasin', `${ITS_DATE} BETWEEN NOW()::date - 365 AND NOW()::date`);
+        const magIts30 = await topQ8('its_dossiers', 'magasin', `${ITS_DATE} BETWEEN NOW()::date - 30 AND NOW()::date`);
         const topIts12 = await topQ('its_dossiers', 'reference', 365, `${ITS_DATE} BETWEEN NOW()::date - 365 AND NOW()::date`);
 
         const its7 = await pool.query(`SELECT COUNT(*) AS n FROM its_dossiers WHERE ${ITS_DATE} BETWEEN NOW()::date - 7 AND NOW()::date`);
@@ -1304,6 +1315,8 @@ const server = http.createServer(async function(req, res) {
           mois_su: moisSu.rows,
           top_su_30: topSu30.rows, top_su_12: topSu12.rows,
           top_its_30: topIts30.rows, top_its_12: topIts12.rows,
+          mag_su_12: magSu12.rows, mag_su_30: magSu30.rows,
+          mag_its_12: magIts12.rows, mag_its_30: magIts30.rows,
           its_7j: parseInt(its7.rows[0].n),
           its_30j: its30.rows,
           its_30j_total: its30Total,
@@ -2385,11 +2398,23 @@ Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
         let dbSync = 0;
         if (pool) {
           const parts = dateExpe.split('/');
-          const iso = parts.length === 3 ? parts[2] + '-' + parts[1] + '-' + parts[0] : dateExpe;
+          const an4 = parts.length === 3 ? (parts[2].length === 2 ? '20' + parts[2] : parts[2]) : '';
+          const iso = parts.length === 3 ? an4 + '-' + parts[1].padStart(2, '0') + '-' + parts[0].padStart(2, '0') : dateExpe;
           for (const a of applied) {
-            if (!a.cnb) continue;
+            const cle = a.cnb || a.fla;
+            if (!cle) continue;
             try {
-              const r = await pool.query('UPDATE dossiers SET tracking = $1, date_envoi = $2 WHERE numero_dossier = $3', [a.tracking, iso, a.cnb]);
+              // UPSERT : un dossier jamais analysé entre AUSSI en base — sa
+              // journée d'expédition apparaît immédiatement dans l'historique
+              const r = await pool.query(`
+                INSERT INTO dossiers (numero_dossier, enseigne, departement_ville, ref_produit, piece, decision, date_reception, tracking, date_envoi, notes, fla)
+                VALUES ($1,$2,$3,$4,$5,'envoi_piece',$6,$7,$8,$9,$10)
+                ON CONFLICT (numero_dossier) DO UPDATE SET
+                  tracking = EXCLUDED.tracking,
+                  date_envoi = EXCLUDED.date_envoi,
+                  fla = CASE WHEN EXCLUDED.fla <> '' THEN EXCLUDED.fla ELSE dossiers.fla END
+              `, [cle, a.enseigne || '', a.magasin || '', a.ref || '', a.piece || '',
+                  null, a.tracking, iso, a.fla ? 'FLA:' + a.fla : '', a.fla || '']);
               dbSync += r.rowCount || 0;
             } catch(e) { console.warn('Sync DB tracking:', e.message); }
           }
