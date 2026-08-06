@@ -1397,7 +1397,7 @@ const server = http.createServer(async function(req, res) {
         const table = univers === 'su' ? 'dossiers' : 'its_dossiers';
         const orderCol = univers === 'su' ? 'date_reception' : 'created_at';
         const sql = 'SELECT * FROM ' + table + ' WHERE ' + conds.join(' AND ') +
-                    ' ORDER BY ' + orderCol + ' DESC NULLS LAST LIMIT 50';
+                    ' ORDER BY ' + orderCol + ' DESC NULLS LAST LIMIT 1000';
         const r = await pool.query(sql, params);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ resultats: r.rows, total: r.rows.length }));
@@ -1849,12 +1849,18 @@ const server = http.createServer(async function(req, res) {
           res.writeHead(200); res.end(JSON.stringify({ ok: true }));
           return;
         }
-        // GET : retrouver le format validé pour un nom scanné
+        // GET : retrouver le format validé pour un nom scanné.
+        // Tolérant : exact d'abord, puis inclusion (le dossier du jour peut
+        // écrire "BREST CEDEX 9" là où l'écriture validée est "29 BREST").
         const cle = normV2((payload.nom || '').replace(/^\d{2,3}\s*/, ''));
         if (!cle) { res.writeHead(200); res.end(JSON.stringify({ format: null })); return; }
-        const q = await pool.query('SELECT format FROM villes_ref WHERE norm = $1', [cle]);
+        const q = await pool.query('SELECT norm, format FROM villes_ref');
+        let hit = q.rows.find(r => r.norm === cle);
+        if (!hit && cle.length >= 3) {
+          hit = q.rows.find(r => r.norm.length >= 3 && (r.norm.includes(cle) || cle.includes(r.norm)));
+        }
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ format: q.rows.length ? q.rows[0].format : null }));
+        res.end(JSON.stringify({ format: hit ? hit.format : null }));
         return;
       }
 
