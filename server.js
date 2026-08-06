@@ -368,6 +368,9 @@ function stripCircled(t) {
   });
 }
 
+// Classeur des références Intersport (feuilles par année 2017→2026)
+const REF_ITS_SHEET_ID = '1B2kOW2TPtjQ4HDAq62IlItuUiU5kly22_GSegFiOKRc';
+
 // ── Serveur ───────────────────────────────────────────────
 const server = http.createServer(async function(req, res) {
   corsHeaders(res);
@@ -379,7 +382,12 @@ const server = http.createServer(async function(req, res) {
     return;
   }
 
-  if (req.headers['x-app-secret'] !== APP_SECRET) {
+  // Exception lecture navigateur : le diagnostic du référentiel ITS
+  // accepte la clé en paramètre d'URL (?key=…)
+  const urlKey = (req.url.match(/[?&]key=([^&]+)/) || [])[1];
+  if (req.url.startsWith('/ref-its-structure') && urlKey === APP_SECRET) {
+    // accès autorisé
+  } else if (req.headers['x-app-secret'] !== APP_SECRET) {
     res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
   }
 
@@ -643,6 +651,90 @@ const server = http.createServer(async function(req, res) {
           qty: data.qty ?? null,                  // pour produits sans pièces
           note: data.note || ''
         }));
+        return;
+      }
+
+      // ── RÉFÉRENTIEL ITS : prix import (cascade après PRIX AVOIR) ────
+      // Feuilles par année (2026→2017), en-têtes détectés PAR NOM (ligne 1 ou 2,
+      // positions variables selon l'année). Cache 30 min.
+      if (req.url === '/ref-its-lookup') {
+        const query = (payload.ref || '').trim();
+        if (!query) { res.writeHead(200); res.end(JSON.stringify({ found: false })); return; }
+        if (!global.REF_ITS_CACHE || (Date.now() - global.REF_ITS_CACHE.t) > 30 * 60 * 1000) {
+          const token = await getSheetsToken();
+          const meta = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${REF_ITS_SHEET_ID}?fields=sheets.properties.title`,
+            { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+          const annees = (meta.sheets || []).map(x => x.properties.title)
+            .filter(t => /^\d{4}$/.test(t)).sort((a, b) => b.localeCompare(a)); // 2026 → 2017
+          const entries = [];
+          for (const an of annees) {
+            const v = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${REF_ITS_SHEET_ID}/values/${encodeURIComponent("'" + an + "'!A:AU")}`,
+              { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+            const rows = v.values || [];
+            const normH = h => String(h || '').replace(/\s+/g, ' ').trim().toUpperCase();
+            let hIdx = -1;
+            for (let i = 0; i < Math.min(3, rows.length); i++) {
+              if ((rows[i] || []).some(c => normH(c) === 'ITS REFERENCE')) { hIdx = i; break; }
+            }
+            if (hIdx < 0) continue;
+            const H = (rows[hIdx] || []).map(normH);
+            const col = n2 => H.indexOf(n2);
+            const cEan = col('EAN'), cIts = col('ITS REFERENCE'), cWis = col('WISEN REFERENCE');
+            const cFob = col('ITS FOB'), cDdp = col('ITS DDP'), cPrice = col('ITS PRICE');
+            for (let i = hIdx + 1; i < rows.length; i++) {
+              const r = rows[i] || [];
+              const its = (r[cIts] || '').toString().trim();
+              const wis = cWis >= 0 ? (r[cWis] || '').toString().trim() : '';
+              if (!its && !wis) continue;
+              entries.push({
+                annee: an, its, wis,
+                ean: cEan >= 0 ? (r[cEan] || '').toString().replace(/\.0$/, '').trim() : '',
+                fob: cFob >= 0 ? (r[cFob] || '').toString().trim() : '',
+                ddp: cDdp >= 0 ? (r[cDdp] || '').toString().trim() : '',
+                price: cPrice >= 0 ? (r[cPrice] || '').toString().trim() : ''
+              });
+            }
+          }
+          global.REF_ITS_CACHE = { t: Date.now(), entries };
+          console.log('Référentiel ITS chargé :', entries.length, 'lignes,', annees.length, 'feuilles');
+        }
+        const entries = global.REF_ITS_CACHE.entries;
+        const norm = v => String(v || '').toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^A-Z0-9]+/g, ' ').trim();
+        const q = norm(query);
+        const isEan = /^\d{8,14}$/.test(query.replace(/\s/g, ''));
+        let hit = entries.find(e => norm(e.its) === q)
+          || entries.find(e => norm(e.wis) === q)
+          || (isEan ? entries.find(e => e.ean === query.replace(/\s/g, '')) : null)
+          || entries.find(e => q.length >= 4 && (norm(e.its).includes(q) || q.includes(norm(e.its)) && norm(e.its).length >= 4))
+          || entries.find(e => q.length >= 4 && norm(e.wis).includes(q));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(hit
+          ? { found: true, annee: hit.annee, its_ref: hit.its, wisen_ref: hit.wis, fob: hit.fob, ddp: hit.ddp, price: hit.price }
+          : { found: false }));
+        return;
+      }
+
+      // ── RÉFÉRENTIEL ITS : cartographie du classeur (diagnostic) ────
+      if (req.url.startsWith('/ref-its-structure')) {
+        try {
+          const token = await getSheetsToken();
+          const meta = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${REF_ITS_SHEET_ID}?fields=sheets.properties.title`,
+            { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+          if (meta.error) throw new Error(meta.error.message || 'accès refusé — le classeur est-il partagé au compte de service ?');
+          const titres = (meta.sheets || []).map(x => x.properties.title);
+          const feuilles = [];
+          for (const t of titres) {
+            const v = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${REF_ITS_SHEET_ID}/values/${encodeURIComponent("'" + t + "'!A1:Z3")}`,
+              { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+            const rows = v.values || [];
+            feuilles.push({ feuille: t, entetes: rows[0] || [], exemple1: rows[1] || [], exemple2: rows[2] || [] });
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ classeur: REF_ITS_SHEET_ID, feuilles }, null, 2));
+        } catch(e) {
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ error: e.message }));
+        }
         return;
       }
 
