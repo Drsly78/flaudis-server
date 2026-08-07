@@ -62,6 +62,8 @@ async function initDB() {
     await pool.query(`ALTER TABLE dossiers ADD COLUMN IF NOT EXISTS date_envoi TEXT`).catch(() => {});
     await pool.query(`ALTER TABLE dossiers ADD COLUMN IF NOT EXISTS revers_url TEXT`).catch(() => {});
     await pool.query(`ALTER TABLE dossiers ADD COLUMN IF NOT EXISTS fla TEXT`).catch(() => {});
+    await pool.query(`ALTER TABLE dossiers ADD COLUMN IF NOT EXISTS accord TEXT`).catch(() => {});
+    await pool.query(`ALTER TABLE dossiers ADD COLUMN IF NOT EXISTS wisen TEXT`).catch(() => {});
     // Migration : dates d'envoi estropiées 'AA-MM-JJ' → 'AAAA-MM-JJ'
     await pool.query(`UPDATE dossiers SET date_envoi = '20' || date_envoi
       WHERE date_envoi ~ '^[0-9]{2}-[0-9]{2}-[0-9]{2}$'`).catch(() => {});
@@ -1749,15 +1751,21 @@ const server = http.createServer(async function(req, res) {
               const iso = toIso(r[0]);
               if (!key || !iso) { skip++; continue; }
               await pool.query(`
-                INSERT INTO dossiers (numero_dossier, enseigne, departement_ville, ref_produit, piece, decision, date_reception, notes)
-                VALUES ($1,$2,$3,$4,'','remboursement',$5,$6)
+                INSERT INTO dossiers (numero_dossier, enseigne, departement_ville, ref_produit, piece, decision, date_reception, notes, fla, accord, wisen)
+                VALUES ($1,$2,$3,$4,'','remboursement',$5,$6,$7,$8,$9)
                 ON CONFLICT (numero_dossier) DO UPDATE SET
+                  enseigne = EXCLUDED.enseigne,
                   departement_ville = EXCLUDED.departement_ville,
                   ref_produit = EXCLUDED.ref_produit,
                   decision = 'remboursement',
-                  date_reception = EXCLUDED.date_reception
+                  date_reception = EXCLUDED.date_reception,
+                  notes = CASE WHEN EXCLUDED.notes ~ 'FLA:.' THEN EXCLUDED.notes ELSE dossiers.notes END,
+                  fla = CASE WHEN EXCLUDED.fla <> '' THEN EXCLUDED.fla ELSE dossiers.fla END,
+                  accord = CASE WHEN EXCLUDED.accord <> '' THEN EXCLUDED.accord ELSE dossiers.accord END,
+                  wisen = CASE WHEN EXCLUDED.wisen <> '' THEN EXCLUDED.wisen ELSE dossiers.wisen END
               `, [key, (r[5] || '').toString().trim(), (r[6] || '').toString().trim(),
-                  (r[2] || '').toString().trim(), iso, fla ? 'FLA:' + fla : '']);
+                  (r[2] || '').toString().trim(), iso, fla ? 'FLA:' + fla : '', fla,
+                  (r[9] || '').toString().trim(), (r[10] || '').toString().trim()]);
               up++;
             }
             console.log('Sync SU:', up, 'dossiers,', trk, 'trackings,', skip, 'lignes sans clé/date');
