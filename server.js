@@ -59,6 +59,7 @@ async function initDB() {
     `);
     await pool.query(`ALTER TABLE its_dossiers ADD COLUMN IF NOT EXISTS tracking TEXT`).catch(() => {});
     await pool.query(`ALTER TABLE its_dossiers ADD COLUMN IF NOT EXISTS date_expe TEXT`).catch(() => {});
+    await pool.query(`ALTER TABLE its_dossiers ADD COLUMN IF NOT EXISTS quantite TEXT`).catch(() => {});
     await pool.query(`ALTER TABLE dossiers ADD COLUMN IF NOT EXISTS date_envoi TEXT`).catch(() => {});
     await pool.query(`ALTER TABLE dossiers ADD COLUMN IF NOT EXISTS revers_url TEXT`).catch(() => {});
     await pool.query(`ALTER TABLE dossiers ADD COLUMN IF NOT EXISTS fla TEXT`).catch(() => {});
@@ -344,6 +345,20 @@ function callAnthropic(payload) {
     req.write(data);
     req.end();
   });
+}
+
+// Clé interne déterministe pour les dossiers traités en direct (sans CNB/FLA)
+// — même ligne = même clé à chaque synchro, donc jamais de doublon.
+function cleDirecte(date, ref, ville, piece) {
+  // Date normalisée en JJMMAA quel que soit le format d'entrée
+  let d = String(date || '').replace(/[^0-9]/g, '');
+  if (d.length === 8 && d.startsWith('20')) d = d.slice(6, 8) + d.slice(4, 6) + d.slice(2, 4); // AAAAMMJJ → JJMMAA
+  else if (d.length === 6) { /* déjà JJMMAA */ }
+  const n = v => String(v || '').toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^A-Z0-9]/g, '');
+  const base = d + '|' + n(ref) + '|' + n(ville) + '|' + n(piece);
+  let h = 5381;
+  for (let i = 0; i < base.length; i++) h = ((h << 5) + h + base.charCodeAt(i)) >>> 0;
+  return 'D-' + h.toString(36).toUpperCase();
 }
 
 // Parse tolérant du JSON renvoyé par le modèle
@@ -1450,8 +1465,9 @@ const server = http.createServer(async function(req, res) {
           for (const r of rows) {
             const cnb = phase === 1 ? (r[7] || '') : (r[8] || '');
             const fla = phase === 1 ? (r[8] || '') : (r[12] || '');
-            const key = cnb.toString().trim() || fla.toString().trim();
             const iso = toIso2(r[0]);
+            const key = cnb.toString().trim() || fla.toString().trim()
+              || (iso ? cleDirecte(iso, r[2], phase === 1 ? r[5] : r[6], phase === 1 ? r[3] : '') : '');
             if (!key || !iso) { skip++; continue; }
             parCle.set(key, { r, iso, fla: fla.toString().trim() });
           }
@@ -1720,8 +1736,8 @@ const server = http.createServer(async function(req, res) {
             const rows = await tail('SYSTEME U', 'H', 12000, 'I');
             for (const r of rows) {
               const cnb = (r[7] || '').toString().trim(), fla = (r[8] || '').toString().trim();
-              const key = cnb || fla;
               const iso = toIso(r[0]);
+              const key = cnb || fla || (iso ? cleDirecte(iso, r[2], r[5], r[3]) : '');
               if (!key || !iso) { skip++; continue; }
               const dateEnvoiT = (() => { const v = (r[1] || '').toString().trim(); return (v && v.toLowerCase() !== 'x') ? (toIso(v) || v) : ''; })();
               await pool.query(`
@@ -1747,8 +1763,8 @@ const server = http.createServer(async function(req, res) {
             const rrows = await tail('REMBOURSEMENT SU', 'I', 1500, 'M');
             for (const r of rrows) {
               const cnb = (r[8] || '').toString().trim(), fla = (r[12] || '').toString().trim();
-              const key = cnb || fla;
               const iso = toIso(r[0]);
+              const key = cnb || fla || (iso ? cleDirecte(iso, r[2], r[6], '') : '');
               if (!key || !iso) { skip++; continue; }
               await pool.query(`
                 INSERT INTO dossiers (numero_dossier, enseigne, departement_ville, ref_produit, piece, decision, date_reception, notes, fla, accord, wisen)
@@ -1911,7 +1927,7 @@ const server = http.createServer(async function(req, res) {
         const dept = (mag.match(/^(\d{2,3})/) || [])[1] || '';
         const cible = normMag(mag.replace(/^\d{2,3}\s*/, ''));
         const q = await pool.query(`
-          SELECT magasin, date_reception, reference, pannes, decision, accord, tracking, created_at
+          SELECT magasin, date_reception, reference, pannes, decision, accord, tracking, quantite, date_expe, created_at
           FROM its_dossiers
           WHERE magasin ILIKE $1 AND created_at > NOW() - INTERVAL '4 months'
           ORDER BY created_at DESC LIMIT 500
@@ -2163,9 +2179,10 @@ Réponds UNIQUEMENT avec ce JSON, sans texte autour :
           for (const a of applied) {
             const pr = produits.find(p => (p.reference || '').trim() === a.reference) || {};
             pool.query(
-              'INSERT INTO its_dossiers (date_reception, reference, pannes, magasin, decision, accord, date_expe) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+              'INSERT INTO its_dossiers (date_reception, reference, pannes, magasin, decision, accord, date_expe, quantite) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
               [d.date, a.reference, pr.pannes || '', d.magasin, a.etat || '', accordByRef[a.reference] || '',
-               (a.etat || '').toUpperCase() === 'AVOIR' ? todayFR : '']
+               (a.etat || '').toUpperCase() === 'AVOIR' ? todayFR : '',
+               (pr.quantite || a.quantite || '').toString().trim()]
             ).catch(e => console.warn('Historique ITS:', e.message));
           }
         }
@@ -2304,6 +2321,7 @@ Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
           valueUpdates.push({ range: "'SYSTEME U'!B" + row, values: [[dateExpe]] });
           valueUpdates.push({ range: "'SYSTEME U'!G" + row, values: [[trk]] });
           applied.push({ row, tracking: trk,
+            date_recep: (cur[0] || '').toString().trim(),
             cnb: (cur[7] || '').toString().trim(),
             fla: (cur[8] || '').toString().trim(),
             enseigne: (cur[4] || '').toString().trim(),
@@ -2415,7 +2433,7 @@ Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
           const an4 = parts.length === 3 ? (parts[2].length === 2 ? '20' + parts[2] : parts[2]) : '';
           const iso = parts.length === 3 ? an4 + '-' + parts[1].padStart(2, '0') + '-' + parts[0].padStart(2, '0') : dateExpe;
           for (const a of applied) {
-            const cle = a.cnb || a.fla;
+            const cle = a.cnb || a.fla || cleDirecte(a.date_recep || '', a.ref, a.magasin, a.piece);
             if (!cle) continue;
             try {
               // UPSERT : un dossier jamais analysé entre AUSSI en base — sa
