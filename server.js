@@ -703,6 +703,18 @@ const server = http.createServer(async function(req, res) {
           }
         }
         propositions.reverse(); // les plus récentes d'abord
+        // URLs Revers.io des dossiers déjà scannés par l'app
+        if (pool && propositions.length) {
+          const cnbs = propositions.map(p => p.cnb).filter(Boolean);
+          if (cnbs.length) {
+            try {
+              const uq = await pool.query('SELECT numero_dossier, revers_url FROM dossiers WHERE numero_dossier = ANY($1) AND revers_url IS NOT NULL', [cnbs]);
+              const uMap = {};
+              uq.rows.forEach(r2 => { uMap[r2.numero_dossier] = r2.revers_url; });
+              propositions.forEach(p => { p.revers_url = uMap[p.cnb] || null; });
+            } catch(e) {}
+          }
+        }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ propositions }));
         return;
