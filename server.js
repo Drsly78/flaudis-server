@@ -697,7 +697,8 @@ const server = http.createServer(async function(req, res) {
               ville: ((rows[i] || [])[6] || '').toString().trim(),
               montant_txt: (h.match(/Proposition geste co\s*([^\u2014—]*)/i) || [, h])[1].trim(),
               cnb: ((rows[i] || [])[8] || '').toString().trim(),
-              fla: ((rows[i] || [])[12] || '').toString().trim()
+              fla: ((rows[i] || [])[12] || '').toString().trim(),
+              cells: (rows[i] || []).slice(0, 13).map(c => (c || '').toString())
             });
           }
         }
