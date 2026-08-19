@@ -347,6 +347,12 @@ function callAnthropic(payload) {
   });
 }
 
+// Magasins Intersport : MAJUSCULES sans accents (Luçon → LUCON), pour
+// matcher la feuille CODE SOCIETAIRE
+function normMagasinIts(v) {
+  return String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().replace(/\s+/g, ' ').trim();
+}
+
 // Clé interne déterministe pour les dossiers traités en direct (sans CNB/FLA)
 // — même ligne = même clé à chaque synchro, donc jamais de doublon.
 function cleDirecte(date, ref, ville, piece) {
@@ -674,6 +680,106 @@ const server = http.createServer(async function(req, res) {
         return;
       }
 
+      // ── GESTES COMMERCIAUX : propositions en attente ────────────────
+      if (req.url === '/gestes-co-liste') {
+        const token = await getSheetsToken();
+        const q = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'REMBOURSEMENT SU'!A:M")}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const rows = q.values || [];
+        const propositions = [];
+        for (let i = 1; i < rows.length; i++) {
+          const h = ((rows[i] || [])[7] || '').toString().trim();
+          if (/^Proposition geste co/i.test(h)) {
+            propositions.push({
+              row: i + 1,
+              date: ((rows[i] || [])[0] || '').toString().trim(),
+              ref: ((rows[i] || [])[2] || '').toString().trim(),
+              ville: ((rows[i] || [])[6] || '').toString().trim(),
+              montant_txt: (h.match(/Proposition geste co\s*([^\u2014—]*)/i) || [, h])[1].trim(),
+              cnb: ((rows[i] || [])[8] || '').toString().trim(),
+              fla: ((rows[i] || [])[12] || '').toString().trim()
+            });
+          }
+        }
+        propositions.reverse(); // les plus récentes d'abord
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ propositions }));
+        return;
+      }
+
+      if (req.url === '/geste-co-valider' || req.url === '/geste-co-refuser') {
+        const rowN = parseInt(payload.row);
+        if (!rowN || rowN < 2) { res.writeHead(400); res.end(JSON.stringify({ error: 'row requis' })); return; }
+        const token = await getSheetsToken();
+        // Relire la ligne : elle doit toujours être une proposition (anti-décalage)
+        const vr = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'REMBOURSEMENT SU'!A" + rowN + ":M" + rowN)}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const lr = ((vr.values || [])[0] || []);
+        const hTxt = (lr[7] || '').toString().trim();
+        if (!/^Proposition geste co/i.test(hTxt)) {
+          res.writeHead(409); res.end(JSON.stringify({ error: 'Cette ligne n\u2019est plus une proposition (tableau modifié entre-temps ?) — recharge la liste.' })); return;
+        }
+        const gid = await getSheetGid(token, 'REMBOURSEMENT SU');
+
+        if (req.url === '/geste-co-refuser') {
+          // Suppression pure de la ligne + de l'historique en base
+          await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}:batchUpdate`, {
+            method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ requests: [{ deleteDimension: { range: { sheetId: gid, dimension: 'ROWS', startIndex: rowN - 1, endIndex: rowN } } }] })
+          });
+          if (pool) {
+            const cnb = (lr[8] || '').toString().trim(), fla = (lr[12] || '').toString().trim();
+            const cle = cnb || fla || cleDirecte(toIso2 ? (toIso2(lr[0]) || lr[0]) : lr[0], lr[2], lr[6], '');
+            if (cle) await pool.query('DELETE FROM dossiers WHERE numero_dossier = $1', [cle]).catch(() => {});
+          }
+          console.log('Geste co REFUSÉ — ligne', rowN, 'supprimée');
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, action: 'supprime' }));
+          return;
+        }
+
+        // VALIDATION : n° d'accord suivant (même règle que l'export), H réécrit, vert
+        const jq = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'REMBOURSEMENT SU'!J:J")}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const now = new Date();
+        const aa = String(now.getFullYear()).slice(2);
+        const mm = String(now.getMonth() + 1).padStart(2, '0');
+        const reNum = new RegExp('^SU[\\s.-]*' + aa + '[\\s.-]*' + mm + '[\\s.-]*(\\d{1,4})$', 'i');
+        const existants = new Set(); let maxSeq = -1, padLen = 2;
+        (jq.values || []).forEach(x => {
+          const m = ((x[0] || '') + '').trim().match(reNum);
+          if (m) { existants.add(parseInt(m[1])); if (parseInt(m[1]) > maxSeq) { maxSeq = parseInt(m[1]); padLen = Math.max(2, m[1].length); } }
+        });
+        let seq = maxSeq + 1;
+        while (existants.has(seq)) seq++;
+        const accord = 'SU' + aa + mm + String(seq).padStart(padLen, '0');
+        const hValide = hTxt.replace(/^Proposition geste co/i, 'Geste co');
+        await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchUpdate`, {
+          method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ valueInputOption: 'RAW', data: [
+            { range: "'REMBOURSEMENT SU'!H" + rowN, values: [[hValide]] },
+            { range: "'REMBOURSEMENT SU'!J" + rowN, values: [[accord]] }
+          ] })
+        });
+        await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}:batchUpdate`, {
+          method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ requests: [{ repeatCell: {
+            range: { sheetId: gid, startRowIndex: rowN - 1, endRowIndex: rowN, startColumnIndex: 0, endColumnIndex: 12 },
+            cell: { userEnteredFormat: { backgroundColor: { red: 146/255, green: 208/255, blue: 80/255 } } },
+            fields: 'userEnteredFormat.backgroundColor'
+          } }] })
+        });
+        if (pool) {
+          const cnb = (lr[8] || '').toString().trim(), fla = (lr[12] || '').toString().trim();
+          const cle = cnb || fla;
+          if (cle) await pool.query('UPDATE dossiers SET accord = $1 WHERE numero_dossier = $2', [accord, cle]).catch(() => {});
+        }
+        console.log('Geste co VALIDÉ — ligne', rowN, '→', accord);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, action: 'valide', accord }));
+        return;
+      }
+
       // ── RÉFÉRENTIEL ITS : prix import (cascade après PRIX AVOIR) ────
       // Feuilles par année (2026→2017), en-têtes détectés PAR NOM (ligne 1 ou 2,
       // positions variables selon l'année). Cache 30 min.
@@ -960,7 +1066,14 @@ const server = http.createServer(async function(req, res) {
             while (existants.has(seq)) seq++;
             return prefix + String(seq).padStart(padLen, '0');
           };
-          if (!accord && !isDDP) {
+          // Proposition de geste commercial : PAS de n° d'accord (en attente
+          // d'acceptation), texte en H, ligne orange
+          const gesteCo = (payload.geste_co || '').toString().trim();
+          if (gesteCo) {
+            accord = '';
+            const mnt = gesteCo.replace(/\.?0+$/, '').replace('.', ',');
+            row[7] = 'Proposition geste co ' + mnt + '\u20ac' + (row[7] ? ' \u2014 ' + row[7] : '');
+          } else if (!accord && !isDDP) {
             accord = suivantLibre();
           } else if (accord) {
             // Numéro pré-rempli par l'app : s'il est déjà pris entre-temps
@@ -997,7 +1110,9 @@ const server = http.createServer(async function(req, res) {
               body: JSON.stringify({ requests: [{
                 repeatCell: {
                   range: { sheetId: gid, startRowIndex: target - 1, endRowIndex: target, startColumnIndex: 0, endColumnIndex: 12 },
-                  cell: { userEnteredFormat: { backgroundColor: { red: 146/255, green: 208/255, blue: 80/255 } } },
+                  cell: { userEnteredFormat: { backgroundColor: gesteCo
+                    ? { red: 1, green: 192/255, blue: 0 }          // orange #ffc000 : proposition en attente
+                    : { red: 146/255, green: 208/255, blue: 80/255 } } },
                   fields: 'userEnteredFormat.backgroundColor'
                 }
               }] })
@@ -2055,6 +2170,7 @@ Réponds UNIQUEMENT avec ce JSON, sans texte autour :
         const d = payload;
         const produits = Array.isArray(d.produits) ? d.produits : [];
         if (!d.date || !d.magasin || !produits.length) { res.writeHead(400); res.end(JSON.stringify({ error: 'date, magasin et produits requis' })); return; }
+        d.magasin = normMagasinIts(d.magasin);
         const token = await getSheetsToken();
 
         const now = new Date();
@@ -2393,7 +2509,9 @@ Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
               const requests = itsApplied.map(a => ({
                 repeatCell: {
                   range: { sheetId: itsGid, startRowIndex: a.row - 1, endRowIndex: a.row, startColumnIndex: 0, endColumnIndex: 10 },
-                  cell: { userEnteredFormat: { backgroundColor: { red: 146/255, green: 208/255, blue: 80/255 } } },
+                  cell: { userEnteredFormat: { backgroundColor: gesteCo
+                    ? { red: 1, green: 192/255, blue: 0 }          // orange #ffc000 : proposition en attente
+                    : { red: 146/255, green: 208/255, blue: 80/255 } } },
                   fields: 'userEnteredFormat.backgroundColor'
                 }
               }));
