@@ -735,19 +735,26 @@ const server = http.createServer(async function(req, res) {
         const gid = await getSheetGid(token, 'REMBOURSEMENT SU');
 
         if (req.url === '/geste-co-refuser') {
-          // Suppression pure de la ligne + de l'historique en base
+          // La ligne RESTE : texte de refus en H, ligne rouge (traçabilité)
+          const mMnt = hTxt.match(/Proposition geste co\s*([^\u2014]+?)(?:\s*\u2014|$)/i);
+          const montantTxt = mMnt ? mMnt[1].trim() : '';
+          const resteComm = (hTxt.split('\u2014')[1] || '').trim();
+          const hRefus = 'Refus de la proposition' + (montantTxt ? ' de ' + montantTxt : '') + (resteComm ? ' \u2014 ' + resteComm : '');
+          await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'REMBOURSEMENT SU'!H" + rowN)}?valueInputOption=RAW`, {
+            method: 'PUT', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ values: [[hRefus]] })
+          });
           await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}:batchUpdate`, {
             method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ requests: [{ deleteDimension: { range: { sheetId: gid, dimension: 'ROWS', startIndex: rowN - 1, endIndex: rowN } } }] })
+            body: JSON.stringify({ requests: [{ repeatCell: {
+              range: { sheetId: gid, startRowIndex: rowN - 1, endRowIndex: rowN, startColumnIndex: 0, endColumnIndex: 12 },
+              cell: { userEnteredFormat: { backgroundColor: { red: 1, green: 0, blue: 0 } } },
+              fields: 'userEnteredFormat.backgroundColor'
+            } }] })
           });
-          if (pool) {
-            const cnb = (lr[8] || '').toString().trim(), fla = (lr[12] || '').toString().trim();
-            const cle = cnb || fla || cleDirecte(toIso2 ? (toIso2(lr[0]) || lr[0]) : lr[0], lr[2], lr[6], '');
-            if (cle) await pool.query('DELETE FROM dossiers WHERE numero_dossier = $1', [cle]).catch(() => {});
-          }
-          console.log('Geste co REFUSÉ — ligne', rowN, 'supprimée');
+          console.log('Geste co REFUSÉ — ligne', rowN, '→ rouge :', hRefus);
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true, action: 'supprime' }));
+          res.end(JSON.stringify({ ok: true, action: 'refuse' }));
           return;
         }
 
@@ -1084,7 +1091,8 @@ const server = http.createServer(async function(req, res) {
           const gesteCo = (payload.geste_co || '').toString().trim();
           if (gesteCo) {
             accord = '';
-            const mnt = gesteCo.replace(/\.?0+$/, '').replace('.', ',');
+            // On ne retire que les zéros DÉCIMAUX inutiles : 50 → 50, 50.00 → 50, 42.50 → 42,5
+            const mnt = gesteCo.replace(/\.(\d*?)0+$/, '.$1').replace(/\.$/, '').replace('.', ',');
             row[7] = 'Proposition geste co ' + mnt + '\u20ac' + (row[7] ? ' \u2014 ' + row[7] : '');
           } else if (!accord && !isDDP) {
             accord = suivantLibre();
@@ -2755,7 +2763,8 @@ Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
           const noticeContent = [{ type: 'text', text:
             'NOTICE TECHNIQUE du produit ' + raw + ' — TRANSCRIPTION MÉMORISÉE (lue précédemment sur le fichier "' + kbHit.notice_file + '") :\n\n' +
             kbHit.transcription +
-            '\n\nCette transcription est ta référence fiable des repères, désignations et quantités de ce produit — elle remplace les pages images de la notice. Dans ta réponse, la section TRANSCRIPTION peut reprendre ces données telles quelles.' }];
+            '\n\nCette transcription remplace UNIQUEMENT les pages images de la notice OFFICIELLE de référence (repères, désignations, quantités — la section TRANSCRIPTION peut la reprendre telle quelle).\n' +
+            '⚠️ IMPORTANT : elle ne remplace JAMAIS les PIÈCES JOINTES DU DOSSIER. Les documents fournis par le client (notice annotée avec pièces entourées, cochées ou surlignées, photos du produit ou du défaut) doivent être EXAMINÉS VISUELLEMENT avec la plus grande attention : c\u2019est là que le client désigne la pièce défectueuse. Si une notice annotée figure dans les pièces jointes, croise l\u2019annotation avec la transcription ci-dessus pour identifier précisément le repère et la désignation de la pièce entourée.' }];
           const lastMsg = payload.messages[payload.messages.length - 1];
           const orig = Array.isArray(lastMsg.content) ? lastMsg.content : [{ type: 'text', text: lastMsg.content }];
           lastMsg.content = [...noticeContent, ...orig];
