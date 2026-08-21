@@ -680,6 +680,156 @@ const server = http.createServer(async function(req, res) {
         return;
       }
 
+      // ── EN ATTENTE ITS : demandes de renvoi (feuille INTERSPORT) ────
+      if (req.url === '/attente-its-liste') {
+        const token = await getSheetsToken();
+        const q = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'INTERSPORT'!A:J")}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const rows = q.values || [];
+        const attente = [];
+        for (let i = 1; i < rows.length; i++) {
+          const etat = ((rows[i] || [])[8] || '').toString().trim();
+          if (/^DEMANDE\s+(DE\s+)?RENVOI$/i.test(etat)) {
+            attente.push({ row: i + 1, cells: (rows[i] || []).slice(0, 10).map(c => (c || '').toString()) });
+          }
+        }
+        attente.reverse();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ attente }));
+        return;
+      }
+
+      if (req.url === '/attente-its-reception' || req.url === '/attente-its-avoir' || req.url === '/attente-its-renvoyer') {
+        const rowN = parseInt(payload.row);
+        if (!rowN || rowN < 2) { res.writeHead(400); res.end(JSON.stringify({ error: 'row requis' })); return; }
+        const token = await getSheetsToken();
+        const vr = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'INTERSPORT'!A" + rowN + ":J" + rowN)}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const lr = ((vr.values || [])[0] || []).map(c => (c || '').toString());
+        if (!/^DEMANDE\s+(DE\s+)?RENVOI$/i.test((lr[8] || '').trim())) {
+          res.writeHead(409); res.end(JSON.stringify({ error: 'Cette ligne n\u2019est plus en DEMANDE RENVOI (tableau modifié entre-temps ?) — recharge la liste.' })); return;
+        }
+        const now = new Date();
+        const jj = String(now.getDate()).padStart(2, '0'), mo = String(now.getMonth() + 1).padStart(2, '0');
+        const todayFR2 = jj + '/' + mo + '/' + String(now.getFullYear()).slice(2);
+
+        if (req.url === '/attente-its-reception') {
+          // Retour reçu → date du jour en G, rien d'autre ne bouge
+          await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'INTERSPORT'!G" + rowN)}?valueInputOption=RAW`, {
+            method: 'PUT', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ values: [[todayFR2]] })
+          });
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, date: todayFR2 }));
+          return;
+        }
+
+        const gid = await getSheetGid(token, 'INTERSPORT');
+
+        if (req.url === '/attente-its-renvoyer') {
+          // Testé sans défaut → RETOUR EN L'ETAT, F renseigné, ligne blanche
+          await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchUpdate`, {
+            method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ valueInputOption: 'RAW', data: [
+              { range: "'INTERSPORT'!I" + rowN, values: [["RETOUR EN L'ETAT"]] },
+              { range: "'INTERSPORT'!F" + rowN, values: [['Produit testé et fonctionnel']] }
+            ] })
+          });
+          if (gid !== null) await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}:batchUpdate`, {
+            method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ requests: [{ repeatCell: {
+              range: { sheetId: gid, startRowIndex: rowN - 1, endRowIndex: rowN, startColumnIndex: 0, endColumnIndex: 10 },
+              cell: { userEnteredFormat: { backgroundColor: { red: 1, green: 1, blue: 1 } } },
+              fields: 'userEnteredFormat.backgroundColor'
+            } }] })
+          });
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+          return;
+        }
+
+        // ── AVOIR : statut + vert + écriture classique dans REMBOURSEMENT ITS ──
+        const refProd = (lr[1] || '').trim();
+        const magasin = (lr[4] || '').trim();
+        const dateDossier = (lr[0] || '').trim() || todayFR2;
+        // Statut DDP depuis le référentiel (PRIX AVOIR) — cache 10 min sinon rechargé
+        let isDDP = false;
+        try {
+          let items = (global._itsRefCache && (Date.now() - global._itsRefCache.ts) < 10 * 60 * 1000) ? global._itsRefCache.items : null;
+          if (!items) {
+            const bg0 = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchGet?ranges=${encodeURIComponent("'CODE PRODUITS'!A:G")}&ranges=${encodeURIComponent("'PRIX AVOIR'!A:F")}`,
+              { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+            const nrm0 = v => String(v || '').toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^A-Z0-9]/g, '');
+            const pByC = {}, pByN = {};
+            ((bg0.valueRanges || [])[1]?.values || []).slice(2).forEach(r2 => {
+              const code = (r2[0] || '').toString().trim(), lib = (r2[1] || '').toString().trim();
+              const v = r2[4] !== undefined ? String(r2[4]).trim() : '';
+              if (!v) return;
+              if (code) pByC[nrm0(code)] = v;
+              if (lib) pByN[nrm0(lib)] = v;
+            });
+            items = [];
+            ((bg0.valueRanges || [])[0]?.values || []).slice(2).forEach(r2 => {
+              const rf = (r2[0] || '').toString().trim();
+              if (!rf) return;
+              items.push({ ref: rf, prix: pByC[nrm0((r2[3] || '').toString().trim())] || pByN[nrm0(rf)] || '' });
+            });
+          }
+          const nrm1 = v => String(v || '').toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^A-Z0-9]/g, '');
+          const hit = items.find(it => nrm1(it.ref) === nrm1(refProd));
+          isDDP = !!(hit && String(hit.prix || '').toUpperCase().includes('DDP'));
+        } catch(e) {}
+
+        // Ligne libre + accord suivant (règle ITSaamm### habituelle)
+        const bg = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchGet?ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!B:B")}&ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!G:G")}&ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!J:J")}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const vr2 = bg.valueRanges || [];
+        const lens = vr2.map(v => (v.values || []).length);
+        const ligne = Math.max(4, ...lens) + 1;
+        const aa2 = String(now.getFullYear()).slice(2);
+        const prefix = 'ITS' + aa2 + mo;
+        let maxSeq = 0;
+        const reNum = new RegExp('^' + prefix + '(\\d{3})$');
+        ((vr2[2] || {}).values || []).forEach(x => { const m = ((x[0] || '') + '').trim().match(reNum); if (m) maxSeq = Math.max(maxSeq, parseInt(m[1])); });
+        let accord = '';
+        if (!isDDP) accord = prefix + String(maxSeq + 1).padStart(3, '0');
+        const dp = dateDossier.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+        const dateFull = dp ? dp[1].padStart(2,'0') + '/' + dp[2].padStart(2,'0') + '/' + (dp[3].length === 4 ? dp[3].slice(2) : dp[3].padStart(2,'0')) : dateDossier;
+        const updates = [
+          { range: "'REMBOURSEMENT ITS'!B" + ligne, values: [[dateFull]] },
+          { range: "'REMBOURSEMENT ITS'!D" + ligne, values: [[1]] },
+          { range: "'REMBOURSEMENT ITS'!G" + ligne, values: [[refProd]] },
+          { range: "'REMBOURSEMENT ITS'!H" + ligne, values: [[magasin]] }
+        ];
+        if (accord) updates.push({ range: "'REMBOURSEMENT ITS'!J" + ligne, values: [[accord]] });
+        await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchUpdate`, {
+          method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ valueInputOption: 'USER_ENTERED', data: updates })
+        });
+        // Statut + vert sur la ligne INTERSPORT
+        await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'INTERSPORT'!I" + rowN)}?valueInputOption=RAW`, {
+          method: 'PUT', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ values: [['AVOIR']] })
+        });
+        if (gid !== null) await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}:batchUpdate`, {
+          method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ requests: [{ repeatCell: {
+            range: { sheetId: gid, startRowIndex: rowN - 1, endRowIndex: rowN, startColumnIndex: 0, endColumnIndex: 10 },
+            cell: { userEnteredFormat: { backgroundColor: { red: 146/255, green: 208/255, blue: 80/255 } } },
+            fields: 'userEnteredFormat.backgroundColor'
+          } }] })
+        });
+        // Historique base
+        if (pool) pool.query(
+          'INSERT INTO its_dossiers (date_reception, reference, pannes, magasin, decision, accord, date_expe, quantite) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+          [dateDossier, refProd, (lr[3] || '').trim(), magasin, 'AVOIR', accord || (isDDP ? '(DDP — sans numéro)' : ''), todayFR2, '1']
+        ).catch(() => {});
+        console.log('En attente ITS — AVOIR ligne', rowN, '→ REMBOURSEMENT ITS ligne', ligne, accord || '(DDP)');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, ligne, accord, ref: refProd, ddp: isDDP }));
+        return;
+      }
+
       // ── GESTES COMMERCIAUX : propositions en attente ────────────────
       if (req.url === '/gestes-co-liste') {
         const token = await getSheetsToken();
