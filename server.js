@@ -788,6 +788,15 @@ out center tags;`;
         return;
       }
 
+      if (req.url === '/magasins-u-purge-osm') {
+        let n = 0;
+        if (pool) { const r2 = await pool.query("DELETE FROM magasins_u WHERE slug LIKE 'osm-%'").catch(() => null); if (r2) n = r2.rowCount; }
+        console.log('Purge OSM :', n, 'entrées retirées');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, retires: n }));
+        return;
+      }
+
       if (req.url === '/magasins-u-bulk') {
         // Fiches collectées côté navigateur (synchro officielle, passe Cloudflare)
         if (pool) await pool.query(`CREATE TABLE IF NOT EXISTS magasins_u (
