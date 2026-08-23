@@ -727,9 +727,12 @@ const server = http.createServer(async function(req, res) {
               const vus = new Set();
               const lirePage = async u => {
                 try {
-                  const t = await fetch(u, { headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36' } }).then(r2 => r2.text());
-                  for (const m of t.match(/href="(\/magasin\/[a-z0-9-]+)"/gi) || [])
-                    urls.add('https://www.magasins-u.com' + m.replace(/href="|"/g, ''));
+                  const t = await fetch(u, { headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36', 'Accept': 'text/html,application/xhtml+xml', 'Accept-Language': 'fr-FR,fr;q=0.9' } }).then(r2 => r2.text());
+                  // Liens absolus OU relatifs vers les fiches
+                  for (const m of t.match(/(?:https?:\/\/www\.magasins-u\.com)?\/magasin\/([a-z0-9-]+)/gi) || []) {
+                    const slug2 = m.split('/magasin/')[1];
+                    if (slug2) urls.add('https://www.magasins-u.com/magasin/' + slug2);
+                  }
                   const sous = [];
                   for (const m of t.match(/href="([^"#?]*annuaire-magasin[^"#?]*)"/gi) || []) {
                     let l = m.replace(/href="|"/g, '');
