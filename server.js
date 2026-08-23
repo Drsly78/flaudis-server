@@ -411,7 +411,7 @@ const server = http.createServer(async function(req, res) {
   // Exception lecture navigateur : le diagnostic du référentiel ITS
   // accepte la clé en paramètre d'URL (?key=…)
   const urlKey = (req.url.match(/[?&]key=([^&]+)/) || [])[1];
-  if ((req.url.startsWith('/ref-its-structure') || req.url.startsWith('/magasins-u-crawl') || req.url.startsWith('/magasins-u-status')) && urlKey === APP_SECRET) {
+  if ((req.url.startsWith('/ref-its-structure') || req.url.startsWith('/magasins-u-crawl') || req.url.startsWith('/magasins-u-status') || req.url.startsWith('/magasins-u-test')) && urlKey === APP_SECRET) {
     // accès autorisé
   } else if (req.headers['x-app-secret'] !== APP_SECRET) {
     res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
@@ -805,6 +805,28 @@ const server = http.createServer(async function(req, res) {
         })();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, lance: true }));
+        return;
+      }
+
+      if (req.url.startsWith('/magasins-u-test')) {
+        const cible = 'https://www.magasins-u.com/annuaire-magasin';
+        let out = { cible };
+        try {
+          const r2 = await fetch(cible, { redirect: 'follow', headers: {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'fr-FR,fr;q=0.9'
+          } });
+          const t = await r2.text();
+          out.status = r2.status;
+          out.finalUrl = r2.url;
+          out.taille = t.length;
+          out.nbLiensMagasin = (t.match(/\/magasin\/[a-z0-9-]+/gi) || []).length;
+          out.serveur = r2.headers.get('server') || '';
+          out.extrait = t.slice(0, 600);
+        } catch(e) { out.erreur = e.message; }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(out, null, 2));
         return;
       }
 
