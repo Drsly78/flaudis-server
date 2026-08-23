@@ -788,6 +788,28 @@ out center tags;`;
         return;
       }
 
+      if (req.url === '/magasins-u-bulk') {
+        // Fiches collectées côté navigateur (synchro officielle, passe Cloudflare)
+        if (pool) await pool.query(`CREATE TABLE IF NOT EXISTS magasins_u (
+          slug TEXT PRIMARY KEY, enseigne TEXT, nom TEXT, adresse TEXT, cp TEXT,
+          ville TEXT, dept TEXT, tel TEXT, url TEXT, maj TIMESTAMPTZ DEFAULT now())`).catch(() => {});
+        const mags = Array.isArray(payload.magasins) ? payload.magasins : [];
+        let ok = 0;
+        for (const mg of mags) {
+          try {
+            if (!pool || !mg.slug) continue;
+            await pool.query(`INSERT INTO magasins_u (slug, enseigne, nom, adresse, cp, ville, dept, tel, url, maj)
+              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now())
+              ON CONFLICT (slug) DO UPDATE SET enseigne=$2, nom=$3, adresse=$4, cp=$5, ville=$6, dept=$7, tel=$8, url=$9, maj=now()`,
+              [String(mg.slug).slice(0,200), mg.enseigne || '', mg.nom || '', mg.adresse || '', mg.cp || '', mg.ville || '', (mg.cp || '').slice(0,2), mg.tel || '', mg.url || '']);
+            ok++;
+          } catch(e) {}
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, enregistres: ok }));
+        return;
+      }
+
       if (req.url === '/magasins-u-recherche') {
         const q2 = (payload.q || '').trim();
         if (!pool || q2.length < 2) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ magasins: [] })); return; }
