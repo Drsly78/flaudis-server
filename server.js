@@ -682,6 +682,7 @@ const server = http.createServer(async function(req, res) {
 
       // ── ANNUAIRE MAGASINS U (crawl magasins-u.com pour saisie transporteur) ──
       if (req.url.startsWith('/magasins-u-crawl')) {
+        // Source : OpenStreetMap via Overpass (magasins-u.com bloque les serveurs — Cloudflare 403)
         if (pool) await pool.query(`CREATE TABLE IF NOT EXISTS magasins_u (
           slug TEXT PRIMARY KEY, enseigne TEXT, nom TEXT, adresse TEXT, cp TEXT,
           ville TEXT, dept TEXT, tel TEXT, url TEXT, maj TIMESTAMPTZ DEFAULT now())`).catch(() => {});
@@ -691,116 +692,65 @@ const server = http.createServer(async function(req, res) {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: true, deja: true, etat: global._muCrawl })); return;
           }
-          console.log('Crawl magasins U figé — relance autorisée');
         }
-        const force = req.url.includes('force=1');
-        global._muCrawl = { actif: true, phase: 'sitemap', total: 0, fait: 0, ok: 0, erreurs: 0, touch: Date.now(), demarre: new Date().toISOString() };
-        console.log('Crawl magasins U : démarrage');
+        global._muCrawl = { actif: true, phase: 'OpenStreetMap', total: 0, fait: 0, ok: 0, erreurs: 0, touch: Date.now(), demarre: new Date().toISOString() };
+        console.log('Import magasins U (OpenStreetMap) : démarrage');
         (async () => {
           const et = global._muCrawl;
-          const dodo = ms => new Promise(r2 => setTimeout(r2, ms));
           try {
-            // 1. URLs des fiches via les sitemaps
-            let urls = new Set();
-            const lireSitemap = async u => {
+            const requete = `[out:json][timeout:180];
+area["ISO3166-1"="FR"][admin_level=2]->.fr;
+(
+  nwr["shop"]["brand"~"^(Super U|Hyper U|U Express|Utile|Marché U)$"](area.fr);
+  nwr["shop"]["name"~"^(Super U|Hyper U|U Express|Utile)( |$)",i](area.fr);
+);
+out center tags;`;
+            let data = null;
+            for (const api of ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter']) {
               try {
-                const t = await fetch(u, { headers: { 'User-Agent': 'Mozilla/5.0 (annuaire interne SAV)' } }).then(r2 => r2.text());
-                (t.match(/<loc>([^<]+)<\/loc>/g) || []).forEach(m => {
-                  const loc = m.replace(/<\/?loc>/g, '').trim();
-                  if (/\/magasin\/[a-z0-9-]+\/?$/i.test(loc)) urls.add(loc.replace(/\/$/, ''));
-                  else if (/sitemap[^<]*\.xml/i.test(loc) && urls.size < 20000) sousSitemaps.push(loc);
+                const r2 = await fetch(api, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                  body: 'data=' + encodeURIComponent(requete)
                 });
-              } catch(e) {}
-            };
-            const sousSitemaps = [];
-            for (const u of ['https://www.magasins-u.com/sitemap.xml', 'https://www.magasins-u.com/sitemap_index.xml']) await lireSitemap(u);
-            if (!urls.size) {
-              try {
-                const rb = await fetch('https://www.magasins-u.com/robots.txt').then(r2 => r2.text());
-                for (const m of rb.match(/Sitemap:\s*(\S+)/gi) || []) sousSitemaps.push(m.replace(/Sitemap:\s*/i, ''));
-              } catch(e) {}
+                if (r2.ok) { data = await r2.json(); break; }
+                console.log('Overpass', api, '→', r2.status);
+              } catch(e2) { console.log('Overpass', api, 'erreur :', e2.message); }
             }
-            for (let i = 0; i < sousSitemaps.length && i < 40; i++) await lireSitemap(sousSitemaps[i]);
-            // Fallback : l'annuaire officiel par département
-            if (urls.size < 100) {
-              et.phase = 'annuaire';
-              const vus = new Set();
-              const lirePage = async u => {
-                try {
-                  const t = await fetch(u, { headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36', 'Accept': 'text/html,application/xhtml+xml', 'Accept-Language': 'fr-FR,fr;q=0.9' } }).then(r2 => r2.text());
-                  // Liens absolus OU relatifs vers les fiches
-                  for (const m of t.match(/(?:https?:\/\/www\.magasins-u\.com)?\/magasin\/([a-z0-9-]+)/gi) || []) {
-                    const slug2 = m.split('/magasin/')[1];
-                    if (slug2) urls.add('https://www.magasins-u.com/magasin/' + slug2);
-                  }
-                  const sous = [];
-                  for (const m of t.match(/href="([^"#?]*annuaire-magasin[^"#?]*)"/gi) || []) {
-                    let l = m.replace(/href="|"/g, '');
-                    if (l.startsWith('/')) l = 'https://www.magasins-u.com' + l;
-                    if (l.includes('magasins-u.com') && !vus.has(l)) { vus.add(l); sous.push(l); }
-                  }
-                  return sous;
-                } catch(e) { return []; }
-              };
-              const niveau1 = await lirePage('https://www.magasins-u.com/annuaire-magasin');
-              for (let i = 0; i < niveau1.length && i < 150; i++) {
-                const niveau2 = await lirePage(niveau1[i]);
-                for (let j = 0; j < niveau2.length && j < 30; j++) await lirePage(niveau2[j]);
-                await dodo(400);
-                et.fait = 0; et.total = urls.size; et.touch = Date.now(); // progression visible pendant la découverte
-              }
-            }
-            urls = [...urls];
-            et.total = urls.length; et.phase = 'fiches';
-            if (!urls.length) { et.actif = false; et.phase = 'aucune URL trouvée'; return; }
-            // 2. Fiches déjà en base (reprise)
-            let deja = new Set();
-            if (!force && pool) {
-              const q2 = await pool.query('SELECT slug FROM magasins_u').catch(() => ({ rows: [] }));
-              deja = new Set(q2.rows.map(r2 => r2.slug));
-            }
-            for (const u of urls) {
-              const slug = u.split('/magasin/')[1];
+            if (!data || !data.elements) { et.phase = 'Overpass indisponible — réessaie dans quelques minutes'; et.actif = false; return; }
+            const els = data.elements.filter(el => el.tags && (el.tags['addr:postcode'] || el.tags['addr:city']));
+            et.total = els.length; et.phase = 'enregistrement';
+            const nrm = v => String(v || '').trim();
+            for (const el of els) {
               et.fait++; et.touch = Date.now();
-              if (deja.has(slug)) { et.ok++; continue; }
               try {
-                const html = await fetch(u, { headers: { 'User-Agent': 'Mozilla/5.0 (annuaire interne SAV)' } }).then(r2 => r2.text());
-                let nom = '', ens = '', adr = '', cp = '', ville = '', tel = '';
-                // JSON-LD schema.org d'abord
-                for (const m of html.match(/<script[^>]*ld\+json[^>]*>([\s\S]*?)<\/script>/gi) || []) {
-                  try {
-                    const j = JSON.parse(m.replace(/<script[^>]*>|<\/script>/gi, ''));
-                    const objs = Array.isArray(j) ? j : (j['@graph'] || [j]);
-                    for (const o of objs) {
-                      if (o && o.address && (o.name || o.legalName)) {
-                        nom = o.name || o.legalName;
-                        adr = (o.address.streetAddress || '').trim();
-                        cp = (o.address.postalCode || '').trim();
-                        ville = (o.address.addressLocality || '').trim();
-                        tel = (o.telephone || '').trim();
-                      }
-                    }
-                  } catch(e2) {}
+                const t = el.tags;
+                const brandOuNom = nrm(t.brand) || nrm(t.name);
+                const em = brandOuNom.toLowerCase();
+                const ens = em.includes('hyper') ? 'Hyper U' : em.includes('express') ? 'U Express' : em.includes('utile') ? 'Utile' : em.includes('marché') || em.includes('marche') ? 'Marché U' : 'Super U';
+                const ville = nrm(t['addr:city']);
+                // Nom : la précision locale si dispo (branch, ou name différent de l'enseigne), sinon la ville
+                let nom = nrm(t.branch);
+                if (!nom) {
+                  const n2 = nrm(t.name).replace(new RegExp('^' + ens.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'), '').trim();
+                  nom = n2 && n2.toLowerCase() !== ens.toLowerCase() ? n2 : '';
                 }
-                // Fallback : title + motifs texte
-                if (!nom) { const mt = html.match(/<title>([^<|]+)/); if (mt) nom = mt[1].trim(); }
-                if (!cp) { const ma = html.match(/(\d{5})\s+([A-ZÉÈÀÂÎÔÛ][A-ZÉÈÀÂÎÔÛ '\-]{2,40})</); if (ma) { cp = ma[1]; ville = ma[2].trim(); } }
-                if (!tel) { const mt2 = html.match(/0\d(?:[ .]\d\d){4}/); if (mt2) tel = mt2[0]; }
-                const em = (nom + ' ' + slug).toLowerCase();
-                ens = em.includes('hyper') ? 'Hyper U' : em.includes('express') ? 'U Express' : em.includes('utile') ? 'Utile' : 'Super U';
-                nom = nom.replace(/^(Hyper U|Super U|U Express|Utile)\s*/i, '').trim();
-                if (pool && (nom || ville)) {
+                if (!nom) nom = ville.toUpperCase();
+                const adresse = [nrm(t['addr:housenumber']), nrm(t['addr:street'])].filter(Boolean).join(' ');
+                const cp = nrm(t['addr:postcode']);
+                const tel = nrm(t.phone) || nrm(t['contact:phone']);
+                const slug = 'osm-' + el.type + '-' + el.id;
+                if (pool && (ville || cp)) {
                   await pool.query(`INSERT INTO magasins_u (slug, enseigne, nom, adresse, cp, ville, dept, tel, url, maj)
                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now())
                     ON CONFLICT (slug) DO UPDATE SET enseigne=$2, nom=$3, adresse=$4, cp=$5, ville=$6, dept=$7, tel=$8, url=$9, maj=now()`,
-                    [slug, ens, nom, adr, cp, ville, cp.slice(0, 2), tel, u]);
+                    [slug, ens, nom, adresse, cp, ville, cp.slice(0, 2), tel, 'https://www.openstreetmap.org/' + el.type + '/' + el.id]);
                   et.ok++;
                 } else et.erreurs++;
               } catch(e3) { et.erreurs++; }
-              await dodo(700); // crawl doux
             }
             et.phase = 'terminé'; et.actif = false;
-            console.log('Crawl magasins U terminé :', et.ok, 'ok /', et.erreurs, 'erreurs');
+            console.log('Import magasins U terminé :', et.ok, 'ok /', et.erreurs, 'ignorés');
           } catch(e) { et.phase = 'erreur : ' + e.message; et.actif = false; }
         })();
         res.writeHead(200, { 'Content-Type': 'application/json' });
