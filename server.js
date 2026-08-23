@@ -436,7 +436,7 @@ const server = http.createServer(async function(req, res) {
       return;
     }
     let payload;
-    try { payload = JSON.parse(body); }
+    try { payload = JSON.parse(body || '{}'); } // GET sans corps → objet vide, pas un 400
     catch(e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid JSON' })); return; }
 
     try {
@@ -686,11 +686,16 @@ const server = http.createServer(async function(req, res) {
           slug TEXT PRIMARY KEY, enseigne TEXT, nom TEXT, adresse TEXT, cp TEXT,
           ville TEXT, dept TEXT, tel TEXT, url TEXT, maj TIMESTAMPTZ DEFAULT now())`).catch(() => {});
         if (global._muCrawl && global._muCrawl.actif) {
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true, deja: true, etat: global._muCrawl })); return;
+          const fige = !global._muCrawl.touch || (Date.now() - global._muCrawl.touch) > 3 * 60 * 1000;
+          if (!fige) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, deja: true, etat: global._muCrawl })); return;
+          }
+          console.log('Crawl magasins U figé — relance autorisée');
         }
         const force = req.url.includes('force=1');
-        global._muCrawl = { actif: true, phase: 'sitemap', total: 0, fait: 0, ok: 0, erreurs: 0, demarre: new Date().toISOString() };
+        global._muCrawl = { actif: true, phase: 'sitemap', total: 0, fait: 0, ok: 0, erreurs: 0, touch: Date.now(), demarre: new Date().toISOString() };
+        console.log('Crawl magasins U : démarrage');
         (async () => {
           const et = global._muCrawl;
           const dodo = ms => new Promise(r2 => setTimeout(r2, ms));
@@ -739,7 +744,7 @@ const server = http.createServer(async function(req, res) {
                 const niveau2 = await lirePage(niveau1[i]);
                 for (let j = 0; j < niveau2.length && j < 30; j++) await lirePage(niveau2[j]);
                 await dodo(400);
-                et.fait = 0; et.total = urls.size; // progression visible pendant la découverte
+                et.fait = 0; et.total = urls.size; et.touch = Date.now(); // progression visible pendant la découverte
               }
             }
             urls = [...urls];
@@ -753,7 +758,7 @@ const server = http.createServer(async function(req, res) {
             }
             for (const u of urls) {
               const slug = u.split('/magasin/')[1];
-              et.fait++;
+              et.fait++; et.touch = Date.now();
               if (deja.has(slug)) { et.ok++; continue; }
               try {
                 const html = await fetch(u, { headers: { 'User-Agent': 'Mozilla/5.0 (annuaire interne SAV)' } }).then(r2 => r2.text());
@@ -792,6 +797,7 @@ const server = http.createServer(async function(req, res) {
               await dodo(700); // crawl doux
             }
             et.phase = 'terminé'; et.actif = false;
+            console.log('Crawl magasins U terminé :', et.ok, 'ok /', et.erreurs, 'erreurs');
           } catch(e) { et.phase = 'erreur : ' + e.message; et.actif = false; }
         })();
         res.writeHead(200, { 'Content-Type': 'application/json' });
