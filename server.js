@@ -411,7 +411,7 @@ const server = http.createServer(async function(req, res) {
   // Exception lecture navigateur : le diagnostic du référentiel ITS
   // accepte la clé en paramètre d'URL (?key=…)
   const urlKey = (req.url.match(/[?&]key=([^&]+)/) || [])[1];
-  if (req.url.startsWith('/ref-its-structure') && urlKey === APP_SECRET) {
+  if ((req.url.startsWith('/ref-its-structure') || req.url.startsWith('/magasins-u-crawl') || req.url.startsWith('/magasins-u-status')) && urlKey === APP_SECRET) {
     // accès autorisé
   } else if (req.headers['x-app-secret'] !== APP_SECRET) {
     res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
@@ -677,6 +677,122 @@ const server = http.createServer(async function(req, res) {
           qty: data.qty ?? null,                  // pour produits sans pièces
           note: data.note || ''
         }));
+        return;
+      }
+
+      // ── ANNUAIRE MAGASINS U (crawl magasins-u.com pour saisie transporteur) ──
+      if (req.url.startsWith('/magasins-u-crawl')) {
+        if (pool) await pool.query(`CREATE TABLE IF NOT EXISTS magasins_u (
+          slug TEXT PRIMARY KEY, enseigne TEXT, nom TEXT, adresse TEXT, cp TEXT,
+          ville TEXT, dept TEXT, tel TEXT, url TEXT, maj TIMESTAMPTZ DEFAULT now())`).catch(() => {});
+        if (global._muCrawl && global._muCrawl.actif) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, deja: true, etat: global._muCrawl })); return;
+        }
+        const force = req.url.includes('force=1');
+        global._muCrawl = { actif: true, phase: 'sitemap', total: 0, fait: 0, ok: 0, erreurs: 0, demarre: new Date().toISOString() };
+        (async () => {
+          const et = global._muCrawl;
+          const dodo = ms => new Promise(r2 => setTimeout(r2, ms));
+          try {
+            // 1. URLs des fiches via les sitemaps
+            let urls = new Set();
+            const lireSitemap = async u => {
+              try {
+                const t = await fetch(u, { headers: { 'User-Agent': 'Mozilla/5.0 (annuaire interne SAV)' } }).then(r2 => r2.text());
+                (t.match(/<loc>([^<]+)<\/loc>/g) || []).forEach(m => {
+                  const loc = m.replace(/<\/?loc>/g, '').trim();
+                  if (/\/magasin\/[a-z0-9-]+\/?$/i.test(loc)) urls.add(loc.replace(/\/$/, ''));
+                  else if (/sitemap[^<]*\.xml/i.test(loc) && urls.size < 20000) sousSitemaps.push(loc);
+                });
+              } catch(e) {}
+            };
+            const sousSitemaps = [];
+            for (const u of ['https://www.magasins-u.com/sitemap.xml', 'https://www.magasins-u.com/sitemap_index.xml']) await lireSitemap(u);
+            if (!urls.size) {
+              try {
+                const rb = await fetch('https://www.magasins-u.com/robots.txt').then(r2 => r2.text());
+                for (const m of rb.match(/Sitemap:\s*(\S+)/gi) || []) sousSitemaps.push(m.replace(/Sitemap:\s*/i, ''));
+              } catch(e) {}
+            }
+            for (let i = 0; i < sousSitemaps.length && i < 40; i++) await lireSitemap(sousSitemaps[i]);
+            urls = [...urls];
+            et.total = urls.length; et.phase = 'fiches';
+            if (!urls.length) { et.actif = false; et.phase = 'aucune URL trouvée'; return; }
+            // 2. Fiches déjà en base (reprise)
+            let deja = new Set();
+            if (!force && pool) {
+              const q2 = await pool.query('SELECT slug FROM magasins_u').catch(() => ({ rows: [] }));
+              deja = new Set(q2.rows.map(r2 => r2.slug));
+            }
+            for (const u of urls) {
+              const slug = u.split('/magasin/')[1];
+              et.fait++;
+              if (deja.has(slug)) { et.ok++; continue; }
+              try {
+                const html = await fetch(u, { headers: { 'User-Agent': 'Mozilla/5.0 (annuaire interne SAV)' } }).then(r2 => r2.text());
+                let nom = '', ens = '', adr = '', cp = '', ville = '', tel = '';
+                // JSON-LD schema.org d'abord
+                for (const m of html.match(/<script[^>]*ld\+json[^>]*>([\s\S]*?)<\/script>/gi) || []) {
+                  try {
+                    const j = JSON.parse(m.replace(/<script[^>]*>|<\/script>/gi, ''));
+                    const objs = Array.isArray(j) ? j : (j['@graph'] || [j]);
+                    for (const o of objs) {
+                      if (o && o.address && (o.name || o.legalName)) {
+                        nom = o.name || o.legalName;
+                        adr = (o.address.streetAddress || '').trim();
+                        cp = (o.address.postalCode || '').trim();
+                        ville = (o.address.addressLocality || '').trim();
+                        tel = (o.telephone || '').trim();
+                      }
+                    }
+                  } catch(e2) {}
+                }
+                // Fallback : title + motifs texte
+                if (!nom) { const mt = html.match(/<title>([^<|]+)/); if (mt) nom = mt[1].trim(); }
+                if (!cp) { const ma = html.match(/(\d{5})\s+([A-ZÉÈÀÂÎÔÛ][A-ZÉÈÀÂÎÔÛ '\-]{2,40})</); if (ma) { cp = ma[1]; ville = ma[2].trim(); } }
+                if (!tel) { const mt2 = html.match(/0\d(?:[ .]\d\d){4}/); if (mt2) tel = mt2[0]; }
+                const em = (nom + ' ' + slug).toLowerCase();
+                ens = em.includes('hyper') ? 'Hyper U' : em.includes('express') ? 'U Express' : em.includes('utile') ? 'Utile' : 'Super U';
+                nom = nom.replace(/^(Hyper U|Super U|U Express|Utile)\s*/i, '').trim();
+                if (pool && (nom || ville)) {
+                  await pool.query(`INSERT INTO magasins_u (slug, enseigne, nom, adresse, cp, ville, dept, tel, url, maj)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now())
+                    ON CONFLICT (slug) DO UPDATE SET enseigne=$2, nom=$3, adresse=$4, cp=$5, ville=$6, dept=$7, tel=$8, url=$9, maj=now()`,
+                    [slug, ens, nom, adr, cp, ville, cp.slice(0, 2), tel, u]);
+                  et.ok++;
+                } else et.erreurs++;
+              } catch(e3) { et.erreurs++; }
+              await dodo(700); // crawl doux
+            }
+            et.phase = 'terminé'; et.actif = false;
+          } catch(e) { et.phase = 'erreur : ' + e.message; et.actif = false; }
+        })();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, lance: true }));
+        return;
+      }
+
+      if (req.url.startsWith('/magasins-u-status')) {
+        let nb = 0;
+        if (pool) { const q2 = await pool.query('SELECT COUNT(*) FROM magasins_u').catch(() => null); if (q2) nb = parseInt(q2.rows[0].count); }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ enBase: nb, crawl: global._muCrawl || null }));
+        return;
+      }
+
+      if (req.url === '/magasins-u-recherche') {
+        const q2 = (payload.q || '').trim();
+        if (!pool || q2.length < 2) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ magasins: [] })); return; }
+        const like = '%' + q2.toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '') + '%';
+        const r2 = await pool.query(
+          `SELECT * FROM magasins_u WHERE
+             translate(UPPER(nom), 'ÉÈÊÀÂÎÔÛÇ', 'EEEAAIOUC') LIKE $1 OR
+             translate(UPPER(ville), 'ÉÈÊÀÂÎÔÛÇ', 'EEEAAIOUC') LIKE $1 OR
+             cp LIKE $2 OR UPPER(enseigne) LIKE $1
+           ORDER BY ville, nom LIMIT 50`, [like, q2 + '%']);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ magasins: r2.rows }));
         return;
       }
 
