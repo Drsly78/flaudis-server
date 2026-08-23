@@ -716,6 +716,32 @@ const server = http.createServer(async function(req, res) {
               } catch(e) {}
             }
             for (let i = 0; i < sousSitemaps.length && i < 40; i++) await lireSitemap(sousSitemaps[i]);
+            // Fallback : l'annuaire officiel par département
+            if (urls.size < 100) {
+              et.phase = 'annuaire';
+              const vus = new Set();
+              const lirePage = async u => {
+                try {
+                  const t = await fetch(u, { headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36' } }).then(r2 => r2.text());
+                  for (const m of t.match(/href="(\/magasin\/[a-z0-9-]+)"/gi) || [])
+                    urls.add('https://www.magasins-u.com' + m.replace(/href="|"/g, ''));
+                  const sous = [];
+                  for (const m of t.match(/href="([^"#?]*annuaire-magasin[^"#?]*)"/gi) || []) {
+                    let l = m.replace(/href="|"/g, '');
+                    if (l.startsWith('/')) l = 'https://www.magasins-u.com' + l;
+                    if (l.includes('magasins-u.com') && !vus.has(l)) { vus.add(l); sous.push(l); }
+                  }
+                  return sous;
+                } catch(e) { return []; }
+              };
+              const niveau1 = await lirePage('https://www.magasins-u.com/annuaire-magasin');
+              for (let i = 0; i < niveau1.length && i < 150; i++) {
+                const niveau2 = await lirePage(niveau1[i]);
+                for (let j = 0; j < niveau2.length && j < 30; j++) await lirePage(niveau2[j]);
+                await dodo(400);
+                et.fait = 0; et.total = urls.size; // progression visible pendant la découverte
+              }
+            }
             urls = [...urls];
             et.total = urls.length; et.phase = 'fiches';
             if (!urls.length) { et.actif = false; et.phase = 'aucune URL trouvée'; return; }
