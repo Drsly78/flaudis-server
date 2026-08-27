@@ -799,9 +799,15 @@ out center tags;`;
 
       if (req.url === '/wisen-ecrire') {
         // Feuille Wisen : n° d'avoir en col K pour tous les CNB (col I) fournis
-        const usvs = (Array.isArray(payload.usvs) ? payload.usvs : []).map(u => String(u).toUpperCase().trim()).filter(Boolean);
-        const numero = String(payload.numero || '').trim();
-        if (!usvs.length || !numero) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'usvs et numero requis' })); return; }
+        // Deux modes : {usvs, numero} (FOB, numéro unique) ou {paires:[{usv, numero}]} (DDP, un numéro par ligne)
+        let paires = [];
+        if (Array.isArray(payload.paires) && payload.paires.length) {
+          paires = payload.paires.map(p => ({ usv: String(p.usv || '').toUpperCase().trim(), numero: String(p.numero || '').trim() })).filter(p => p.usv && p.numero);
+        } else {
+          const numero = String(payload.numero || '').trim();
+          paires = (Array.isArray(payload.usvs) ? payload.usvs : []).map(u => ({ usv: String(u).toUpperCase().trim(), numero })).filter(p => p.usv && p.numero);
+        }
+        if (!paires.length) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'usvs+numero ou paires requis' })); return; }
         const token = await getSheetsToken();
         const q = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'REMBOURSEMENT SU'!A:M")}`,
           { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
@@ -814,13 +820,13 @@ out center tags;`;
         }
         const data = [], conflits = [], introuvables = [];
         let ecrits = 0, deja = 0;
-        for (const usv of usvs) {
-          const hits = index[usv];
-          if (!hits || !hits.length) { introuvables.push(usv); continue; }
+        for (const p of paires) {
+          const hits = index[p.usv];
+          if (!hits || !hits.length) { introuvables.push(p.usv); continue; }
           for (const h of hits) {
-            if (!h.k) { data.push({ range: "'REMBOURSEMENT SU'!K" + h.row, values: [[numero]] }); ecrits++; }
-            else if (h.k.toUpperCase() === numero.toUpperCase()) deja++;
-            else conflits.push({ usv, k: h.k });
+            if (!h.k) { data.push({ range: "'REMBOURSEMENT SU'!K" + h.row, values: [[p.numero]] }); ecrits++; }
+            else if (h.k.toUpperCase() === p.numero.toUpperCase()) deja++;
+            else conflits.push({ usv: p.usv, k: h.k });
           }
         }
         if (data.length) {
