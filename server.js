@@ -802,7 +802,7 @@ out center tags;`;
         const usvs = (Array.isArray(payload.usvs) ? payload.usvs : []).map(u => String(u).toUpperCase().trim()).filter(Boolean);
         const numero = String(payload.numero || '').trim();
         if (!usvs.length || !numero) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'usvs et numero requis' })); return; }
-        const token = await getAccessToken();
+        const token = await getSheetsToken();
         const q = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'REMBOURSEMENT SU'!A:M")}`,
           { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
         const rows = q.values || [];
