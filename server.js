@@ -797,6 +797,44 @@ out center tags;`;
         return;
       }
 
+      if (req.url === '/wisen-ecrire') {
+        // Feuille Wisen : n° d'avoir en col K pour tous les CNB (col I) fournis
+        const usvs = (Array.isArray(payload.usvs) ? payload.usvs : []).map(u => String(u).toUpperCase().trim()).filter(Boolean);
+        const numero = String(payload.numero || '').trim();
+        if (!usvs.length || !numero) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'usvs et numero requis' })); return; }
+        const token = await getAccessToken();
+        const q = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'REMBOURSEMENT SU'!A:M")}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const rows = q.values || [];
+        const index = {}; // CNB normalisé → [{row (1-based), k}]
+        for (let i = 1; i < rows.length; i++) {
+          const cnb = (rows[i][8] || '').toString().toUpperCase().trim();
+          if (!cnb) continue;
+          (index[cnb] = index[cnb] || []).push({ row: i + 1, k: (rows[i][10] || '').toString().trim() });
+        }
+        const data = [], conflits = [], introuvables = [];
+        let ecrits = 0, deja = 0;
+        for (const usv of usvs) {
+          const hits = index[usv];
+          if (!hits || !hits.length) { introuvables.push(usv); continue; }
+          for (const h of hits) {
+            if (!h.k) { data.push({ range: "'REMBOURSEMENT SU'!K" + h.row, values: [[numero]] }); ecrits++; }
+            else if (h.k.toUpperCase() === numero.toUpperCase()) deja++;
+            else conflits.push({ usv, k: h.k });
+          }
+        }
+        if (data.length) {
+          await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchUpdate`, {
+            method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ valueInputOption: 'RAW', data })
+          });
+        }
+        console.log('Wisen :', ecrits, 'écrits,', deja, 'déjà,', conflits.length, 'conflits,', introuvables.length, 'introuvables');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, ecrits, deja, conflits, introuvables }));
+        return;
+      }
+
       if (req.url === '/magasins-u-bulk') {
         // Fiches collectées côté navigateur (synchro officielle, passe Cloudflare)
         if (pool) await pool.query(`CREATE TABLE IF NOT EXISTS magasins_u (
