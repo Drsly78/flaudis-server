@@ -1,2419 +1,3224 @@
-// server.js — Flaudis Base Produits
-// Dépôt d'offres usines (xls/xlsx/pptx/msg/pdf) -> extraction -> base -> recherche
-const path = require('path');
-const fs = require('fs');
-const express = require('express');
-const multer = require('multer');
-const { db, DATA_DIR } = require('./lib/db');
-const ex = require('./lib/extract');
-const ia = require('./lib/ai');
-const { proteger } = require('./lib/auth');
+const https  = require('https');
+const http   = require('http');
+const { Pool } = require('pg');
 
-// Auto-réparation : ces migrations idempotentes tournent à chaque démarrage,
-// même si lib/db.js n'est pas à jour sur le déploiement.
-try { db.exec("ALTER TABLE fichiers ADD COLUMN dossier TEXT NOT NULL DEFAULT ''"); } catch {}
-try { db.exec("ALTER TABLE fichiers ADD COLUMN mode TEXT NOT NULL DEFAULT 'offre'"); } catch {}
-try { db.exec("ALTER TABLE produits ADD COLUMN dossier TEXT"); } catch {}
-try { db.exec("ALTER TABLE produits ADD COLUMN extras TEXT"); } catch {}
-try { db.exec("ALTER TABLE produits ADD COLUMN modifie_le TEXT"); } catch {}
-try { db.exec("ALTER TABLE fichiers ADD COLUMN date_document TEXT"); } catch {}
-db.exec(`CREATE TABLE IF NOT EXISTS listes (id INTEGER PRIMARY KEY, nom TEXT NOT NULL, creee_le TEXT DEFAULT (datetime('now','localtime')));
-CREATE TABLE IF NOT EXISTS liste_items (id INTEGER PRIMARY KEY, liste_id INTEGER NOT NULL REFERENCES listes(id) ON DELETE CASCADE,
-  produit_id INTEGER NOT NULL REFERENCES produits(id) ON DELETE CASCADE, ajoute_le TEXT DEFAULT (datetime('now','localtime')), UNIQUE(liste_id, produit_id));
-CREATE TABLE IF NOT EXISTS doublons_valides (reference TEXT PRIMARY KEY, signature TEXT NOT NULL, valide_le TEXT DEFAULT (datetime('now','localtime')));
-CREATE TABLE IF NOT EXISTS dossiers (chemin TEXT PRIMARY KEY, cree_le TEXT DEFAULT (datetime('now','localtime')));
-CREATE TABLE IF NOT EXISTS produit_images (
-  produit_id INTEGER NOT NULL REFERENCES produits(id) ON DELETE CASCADE,
-  image_id INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
-  UNIQUE(produit_id, image_id));`);
-try { db.exec("ALTER TABLE produits ADD COLUMN ean TEXT"); } catch {}
-try { db.exec("ALTER TABLE listes ADD COLUMN systeme INTEGER NOT NULL DEFAULT 0"); } catch {}
-try { db.exec("ALTER TABLE produit_images ADD COLUMN principale INTEGER NOT NULL DEFAULT 0"); } catch {}
-try { db.exec("ALTER TABLE listes ADD COLUMN enregistree INTEGER NOT NULL DEFAULT 0"); } catch {}
-try { db.exec("ALTER TABLE produits ADD COLUMN note TEXT"); } catch {}
-try { db.exec("ALTER TABLE fichiers ADD COLUMN valide INTEGER NOT NULL DEFAULT 1"); } catch {}
-db.exec("UPDATE fichiers SET valide=1 WHERE valide=0 AND mode IN ('interne','document')");
-db.exec("UPDATE fichiers SET statut='en_attente' WHERE statut='en_cours'");
-db.exec(`CREATE TABLE IF NOT EXISTS usines (
-  id INTEGER PRIMARY KEY,
-  nom_norm TEXT UNIQUE NOT NULL,
-  nom_affiche TEXT NOT NULL,
-  port TEXT, adresse TEXT, contact TEXT, telephone TEXT, email TEXT, messagerie TEXT, site TEXT,
-  conditions TEXT, notes TEXT,
-  enrichie_le TEXT, modifie_le TEXT,
-  cree_le TEXT DEFAULT (datetime('now','localtime'))
-)`);
-db.exec(`CREATE TABLE IF NOT EXISTS tableaux (
-  id INTEGER PRIMARY KEY, nom TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'retour_selection',
-  sources TEXT NOT NULL DEFAULT '[]', resultat TEXT, statut TEXT NOT NULL DEFAULT 'vide',
-  cree_le TEXT DEFAULT (datetime('now','localtime')), modifie_le TEXT DEFAULT (datetime('now','localtime')))`);
-fs.mkdirSync(path.join(DATA_DIR, 'tableaux'), { recursive: true });
-try { db.exec("ALTER TABLE tableaux ADD COLUMN journal TEXT NOT NULL DEFAULT '[]'"); } catch {}
-try { db.exec("ALTER TABLE tableaux ADD COLUMN ajustements TEXT NOT NULL DEFAULT '{}'"); } catch {}
-db.exec("INSERT INTO listes (nom, systeme) SELECT 'À trier', 1 WHERE NOT EXISTS (SELECT 1 FROM listes WHERE systeme=1)");
-if (db.pragma('user_version', { simple: true }) < 1) {
-  db.exec("INSERT OR IGNORE INTO produit_images (produit_id, image_id) SELECT produit_id, id FROM images WHERE produit_id IS NOT NULL");
-  db.pragma('user_version = 1');
+const API_KEY         = process.env.ANTHROPIC_API_KEY;
+const APP_SECRET      = process.env.APP_SECRET || 'sav-flaudis-2024';
+const PORT            = process.env.PORT || 3000;
+const GITHUB_NOTICES  = 'https://raw.githubusercontent.com/Drsly78/flaudis-notices/main/notices/';
+const FIREBASE_URL    = process.env.FIREBASE_URL || 'https://flaudis-prod-default-rtdb.europe-west1.firebasedatabase.app';
+const FIREBASE_SECRET = process.env.FIREBASE_SECRET; // optionnel si règles ouvertes
+const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID;
+
+// ── PostgreSQL ────────────────────────────────────────────
+const pool = process.env.DATABASE_URL ? new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+}) : null;
+
+async function initDB() {
+  if (!pool) { console.log('Pas de DATABASE_URL — mode sans DB'); return; }
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS dossiers (
+        id SERIAL PRIMARY KEY,
+        numero_dossier VARCHAR(100) UNIQUE,
+        enseigne VARCHAR(100),
+        departement_ville VARCHAR(100),
+        ref_produit VARCHAR(100),
+        piece VARCHAR(100),
+        decision VARCHAR(50),
+        date_reception VARCHAR(20),
+        date_traitement TIMESTAMP DEFAULT NOW(),
+        notes TEXT
+      )
+    `);
+    // Ajout colonnes tracking et date_envoi si absentes
+    await pool.query(`ALTER TABLE dossiers ADD COLUMN IF NOT EXISTS tracking VARCHAR(200)`);
+    await pool.query(`ALTER TABLE dossiers ADD COLUMN IF NOT EXISTS date_envoi VARCHAR(20)`);
+    // Table compteurs pour numéros d'accord
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS compteurs (
+        cle VARCHAR(50) PRIMARY KEY,
+        valeur INTEGER NOT NULL DEFAULT 0,
+        mois_annee VARCHAR(10)
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS its_dossiers (
+        id SERIAL PRIMARY KEY,
+        date_reception TEXT,
+        reference TEXT,
+        pannes TEXT,
+        magasin TEXT,
+        decision TEXT,
+        accord TEXT,
+        tracking TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`ALTER TABLE its_dossiers ADD COLUMN IF NOT EXISTS tracking TEXT`).catch(() => {});
+    await pool.query(`ALTER TABLE its_dossiers ADD COLUMN IF NOT EXISTS date_expe TEXT`).catch(() => {});
+    await pool.query(`ALTER TABLE its_dossiers ADD COLUMN IF NOT EXISTS quantite TEXT`).catch(() => {});
+    await pool.query(`ALTER TABLE dossiers ADD COLUMN IF NOT EXISTS date_envoi TEXT`).catch(() => {});
+    await pool.query(`ALTER TABLE dossiers ADD COLUMN IF NOT EXISTS revers_url TEXT`).catch(() => {});
+    await pool.query(`ALTER TABLE dossiers ADD COLUMN IF NOT EXISTS fla TEXT`).catch(() => {});
+    await pool.query(`ALTER TABLE dossiers ADD COLUMN IF NOT EXISTS accord TEXT`).catch(() => {});
+    await pool.query(`ALTER TABLE dossiers ADD COLUMN IF NOT EXISTS wisen TEXT`).catch(() => {});
+    // Migration : dates d'envoi estropiées 'AA-MM-JJ' → 'AAAA-MM-JJ'
+    await pool.query(`UPDATE dossiers SET date_envoi = '20' || date_envoi
+      WHERE date_envoi ~ '^[0-9]{2}-[0-9]{2}-[0-9]{2}$'`).catch(() => {});
+    // Migration : récupérer les FLA déjà présents dans les notes
+    await pool.query(`UPDATE dossiers SET fla = SUBSTRING(notes FROM 'FLA:([^ ]+)')
+      WHERE COALESCE(fla,'') = '' AND notes LIKE 'FLA:%' AND notes <> 'FLA:'`).catch(() => {});
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS villes_ref (
+        norm TEXT PRIMARY KEY,
+        format TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS reponses_types (
+        id SERIAL PRIMARY KEY,
+        cat TEXT NOT NULL,
+        label TEXT NOT NULL,
+        msg TEXT NOT NULL
+      )
+    `);
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS its_dossiers_uni ON its_dossiers (date_reception, reference, magasin)`);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS notices_override (
+        ref TEXT PRIMARY KEY,
+        notice_file TEXT NOT NULL,
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS produits_kb (
+        ref TEXT PRIMARY KEY,
+        notice_file TEXT,
+        transcription TEXT,
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    // Lever la limite VARCHAR(100) héritée de la création initiale :
+    // les désignations de pièces / villes longues du Sheet la dépassent.
+    for (const col of ['numero_dossier', 'enseigne', 'departement_ville', 'ref_produit', 'piece', 'decision', 'notes']) {
+      await pool.query('ALTER TABLE dossiers ALTER COLUMN ' + col + ' TYPE TEXT').catch(() => {});
+    }
+    console.log('Table dossiers OK');
+  } catch(e) { console.error('DB init error:', e.message); }
 }
-db.exec("UPDATE fichiers SET mode='document' WHERE type NOT IN ('xls','xlsx') AND mode != 'document'");
-fs.mkdirSync(path.join(DATA_DIR, 'apercus'), { recursive: true });
 
-process.on('unhandledRejection', (e) => console.error('[filet] promesse rejetée :', e && e.message || e));
-const app = express();
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 80 * 1024 * 1024 } });
-// page publique (exigée par Google pour la publication OAuth) — placée AVANT le mot de passe
-app.get('/confidentialite', (req, res) => {
-  res.type('html').send(`<!doctype html><html lang="fr"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Règles de confidentialité — Flaudis Base Produits</title>
-<body style="font-family:system-ui,sans-serif;max-width:720px;margin:40px auto;padding:0 20px;line-height:1.6;color:#1c2742">
-<h1>Règles de confidentialité</h1>
-<p><b>Flaudis Base Produits</b> est un outil interne de gestion de base produits utilisé par Flaudis.</p>
-<h2>Données traitées</h2>
-<p>L'application traite des fichiers d'offres fournisseurs (tableurs, présentations, documents) déposés par ses utilisateurs autorisés,
-ainsi que les fiches produits qui en sont extraites. Ces données sont stockées sur l'infrastructure d'hébergement de l'application et
-ne sont ni vendues, ni partagées avec des tiers.</p>
-<h2>Accès Google Drive</h2>
-<p>Lorsque l'utilisateur connecte son compte Google, l'application demande uniquement le droit d'accéder aux fichiers
-qu'elle crée elle-même (portée <code>drive.file</code>). Elle crée des feuilles de calcul temporaires dans un dossier dédié
-(« Flaudis — temporaire ») du Drive de l'utilisateur, à des fins d'aperçu et d'édition, puis les supprime automatiquement.
-L'application n'accède à aucun autre fichier du Drive de l'utilisateur.</p>
-<h2>Cookies et suivi</h2>
-<p>L'application n'utilise aucun outil publicitaire ni traceur tiers.</p>
-<h2>Contact</h2>
-<p>Pour toute question relative à ces règles, contactez l'administrateur de l'application.</p>
-</body></html>`);
-});
-proteger(app, express);   // mot de passe si MOT_DE_PASSE est défini
-app.use(express.json());
-const VERSION = '0.45.1';
-app.get('/api/version', (req, res) => res.json({ version: VERSION }));
-// l'interface ne doit jamais être servie depuis un cache périmé
-app.get(['/', '/index.html'], (req, res) => {
-  res.set('Cache-Control', 'no-cache, must-revalidate');
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-app.use(express.static(path.join(__dirname, 'public')));
+// ── Google Sheets Auth ────────────────────────────────────
+let _sheetsToken = null;
+let _sheetsTokenExpiry = 0;
 
-// ---------- INGESTION ----------
-app.post('/api/depot', upload.array('fichiers', 40), async (req, res) => {
-  // dossier de rangement : "2027/GARDEN/VERTAK" — nettoyé, créé implicitement
-  const dossier = String(req.body.dossier || '')
-    .replace(/\\/g, '/').split('/').map(s => s.trim()).filter(Boolean)
-    .map(s => s.replace(/[^\w\s.\-()&+]/g, '')).join('/').slice(0, 200);
-  const mode = ['interne', 'offre', 'auto'].includes(req.body.mode) ? req.body.mode : 'auto';
-  const rapports = [];
-  const fichiersRecus = req.files || [];
-  let datesClient = [];
-  try { datesClient = JSON.parse(req.body.dates_modif || '[]'); } catch {}
-  // enregistrement immédiat (hash, copie disque, ligne en base) — l'analyse lourde part en file d'attente
-  for (let i = 0; i < fichiersRecus.length; i++) {
-    const f = fichiersRecus[i];
-    rapports.push(ingererFichier(f.originalname, f.buffer, dossier, mode, datesClient[i]));
+async function getSheetsToken() {
+  if (_sheetsToken && Date.now() < _sheetsTokenExpiry - 60000) return _sheetsToken;
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT;
+  if (!raw) throw new Error('GOOGLE_SERVICE_ACCOUNT manquant');
+  const sa = JSON.parse(raw);
+  const now = Math.floor(Date.now() / 1000);
+  const header = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString('base64url');
+  const claim = Buffer.from(JSON.stringify({
+    iss: sa.client_email,
+    scope: 'https://www.googleapis.com/auth/spreadsheets',
+    aud: 'https://oauth2.googleapis.com/token',
+    exp: now + 3600,
+    iat: now
+  })).toString('base64url');
+  const { createSign } = require('crypto');
+  const sign = createSign('RSA-SHA256');
+  sign.update(header + '.' + claim);
+  const sig = sign.sign(sa.private_key, 'base64url');
+  const jwt = header + '.' + claim + '.' + sig;
+  const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`
+  });
+  const tokenData = await tokenRes.json();
+  _sheetsToken = tokenData.access_token;
+  _sheetsTokenExpiry = Date.now() + 3500000;
+  return _sheetsToken;
+}
+
+// ── Firebase REST ─────────────────────────────────────────
+async function firebaseGet(path) {
+  const url = FIREBASE_URL + '/' + path + '.json' +
+    (FIREBASE_SECRET ? '?auth=' + FIREBASE_SECRET : '');
+  const r = await fetch(url);
+  if (!r.ok) return null;
+  return r.json();
+}
+
+function getKey(ref) {
+  return ref.replace(/[.#$\/\[\]]/g, '_');
+}
+
+// ── Helpers ───────────────────────────────────────────────
+function corsHeaders(res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-App-Secret');
+}
+
+function downloadBuffer(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, res => {
+      if (res.statusCode === 404) { resolve(null); return; }
+      if (res.statusCode !== 200) { reject(new Error('HTTP ' + res.statusCode)); return; }
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+    }).on('error', reject);
+  });
+}
+
+// ── INDEX DES NOTICES (GitHub) avec matching flou ──────────
+// Les refs du fichier EAN ne correspondent pas toujours exactement aux noms
+// de fichiers (ex: ref "BLAINVILLE 3X4 A/B" → fichier "BLAINVILLE 3X4 AB.pdf",
+// un "/" étant impossible dans un nom de fichier).
+let noticeIndex = { files: null, ts: 0 };
+
+function fetchGithubJSON(url) {
+  return new Promise((resolve) => {
+    https.get(url, { headers: { 'User-Agent': 'flaudis-server', 'Accept': 'application/vnd.github+json' } }, res => {
+      if (res.statusCode !== 200) { resolve(null); return; }
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => { try { resolve(JSON.parse(Buffer.concat(chunks).toString())); } catch(e) { resolve(null); } });
+    }).on('error', () => resolve(null));
+  });
+}
+
+// Normalisation : majuscules, suppression de .pdf et de tout caractère non alphanumérique
+const normRef = s => String(s || '').toUpperCase().replace(/\.PDF$/i, '').replace(/[^A-Z0-9]/g, '');
+const COLOR_WORDS = /\b(BLEU|GRIS|ROSE|ROUGE|VERT|KAKI|BLANC|NOIR|BEIGE|TAUPE|TERRACOTTA|MULTICOLORE?|WARM|WHITE|COLD|ANTHRACITE|CHENE|NATUREL|MARRON|JAUNE|ORANGE|VIOLET|TURQUOISE)\b/gi;
+const yearOf = f => { const m = String(f).match(/(20\d\d)/); return m ? parseInt(m[1]) : 0; };
+
+// Cœur du matching sur une chaîne normalisée — 4 niveaux
+function coreNoticeMatch(files, rn) {
+  if (!rn || rn.length < 3) return null;
+  // 1. Égalité normalisée
+  let m = files.filter(f => normRef(f) === rn);
+  if (m.length) return { file: m.sort((a,b) => yearOf(b)-yearOf(a))[0], score: 99 };
+  // 2. Préfixe normalisé bidirectionnel
+  m = files.filter(f => { const fn = normRef(f); return fn.startsWith(rn) || rn.startsWith(fn); });
+  if (m.length) return { file: m.sort((a,b) => (normRef(b).length - normRef(a).length) || (yearOf(b)-yearOf(a)))[0], score: 98 };
+  // 3. Ref contenue dans le nom (fichiers multi-références)
+  if (rn.length >= 6) {
+    m = files.filter(f => normRef(f).includes(rn));
+    if (m.length) return { file: m.sort((a,b) => (normRef(a).length - normRef(b).length) || (yearOf(b)-yearOf(a)))[0], score: 97 };
   }
-  res.json({ rapports });
-  setTimeout(pomperFile, 400); // laisse la réponse partir avant d'attaquer l'analyse (lectures Excel bloquantes)
-});
-
-/** Document interne détecté : refusé — la base ne conserve que des offres usines. */
-function refuserInterne(fichierId, rapport, nomDisque, motif) {
-  rapport.statut = 'refuse';
-  rapport.produits = 0; rapport.images = 0;
-  rapport.infos.push(`Document interne Flaudis détecté${motif ? ' (' + motif + ')' : ''} — fichier NON conservé : la base est réservée aux offres usines.`);
-  try { if (nomDisque) fs.unlinkSync(path.join(DATA_DIR, 'fichiers', nomDisque)); } catch {}
-  db.prepare("UPDATE fichiers SET statut='refuse', rapport=? WHERE id=?").run(JSON.stringify(rapport), fichierId);
-  return rapport;
-}
-
-/** Filet déterministe de contenu : les gencodes Flaudis n'existent que dans nos documents internes */
-function filetInterne(texteBrut) {
-  const eans = (texteBrut.match(/3700442\d{6}/g) || []).length;
-  if (eans >= 2) return `le contenu comporte ${eans} gencodes Flaudis (3700442…), que les offres usines n'ont jamais`;
+  // 4. Plus long préfixe commun (gère suffixes divergents : A/B, _8, années…)
+  let best = null, bs = 0;
+  for (const f of files) {
+    const fn = normRef(f).replace(/20\d\d$/, '');
+    let i = 0;
+    while (i < rn.length && i < fn.length && rn[i] === fn[i]) i++;
+    if (i > bs || (i === bs && best && yearOf(f) > yearOf(best))) { best = f; bs = i; }
+  }
+  if (best) {
+    const fn = normRef(best).replace(/20\d\d$/, '');
+    if (bs >= 6 && bs >= 0.65 * Math.min(rn.length, fn.length)) return { file: best, score: bs };
+  }
   return null;
 }
 
-function ingererFichier(nom, buffer, dossier = '', mode = 'auto', dateClient) {
-  // fichiers système (caches Windows/Mac, temporaires Office) : écartés d'office, non stockés
-  const nomBas = nom.toLowerCase().replace(/^_+/, '');
-  if (['thumbs.db', 'desktop.ini', '.ds_store', 'ehthumbs.db'].includes(nomBas) || /^~\$/.test(nom)) {
-    return { fichier: nom, produits: 0, images: 0, statut: 'ignore', rejets: [], avertissements: [],
-      infos: ['Fichier système (cache de vignettes Windows / temporaire) — écarté automatiquement, non conservé.'] };
+// Candidats de recherche pour une ref : complète, segments "/", sans couleurs
+function refCandidates(ref) {
+  const raw = String(ref || '').trim();
+  const candidates = [raw];
+  if (raw.includes('/')) raw.split('/').forEach(s => { s = s.trim(); if (s) candidates.push(s); });
+  const sansCouleur = raw.replace(COLOR_WORDS, '').replace(/[\s\-_,]+$/, '').trim();
+  if (sansCouleur && sansCouleur !== raw) candidates.push(sansCouleur);
+  return candidates;
+}
+
+// Meilleur match d'une ref parmi une liste de noms (notices ou clés Firebase)
+function findBestMatch(names, ref) {
+  let best = null;
+  for (const c of refCandidates(ref)) {
+    const r = coreNoticeMatch(names, normRef(c));
+    if (r && (!best || r.score > best.score)) best = r;
+    if (best && best.score === 99) break;
   }
-  const rapport = { fichier: nom, produits: 0, images: 0, infos: [], avertissements: [], rejets: [], statut: 'ok' };
+  return best ? best.file : null;
+}
+
+async function findNoticeFile(ref) {
+  // Index rafraîchi toutes les 10 minutes
+  if (!noticeIndex.files || Date.now() - noticeIndex.ts > 10 * 60 * 1000) {
+    const list = await fetchGithubJSON('https://api.github.com/repos/Drsly78/flaudis-notices/contents/notices');
+    if (Array.isArray(list)) {
+      noticeIndex = { files: list.filter(f => /\.pdf$/i.test(f.name)).map(f => f.name), ts: Date.now() };
+      console.log('Index notices rafraîchi:', noticeIndex.files.length, 'fichiers');
+    }
+  }
+  const files = noticeIndex.files || [];
+  if (files.length === 0) return null;
+  return findBestMatch(files, ref);
+}
+
+async function pdfToImages(pdfBuffer, maxPages = 14) {
   try {
-    const hash = ex.md5(buffer);
-    const deja = db.prepare('SELECT id, nom FROM fichiers WHERE hash=?').get(hash);
-    if (deja) {
-      compacterInfosImages(rapport);
-  rapport.statut = 'doublon';
-      rapport.infos.push(`Fichier identique déjà en base sous « ${deja.nom} » — ignoré.`);
-      return rapport;
-    }
-    const type = (nom.split('.').pop() || '').toLowerCase();
-    // 1. copie brute conservée (la preuve source)
-    const nomDisque = `${Date.now()}_${nom.replace(/[^\w.\-]+/g, '_')}`;
-    fs.writeFileSync(path.join(DATA_DIR, 'fichiers', nomDisque), buffer);
-    const modeEffectif = ['xls', 'xlsx'].includes(type) ? mode : 'document';
-    const dateDoc = (['xls', 'xlsx'].includes(type) ? ex.dateDocument(buffer, nom) : ex.dateDocument(Buffer.alloc(0), nom))
-      || (dateClient ? new Date(Number(dateClient)).toISOString().slice(0, 10) : null)
-      || new Date().toISOString().slice(0, 10);
-    const valide = ['xls', 'xlsx', 'pptx', 'msg'].includes(type) ? 0 : 1;
-    const fi = db.prepare('INSERT INTO fichiers (nom, hash, taille, type, rapport, dossier, mode, date_document, valide) VALUES (?,?,?,?,?,?,?,?,?)')
-      .run(nom, hash, buffer.length, type, null, dossier, modeEffectif, dateDoc, valide);
-    rapport.date_document = dateDoc;
-    rapport.mode = modeEffectif;
-    const fichierId = fi.lastInsertRowid;
-    db.prepare('UPDATE fichiers SET rapport=? WHERE id=?').run(JSON.stringify({ disque: nomDisque }), fichierId);
-    rapport.fichierId = fichierId;
-    rapport.statut = 'en_attente';
-    db.prepare("UPDATE fichiers SET statut='en_attente' WHERE id=?").run(fichierId);
-  } catch (e) {
-    rapport.statut = 'erreur';
-    rapport.avertissements.push(String(e.message || e));
-  }
-  return rapport;
-}
-
-// ---------- FILE DE TRAITEMENT (un fichier à la fois : ménage la mémoire et l'IA) ----------
-let analysesEnCours = 0;
-const ANALYSES_MAX = Math.max(1, Number(process.env.FLAUDIS_PARALLELE || 2));
-const goog = require('./lib/google');
-db.exec("CREATE TABLE IF NOT EXISTS parametres (cle TEXT PRIMARY KEY, valeur TEXT)");
-goog.configurer({
-  lire: (cle) => (db.prepare('SELECT valeur FROM parametres WHERE cle=?').get(cle) || {}).valeur || null,
-  ecrire: (cle, valeur) => valeur == null
-    ? db.prepare('DELETE FROM parametres WHERE cle=?').run(cle)
-    : db.prepare('INSERT INTO parametres (cle, valeur) VALUES (?,?) ON CONFLICT(cle) DO UPDATE SET valeur=excluded.valeur').run(cle, valeur),
-});
-db.exec(`CREATE TABLE IF NOT EXISTS sheets_sessions (
-  id INTEGER PRIMARY KEY, genre TEXT NOT NULL, ref_id INTEGER NOT NULL,
-  file_id TEXT NOT NULL, url TEXT NOT NULL,
-  cree_le TEXT DEFAULT (datetime('now','localtime')), expire_le TEXT NOT NULL
-)`);
-try { db.exec("ALTER TABLE sheets_sessions ADD COLUMN extra TEXT"); } catch {}
-try { db.exec("ALTER TABLE produits ADD COLUMN variante_de TEXT"); } catch {}
-try { db.exec("ALTER TABLE produits ADD COLUMN maj_de TEXT"); } catch {}
-try { db.exec("ALTER TABLE tableaux ADD COLUMN finalise INTEGER DEFAULT 0"); } catch {}
-try { db.exec("ALTER TABLE tableaux ADD COLUMN codes_proposes TEXT"); } catch {}
-try { db.exec("ALTER TABLE tableaux ADD COLUMN dossier TEXT"); } catch {}
-try { db.exec("ALTER TABLE tableaux ADD COLUMN genre TEXT DEFAULT 'selection'"); } catch {}
-try { db.exec("ALTER TABLE tableaux ADD COLUMN selection_id INTEGER"); } catch {}
-try { db.exec("ALTER TABLE tableaux ADD COLUMN cartographie TEXT"); } catch {}
-try { db.exec("ALTER TABLE tableaux ADD COLUMN selection_fob_id INTEGER"); } catch {}
-try { db.exec("ALTER TABLE tableaux ADD COLUMN selections_json TEXT"); } catch {}
-async function nettoyerSheets() {
-  if (!goog.dispo()) return;
-  for (const s of db.prepare("SELECT * FROM sheets_sessions WHERE expire_le < datetime('now','localtime')").all()) {
-    try { await goog.supprimer(s.file_id); } catch (e) { console.error('nettoyage Sheet:', e.message); }
-    db.prepare('DELETE FROM sheets_sessions WHERE id=?').run(s.id);
-  }
-}
-setInterval(() => nettoyerSheets().catch(() => {}), 10 * 60 * 1000);
-setTimeout(() => nettoyerSheets().catch(() => {}), 20 * 1000);
-
-const normUsine = x => String(x || '').trim().toUpperCase().replace(/\s+/g, ' ');
-function synchroUsines() {
-  // l'annuaire se construit tout seul depuis les fiches : une entrée par usine, port majoritaire proposé
-  try {
-    const lignes = db.prepare("SELECT fournisseur, port, COUNT(*) n FROM produits WHERE fournisseur IS NOT NULL AND TRIM(fournisseur)<>'' GROUP BY fournisseur, port").all();
-    const parNorm = {};
-    for (const l of lignes) {
-      const k = normUsine(l.fournisseur);
-      if (!k || k === 'FOURNISSEUR ?') continue;
-      (parNorm[k] ||= { variantes: {}, ports: {} });
-      parNorm[k].variantes[l.fournisseur.trim()] = (parNorm[k].variantes[l.fournisseur.trim()] || 0) + l.n;
-      if (l.port) parNorm[k].ports[String(l.port).trim().toUpperCase()] = (parNorm[k].ports[String(l.port).trim().toUpperCase()] || 0) + l.n;
-    }
-    const ins = db.prepare('INSERT INTO usines (nom_norm, nom_affiche, port) VALUES (?,?,?) ON CONFLICT(nom_norm) DO NOTHING');
-    const majPort = db.prepare("UPDATE usines SET port=? WHERE nom_norm=? AND (port IS NULL OR port='')");
-    for (const [k, v] of Object.entries(parNorm)) {
-      const affiche = Object.entries(v.variantes).sort((a, b) => b[1] - a[1])[0][0];
-      const portMaj = (Object.entries(v.ports).sort((a, b) => b[1] - a[1])[0] || [null])[0];
-      ins.run(k, affiche, portMaj);
-      if (portMaj) majPort.run(portMaj, k); // ne touche jamais un port saisi à la main
-    }
-  } catch (e) { console.error('synchroUsines:', e.message); }
-}
-synchroUsines();
-
-async function pomperFile() {
-  while (analysesEnCours < ANALYSES_MAX) {
-    const suivant = db.prepare("SELECT id FROM fichiers WHERE statut='en_attente' ORDER BY id LIMIT 1").get();
-    if (!suivant) return;
-    analysesEnCours++;
-    db.prepare("UPDATE fichiers SET statut='en_cours' WHERE id=?").run(suivant.id);
-    (async () => {
+    const pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
+    const { createCanvas } = require('canvas');
+    const data = new Uint8Array(pdfBuffer);
+    const pdf = await pdfjsLib.getDocument({ data }).promise;
+    const images = [];
+    const pages = Math.min(pdf.numPages, maxPages);
+    for (let i = 1; i <= pages; i++) {
+      let canvas = null;
       try {
-        await traiterFichierEnFile(suivant.id);
-      } catch (e) {
-        const f = db.prepare('SELECT nom, rapport FROM fichiers WHERE id=?').get(suivant.id);
-        let j = {}; try { j = JSON.parse(f?.rapport || '{}'); } catch {}
-        const rap = { fichier: f?.nom || '?', fichierId: suivant.id, produits: 0, images: 0, infos: [],
-          avertissements: [String(e.message || e)], rejets: [], statut: 'erreur', disque: j.disque };
-        db.prepare("UPDATE fichiers SET statut='erreur', rapport=? WHERE id=?").run(JSON.stringify(rap), suivant.id);
+        const page = await pdf.getPage(i);
+        // Résolution adaptative : ~1600px de large max. Net pour lire les
+        // tables de pièces, sans saturer la RAM (scale 2.2 faisait crasher Railway).
+        const base = page.getViewport({ scale: 1 });
+        const scale = 1.5; // résolution d'origine qui fonctionnait
+        const viewport = page.getViewport({ scale });
+        canvas = createCanvas(viewport.width, viewport.height);
+        await Promise.race([
+          page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise,
+          new Promise((_, rej) => setTimeout(() => rej(new Error('render timeout p' + i)), 30000))
+        ]);
+        images.push(canvas.toBuffer('image/jpeg', { quality: 0.8 }).toString('base64'));
+        page.cleanup(); // libère la mémoire interne de la page
+      } catch(pageErr) {
+        console.warn('pdfToImages — page', i, 'ignorée:', pageErr.message);
+      } finally {
+        // Libère explicitement le canvas (gros consommateur RAM) avant la page suivante
+        if (canvas) { canvas.width = 0; canvas.height = 0; canvas = null; }
       }
-      analysesEnCours--;
-      try { synchroUsines(); } catch {}
-      // enrichissement auto (fond) : les usines jamais enrichies liées à ce fichier
-      const fichierTraite = suivant.id;
-      setImmediate(async () => {
-        try {
-          const fours = db.prepare('SELECT DISTINCT fournisseur FROM produits WHERE fichier_id=? AND fournisseur IS NOT NULL').all(fichierTraite);
-          const norms = new Set(fours.map(f => normUsine(f.fournisseur)));
-          for (const u of db.prepare('SELECT id, nom_norm FROM usines WHERE enrichie_le IS NULL').all()) {
-            if (!norms.has(u.nom_norm)) continue;
-            const rep = await fetch(`http://127.0.0.1:${PORT}/api/usines/${u.id}/enrichir`, { method: 'POST' }).catch(() => null);
-            if (!rep || !rep.ok) db.prepare("UPDATE usines SET enrichie_le=datetime('now','localtime') WHERE id=?").run(u.id);
-          }
-        } catch (e) { console.error('auto-enrichissement:', e.message); }
+    }
+    return images;
+  } catch(e) { console.error('pdfToImages error:', e.message); return []; }
+}
+
+const MODEL_MAIN  = process.env.MODEL_MAIN  || 'claude-sonnet-4-6';
+const MODEL_LIGHT = process.env.MODEL_LIGHT || 'claude-haiku-4-5-20251001';
+
+function callAnthropic(payload) {
+  // Règles statiques en "system" avec cache : mêmes instructions à chaque
+  // scan → l'API ne les refacture qu'au dixième du prix après la 1re requête.
+  let systemBlock;
+  if (payload.system_cached) {
+    systemBlock = [{ type: 'text', text: payload.system_cached, cache_control: { type: 'ephemeral' } }];
+    delete payload.system_cached;
+  }
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify({
+      model: payload.model || MODEL_MAIN,
+      ...(systemBlock ? { system: systemBlock } : {}),
+      max_tokens: payload.max_tokens || 2000,
+      ...(payload.system ? { system: payload.system } : {}),
+      messages: payload.messages
+    });
+    const options = {
+      hostname: 'api.anthropic.com',
+      path: '/v1/messages',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': API_KEY,
+        'anthropic-version': '2023-06-01',
+        'Content-Length': Buffer.byteLength(data)
+      },
+      timeout: 120000 // 2 min, sans rester bloqué indéfiniment
+    };
+    const req = https.request(options, res => {
+      let response = '';
+      res.on('data', c => { response += c; });
+      res.on('end', () => {
+        if (res.statusCode !== 200) {
+          return reject(new Error('API Claude HTTP ' + res.statusCode + ' : ' + response.slice(0, 200)));
+        }
+        try { resolve(JSON.parse(stripCircled(response))); }
+        catch(e) { reject(new Error('Réponse API illisible : ' + response.slice(0, 120))); }
       });
-      setImmediate(pomperFile);
-    })();
+    });
+    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout API Claude (2 min)')); });
+    req.on('error', reject);
+    req.write(data);
+    req.end();
+  });
+}
+
+// Magasins Intersport : MAJUSCULES sans accents (Luçon → LUCON), pour
+// matcher la feuille CODE SOCIETAIRE
+function normMagasinIts(v) {
+  return String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().replace(/\s+/g, ' ').trim();
+}
+
+// Clé interne déterministe pour les dossiers traités en direct (sans CNB/FLA)
+// — même ligne = même clé à chaque synchro, donc jamais de doublon.
+function cleDirecte(date, ref, ville, piece) {
+  // Date normalisée en JJMMAA quel que soit le format d'entrée
+  let d = String(date || '').replace(/[^0-9]/g, '');
+  if (d.length === 8 && d.startsWith('20')) d = d.slice(6, 8) + d.slice(4, 6) + d.slice(2, 4); // AAAAMMJJ → JJMMAA
+  else if (d.length === 6) { /* déjà JJMMAA */ }
+  const n = v => String(v || '').toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^A-Z0-9]/g, '');
+  const base = d + '|' + n(ref) + '|' + n(ville) + '|' + n(piece);
+  let h = 5381;
+  for (let i = 0; i < base.length; i++) h = ((h << 5) + h + base.charCodeAt(i)) >>> 0;
+  return 'D-' + h.toString(36).toUpperCase();
+}
+
+// Parse tolérant du JSON renvoyé par le modèle
+function parseJsonModel(raw) {
+  try { return JSON.parse(raw.replace(/```json|```/g, '').trim()); }
+  catch(e) {
+    const m = raw.match(/\{[\s\S]*\}/);
+    if (m) { try { return JSON.parse(m[0]); } catch(e2) {} }
   }
-}
-setInterval(pomperFile, 3000);
-
-const LIBELLES_CHAMPS = { description: 'description', taille_produit: 'dimensions', matiere: 'matière', pcb: 'PCB', colisage_cm: 'colisage', volume_m3: 'volume', poids_nb: 'poids', prix: 'prix', devise: 'devise', port: 'port', moq: 'MOQ', code_hs_usine: 'code douanier usine', code_douanier: 'code douanier', kd: 'KD', remarques: 'remarques', extras: 'infos annexes', ean: 'EAN', fournisseur: 'fournisseur', variante_de: 'variante' };
-async function traiterFichierEnFile(fichierId) {
-  const f = db.prepare('SELECT * FROM fichiers WHERE id=?').get(fichierId);
-  if (!f) return;
-  let disque = null; try { disque = JSON.parse(f.rapport || '{}').disque; } catch {}
-  const chemin = disque ? path.join(DATA_DIR, 'fichiers', disque) : null;
-  if (!chemin || !fs.existsSync(chemin)) throw new Error('copie source introuvable sur le disque');
-  const buffer = fs.readFileSync(chemin);
-  const rapport = { fichier: f.nom, fichierId, produits: 0, images: 0, infos: [], avertissements: [], rejets: [],
-    statut: 'ok', date_document: f.date_document, mode: f.mode };
-  await analyserContenu({ fichierId, nom: f.nom, buffer, type: f.type, mode: f.mode, rapport, nomDisque: disque, dossier: f.dossier || '' });
+  return null;
 }
 
-async function analyserContenu({ fichierId, nom, buffer, type, mode, rapport, nomDisque, dossier = '' }) {
-  {
-    let texteBrut = '';
-    if (type === 'xlsx' || type === 'xls') {
-      const feuilles = ex.lireCellules(buffer);
-      texteBrut = ex.texteDesFeuilles(feuilles);
-      if (mode === 'auto') {
-        const motif = filetInterne(texteBrut);
-        if (motif) {
-          return refuserInterne(fichierId, rapport, nomDisque, motif);
-          db.prepare('UPDATE fichiers SET mode=? WHERE id=?').run(mode, fichierId);
-        }
-        // sinon : c'est l'IA qui tranchera en lisant le contenu, ligne par ligne
-      }
-    }
-    if (type === 'pptx') {
-      const slides = await ex.textePptxParSlides(buffer);
-      texteBrut = slides.map(sl => `=== Slide ${sl.slide} ===\n${sl.texte}`).join('\n');
-      const motif = filetInterne(texteBrut);
-      if (motif) return refuserInterne(fichierId, rapport, nomDisque, motif);
-    }
-    if (type === 'msg') {
-      let piecesMail = [];
-      try {
-        const m = ex.lireMsg(buffer);
-        texteBrut = m.corps ? '=== CORPS DU MAIL ===\n' + m.corps : ex.texteMsg(buffer);
-        piecesMail = m.pieces;
-      } catch { texteBrut = ex.texteMsg(buffer); }
-      // pièces jointes utiles : déposées comme fichiers autonomes (elles portent leurs propres photos)
-      for (const pj of piecesMail) {
-        const t2 = (String(pj.nom).split('.').pop() || '').toLowerCase();
-        if (!['xls', 'xlsx', 'pptx', 'docx', 'pdf'].includes(t2) || pj.buffer.length < 300) continue;
-        const h2 = ex.md5(pj.buffer);
-        if (db.prepare('SELECT id FROM fichiers WHERE hash=?').get(h2)) {
-          rapport.infos.push(`Pièce jointe « ${pj.nom} » déjà en base — non redéposée.`);
-          continue;
-        }
-        const nd2 = `${h2}.${t2}`;
-        fs.writeFileSync(path.join(DATA_DIR, 'fichiers', nd2), pj.buffer);
-        const dd2 = (['xls', 'xlsx'].includes(t2) ? ex.dateDocument(pj.buffer, pj.nom) : ex.dateDocument(Buffer.alloc(0), pj.nom)) || rapport.date_document || null;
-        const fi2 = db.prepare('INSERT INTO fichiers (nom, hash, taille, type, rapport, dossier, mode, date_document, valide) VALUES (?,?,?,?,?,?,?,?,?)')
-          .run(pj.nom, h2, pj.buffer.length, t2, JSON.stringify({ disque: nd2 }), dossier || null, mode || 'offre', dd2, ['xls', 'xlsx', 'pptx'].includes(t2) ? 0 : 1);
-        db.prepare("UPDATE fichiers SET statut='en_attente' WHERE id=?").run(fi2.lastInsertRowid);
-        rapport.infos.push(`Pièce jointe extraite du mail et mise en analyse : « ${pj.nom} ».`);
-      }
-    }
-    if ((type === 'xlsx' || type === 'xls') && mode === 'interne') {
-      return refuserInterne(fichierId, rapport, nomDisque, 'classement manuel « interne » (mode retiré : la base est réservée aux offres usines)');
-    }
-    if (false) {
-      // document interne : conservé + indexé texte, AUCUNE fiche produit créée
-      if (!rapport.avertissements.some(a => a.startsWith('Classé automatiquement')))
-        rapport.infos.push('Document interne : indexé pour la recherche, aucune fiche produit créée.');
-    } else if (type === 'xlsx' || type === 'xls' || type === 'pptx' || type === 'msg') {
-      // 2. extraction IA (qui juge aussi la nature du document, au contenu) + filet déterministe
-      const masquees = (type === 'xlsx' || type === 'xls') ? ex.feuillesMasquees(buffer) : [];
-      if (masquees.length) rapport.infos.push(`Feuille(s) masquée(s) IGNORÉE(S) à l'import : ${masquees.join(', ')} — masquées par le fournisseur, donc non destinées au client (ni produits ni photos extraits ; pour contrôler leur contenu, télécharge l'original — l'aperçu 👁 reste fidèle au fichier tel que le client le voit).`);
-      const { nature, motif, produits, erreur, erreur_partielle } = await ia.extraireProduitsIA(texteBrut, nom);
-      if (erreur) rapport.avertissements.push(erreur);
-      if (erreur_partielle) rapport.avertissements.push(erreur_partielle);
-      if (mode === 'auto' || ((type === 'pptx' || type === 'msg') && mode === 'document')) {
-        if ((type === 'pptx' || type === 'msg') && !produits.length) {
-          rapport.infos.push('Aucune ligne d\u2019offre détectée dans ce PPTX — conservé comme document annexe (texte indexé pour la recherche).');
-          mode = 'document';
-          db.prepare('UPDATE fichiers SET valide=1 WHERE id=?').run(fichierId); // annexe : pas de récap à valider
-        } else if (nature === 'interne' && !produits.length)
-          return refuserInterne(fichierId, rapport, nomDisque, motif || 'jugé document interne par l\u2019analyse du contenu');
-        else mode = 'offre';
-        db.prepare('UPDATE fichiers SET mode=? WHERE id=?').run(mode, fichierId);
-        if (nature === 'interne')
-          rapport.infos.push(`L'IA a jugé ce document « interne » au contenu${motif ? ' : ' + motif : ''}${produits.length ? ' — mais y a tout de même trouvé des lignes d\u2019offre, extraites ci-dessous' : '. Aucune fiche produit créée.'}`);
-      }
-      const { gardes, rejets } = ia.verifierProduits(produits, texteBrut);
-      rapport.rejets = rejets.map(r => `${r.produit?.reference || '(sans ref)'} : ${r.raison}`);
+// Chiffres cerclés des notices (①②…❶❷…) → chiffres simples, plus lisibles
+function stripCircled(t) {
+  return String(t).replace(/[\u2460-\u24FF\u2776-\u2793]/g, ch => {
+    const c = ch.codePointAt(0);
+    if (c >= 0x2460 && c <= 0x2473) return String(c - 0x245F);      // ①-⑳
+    if (c >= 0x2474 && c <= 0x2487) return String(c - 0x2473);      // ⑴-⒇
+    if (c >= 0x2488 && c <= 0x249B) return String(c - 0x2487);      // ⒈-⒛
+    if (c === 0x24EA) return '0';                                    // ⓪
+    if (c >= 0x24EB && c <= 0x24F4) return String(c - 0x24EB + 11); // ⓫-⓴
+    if (c >= 0x24F5 && c <= 0x24FE) return String(c - 0x24F4);      // ⓵-⓾
+    if (c >= 0x2776 && c <= 0x277F) return String(c - 0x2775);      // ❶-❿
+    if (c >= 0x2780 && c <= 0x2789) return String(c - 0x277F);      // ➀-➉
+    if (c >= 0x278A && c <= 0x2793) return String(c - 0x2789);      // ➊-➓
+    return ch;
+  });
+}
 
-      const ins = db.prepare(`INSERT INTO produits
-        (reference, fichier_id, feuille, ligne, fournisseur, description, taille_produit, matiere,
-         pcb, colisage_cm, volume_m3, poids_nb, prix, devise, port, moq, code_hs_usine, kd, remarques, avertissements, extras)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
-      const lignesProduits = {};
-      const heritagesImages = new Map(); // nouvelleFicheId -> images de la fiche remplacée
-      const reversements = []; // fiche plus ancienne arrivée après coup -> complète la fiche récente // feuille -> [{ligne, id}]
-      // références provisoires pour les offres sans référence usine
-      const sansRef = gardes.filter(p => p.sans_ref || !p.reference);
-      if (sansRef.length) {
-        const base = nom.replace(/\.[^.]+$/, '').toUpperCase().replace(/[^A-Z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 14);
-        sansRef.forEach((p, i) => { p.reference = `PROV-${base}-${i + 1}`; });
-        rapport.infos.push(`${sansRef.length} produit(s) sans référence usine : références provisoires créées (${sansRef.map(p => p.reference).join(', ')}).`);
+// Classeur des références Intersport (feuilles par année 2017→2026)
+const REF_ITS_SHEET_ID = '1B2kOW2TPtjQ4HDAq62IlItuUiU5kly22_GSegFiOKRc';
+
+// ── Serveur ───────────────────────────────────────────────
+const server = http.createServer(async function(req, res) {
+  corsHeaders(res);
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+  if (req.method === 'GET' && req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok', version: '4.0', db: !!pool }));
+    return;
+  }
+
+  // Exception lecture navigateur : le diagnostic du référentiel ITS
+  // accepte la clé en paramètre d'URL (?key=…)
+  const urlKey = (req.url.match(/[?&]key=([^&]+)/) || [])[1];
+  if ((req.url.startsWith('/ref-its-structure') || req.url.startsWith('/magasins-u-crawl') || req.url.startsWith('/magasins-u-status') || req.url.startsWith('/magasins-u-test')) && urlKey === APP_SECRET) {
+    // accès autorisé
+  } else if (req.headers['x-app-secret'] !== APP_SECRET) {
+    res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
+  }
+
+  let body = '';
+  let bodySize = 0;
+  const MAX_BODY = 12 * 1024 * 1024; // 12 Mo : au-delà on refuse plutôt que crasher
+  let bodyTooBig = false;
+  req.on('data', chunk => {
+    bodySize += chunk.length;
+    if (bodySize > MAX_BODY) {
+      bodyTooBig = true;
+      return; // on arrête d'accumuler en mémoire
+    }
+    body += chunk;
+  });
+  req.on('end', async () => {
+    if (bodyTooBig) {
+      res.writeHead(413, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Requête trop volumineuse (pièces jointes). Réduisez le nombre de photos/PDF.' }));
+      return;
+    }
+    let payload;
+    try { payload = JSON.parse(body || '{}'); } // GET sans corps → objet vide, pas un 400
+    catch(e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid JSON' })); return; }
+
+    try {
+
+      // ── SAUVEGARDER UN DOSSIER ────────────────────────────
+      if (req.url === '/save-dossier') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ ok: true, msg: 'no db' })); return; }
+        const d = payload;
+        await pool.query(`
+          INSERT INTO dossiers (numero_dossier, enseigne, departement_ville, ref_produit, piece, decision, date_reception, tracking, date_envoi, revers_url, notes, fla)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+          ON CONFLICT (numero_dossier) DO UPDATE SET
+            enseigne=$2, departement_ville=$3, ref_produit=$4, piece=$5,
+            decision=$6, date_reception=$7, date_traitement=NOW(),
+            tracking=COALESCE(EXCLUDED.tracking, dossiers.tracking),
+            date_envoi=COALESCE(EXCLUDED.date_envoi, dossiers.date_envoi),
+            revers_url=COALESCE(EXCLUDED.revers_url, dossiers.revers_url),
+            notes=CASE WHEN EXCLUDED.notes ~ 'FLA:.' THEN EXCLUDED.notes ELSE dossiers.notes END,
+            fla=CASE WHEN EXCLUDED.fla <> '' THEN EXCLUDED.fla ELSE dossiers.fla END
+        `, [d.numero_dossier||null, d.enseigne||null, d.departement_ville||null,
+            d.ref_produit||null, d.piece||null, d.decision||null, d.date_reception||null,
+            d.tracking||null, d.date_envoi||null, d.revers_url||null,
+            d.notes||'', ((String(d.notes||'').match(/FLA:(\S+)/) || [])[1] || '')]);
+        res.writeHead(200); res.end(JSON.stringify({ ok: true }));
+        return;
       }
-      // doublons de référence AU SEIN du fichier (coquille usine probable, ex: Grade A/B)
-      const vues = {};
-      for (const p of gardes) if (p.reference) (vues[p.reference] ||= []).push(p.ligne || '?');
-      for (const [refD, lignesD] of Object.entries(vues)) if (lignesD.length > 1)
-        rapport.avertissements.push(`${refD} apparaît ${lignesD.length} fois dans CE fichier (lignes ${lignesD.join(', ')}) — coquille usine probable (variante Grade A/B ?), à vérifier/corriger via ✎.`);
-      for (const p of gardes) {
-        const r = ins.run(p.reference, fichierId, p.feuille || null, p.ligne || null,
-          p.fournisseur || null, p.description || null, p.taille_produit || null, p.matiere || null,
-          p.pcb != null ? String(p.pcb) : null, p.colisage_cm || null,
-          p.volume_m3 != null ? String(p.volume_m3) : null, p.poids_nb || null,
-          p.prix != null ? String(p.prix) : null, p.devise || null, p.port || null,
-          p.moq != null ? String(p.moq) : null, p.code_hs_usine != null ? String(p.code_hs_usine) : null,
-          p.kd ? 1 : 0, p.remarques || null, JSON.stringify(p.avertissements || []),
-          p.extras && p.extras.length ? JSON.stringify(p.extras) : null);
-        if (dossier) db.prepare('UPDATE produits SET dossier=? WHERE id=?').run(dossier, r.lastInsertRowid);
-        if (p.variante_de) db.prepare('UPDATE produits SET variante_de=? WHERE id=?').run(String(p.variante_de).trim(), r.lastInsertRowid);
-        (lignesProduits[p.feuille || ''] ||= []).push({ ligne: p.ligne || 0, id: r.lastInsertRowid, ref: p.reference, variante_de: p.variante_de ? String(p.variante_de).trim() : null });
-        for (const a of p.avertissements || []) rapport.avertissements.push(`${p.reference} : ${a}`);
-        // alerte doublon de référence (autre fichier) — non bloquant : peut être une offre mise à jour
-        // règle métier : entre deux fichiers, seule la fiche la plus récente est conservée
-        const maDate = rapport.date_document || '';
-        const anciens = db.prepare(`SELECT pr.id, pr.dossier, pr.fichier_id AS fid, f.nom AS fnom, COALESCE(f.date_document, substr(f.depose_le,1,10)) AS fdate FROM produits pr
-          JOIN fichiers f ON f.id = pr.fichier_id
-          WHERE pr.reference = ? AND pr.fichier_id != ?`).all(p.reference, fichierId);
-        for (const anc of anciens) {
-          if (anc.fdate > maDate) {
-            heritagesImages.delete(r.lastInsertRowid);
-            // on garde la fiche entrante jusqu'à la fin du traitement (le temps que ses images s'associent),
-            // puis elle COMPLÈTE la fiche récente avant de disparaître
-            reversements.push({ recente: anc.id, entrante: r.lastInsertRowid, fnom: anc.fnom, fdate: anc.fdate });
-            break;
-          }
-          if (anc.dossier && !dossier) db.prepare('UPDATE produits SET dossier=? WHERE id=?').run(anc.dossier, r.lastInsertRowid);
-          // FUSION : les infos produit PERSISTENT — seules les valeurs réellement renseignées
-          // par le fichier plus récent les remplacent (un update de prix ne vide pas la fiche)
+
+      // ── VERIFIER UN DOSSIER ───────────────────────────────
+      if (req.url === '/check-dossier') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ found: false })); return; }
+        const { numero_dossier } = payload;
+        if (!numero_dossier) { res.writeHead(200); res.end(JSON.stringify({ found: false })); return; }
+        const result = await pool.query('SELECT * FROM dossiers WHERE numero_dossier=$1', [numero_dossier]);
+        res.writeHead(200);
+        res.end(JSON.stringify(result.rows.length > 0
+          ? { found: true, dossier: result.rows[0] }
+          : { found: false }));
+        return;
+      }
+
+      // ── HISTORIQUE MAGASIN (2 tableaux) ──────────────────
+      if (req.url === '/get-historique-magasin') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ par_ref: [], complet: [] })); return; }
+        const { enseigne, departement_ville, ref_produit } = payload;
+
+        // Normalisation TOLÉRANTE : accents, tirets, points, espaces, SAINT/ST
+        const normU = v => String(v || '').toUpperCase()
+          .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+          .replace(/[^A-Z0-9]/g, '').replace(/SAINT/g, 'ST');
+        const deptU = ((departement_ville || '').match(/^(\d{2,3})/) || [])[1] || '';
+        const villeCible = normU((departement_ville || '').replace(/^\d+\s*/, ''));
+        const matchVille = r => {
+          const n = normU(String(r.departement_ville || '').replace(/^\d+\s*/, ''));
+          return n === villeCible || n.includes(villeCible) || villeCible.includes(n);
+        };
+        const ville = villeCible; // compat
+
+        const HIST_MOIS = 4; // fenêtre d'historique magasin affichée dans l'app
+        const sixMoisAvant = new Date();
+        sixMoisAvant.setMonth(sixMoisAvant.getMonth() - HIST_MOIS);
+        const dateLimit = sixMoisAvant.toISOString().slice(0, 10);
+
+        // Tableau 1 : même magasin + même ref, sur la fenêtre HIST_MOIS
+        const resRef = await pool.query(`
+          SELECT * FROM dossiers
+          WHERE departement_ville ILIKE $1
+          AND UPPER(enseigne) LIKE $2
+          AND UPPER(ref_produit) = $3
+          AND date_reception >= $4
+          ORDER BY date_reception DESC
+          LIMIT 200
+        `, [
+          (deptU ? deptU : '') + '%',
+          '%' + (enseigne||'').toUpperCase() + '%',
+          (ref_produit||'').toUpperCase(),
+          dateLimit
+        ]);
+        resRef.rows = resRef.rows.filter(matchVille).slice(0, 20);
+
+        // Tableau 2 : même magasin tous produits, sur la fenêtre HIST_MOIS
+        const resComplet = await pool.query(`
+          SELECT * FROM dossiers
+          WHERE departement_ville ILIKE $1
+          AND UPPER(enseigne) LIKE $2
+          AND date_reception >= $3
+          ORDER BY date_reception DESC
+          LIMIT 600
+        `, [
+          (deptU ? deptU : '') + '%',
+          '%' + (enseigne||'').toUpperCase() + '%',
+          dateLimit
+        ]);
+        resComplet.rows = resComplet.rows.filter(matchVille).slice(0, 150);
+
+        // Pour chaque dossier avec CNB, tenter de récupérer tracking + date_envoi depuis Sheet
+        const enrichir = async (rows) => {
+          if (!GOOGLE_SHEET_ID) return rows;
           try {
-            const ancienne = db.prepare('SELECT * FROM produits WHERE id=?').get(anc.id);
-            const nouvelle = db.prepare('SELECT * FROM produits WHERE id=?').get(r.lastInsertRowid);
-            const NON_HERITES = new Set(['id', 'reference', 'fichier_id', 'feuille', 'ligne', 'dossier', 'avertissements', 'maj_de']);
-            const estVide = (v) => v == null || String(v).trim() === '' || String(v).trim() === '[]';
-            const herites = [];
-            for (const col of db.prepare('PRAGMA table_info(produits)').all().map(x => x.name)) {
-              if (NON_HERITES.has(col)) continue;
-              if (estVide(nouvelle[col]) && !estVide(ancienne[col])) {
-                db.prepare(`UPDATE produits SET ${col}=? WHERE id=?`).run(ancienne[col], r.lastInsertRowid);
-                herites.push(col);
-              }
-            }
-            // les listes qui contenaient l'ancienne fiche suivent la nouvelle
-            db.prepare('UPDATE OR IGNORE liste_items SET produit_id=? WHERE produit_id=?').run(r.lastInsertRowid, anc.id);
-            if (herites.length) {
-              rapport.infos.push(`${p.reference} : ${herites.length} info(s) conservée(s) de la version précédente (${herites.map(c => LIBELLES_CHAMPS[c] || c).join(', ')}) — ce fichier ne les renseignait pas.`);
-            }
-          } catch (e) { rapport.avertissements.push(`${p.reference} : fusion avec la version précédente incomplète (${e.message})`); }
-          db.prepare('UPDATE produits SET maj_de=? WHERE id=?').run(`${anc.fnom} · ${anc.fdate}`, r.lastInsertRowid);
-          // photos de l'ancienne fiche : gardées de côté (une version « update de prix » a souvent des photos dégradées)
-          const imgsAnc = db.prepare(`SELECT pi.image_id, pi.principale, i.chemin FROM produit_images pi JOIN images i ON i.id=pi.image_id WHERE pi.produit_id=?`).all(anc.id);
-          if (imgsAnc.length) heritagesImages.set(r.lastInsertRowid, { ref: p.reference, images: imgsAnc });
-          db.prepare('DELETE FROM produits WHERE id=?').run(anc.id);
-          rapport.infos.push(`${p.reference} : remplace la fiche plus ancienne (${anc.fnom}, daté du ${anc.fdate})${anc.dossier && !dossier ? ' — classement « ' + anc.dossier + ' » hérité' : ''}.`);
-          // trace symétrique sur le rapport du fichier dont la fiche vient de sauter
-          try {
-            const ra = db.prepare('SELECT rapport FROM fichiers WHERE id=?').get(anc.fid);
-            const j = JSON.parse(ra.rapport || '{}');
-            (j.avertissements = j.avertissements || []).push(`${p.reference} : fiche remplacée par la version plus récente de « ${nom} » (daté du ${maDate}).`);
-            if (typeof j.produits === 'number' && j.produits > 0) j.produits--;
-            db.prepare('UPDATE fichiers SET rapport=? WHERE id=?').run(JSON.stringify(j), anc.fid);
-          } catch {}
-        }
-      }
-      rapport.produits = gardes.length;
-
-      // 3. images : xlsx natif, ou .xls converti via LibreOffice, ou repli binaire
-      let bufferImages = null, sansAncrage = false;
-      if (type === 'pptx') bufferImages = Object.values(lignesProduits).flat().length ? buffer : null;
-      else if (type === 'xlsx') bufferImages = buffer;
-      else if (type === 'xls') {
-        bufferImages = await ex.convertirXlsEnXlsx(buffer);
-        if (bufferImages) rapport.infos.push('Fichier .xls converti automatiquement : photos et positions extraites.');
-        else {
-          const brutes = ex.imagesBinairesXls(buffer);
-          if (brutes.length) { sansAncrage = true; rapport.avertissements.push(`Photos récupérées du .xls sans leur position (${brutes.length}) — ${''}associées seulement si le fichier n'a qu'un produit.`); }
-          bufferImages = null;
-          // insertion directe des images sans ancrage
-          const insImg0 = db.prepare(`INSERT INTO images (fichier_id, produit_id, hash, chemin, feuille, ligne_ancrage, ambigue)
-                                      VALUES (?,?,?,?,?,?,?)`);
-          const seuls = Object.values(lignesProduits).flat();
-          const associeA = seuls.length === 1 ? seuls[0] : null;
-          const vus0 = new Set();
-          for (const img of brutes) {
-            if (vus0.has(img.hash)) continue; vus0.add(img.hash);
-            const dejaImg = db.prepare('SELECT chemin FROM images WHERE hash=?').get(img.hash);
-            const chemin = dejaImg ? dejaImg.chemin : `${img.hash}.${img.ext}`;
-            if (!dejaImg) fs.writeFileSync(path.join(DATA_DIR, 'images', chemin), img.buffer);
-            const assoc0Vivant = associeA && db.prepare('SELECT 1 FROM produits WHERE id=?').get(associeA.id) ? associeA : null;
-            const rimg0 = insImg0.run(fichierId, assoc0Vivant ? assoc0Vivant.id : null, img.hash, chemin, null, null, assoc0Vivant ? 1 : 0);
-            if (assoc0Vivant)
-              db.prepare('INSERT OR IGNORE INTO produit_images (produit_id, image_id) VALUES (?,?)').run(assoc0Vivant.id, rimg0.lastInsertRowid);
-            rapport.images++;
-          }
-        }
-      }
-      if (bufferImages) {
-        try {
-          const images = type === 'pptx' ? await ex.imagesPptx(buffer) : await ex.lireImagesXlsx(bufferImages);
-          const insImg = db.prepare(`INSERT INTO images (fichier_id, produit_id, hash, chemin, feuille, ligne_ancrage, ambigue)
-                                     VALUES (?,?,?,?,?,?,?)`);
-          const vus = new Set();
-          for (const img of images) {
-            if (vus.has(img.hash)) continue; // dédoublonnage intra-fichier (les fameuses carafes)
-            vus.add(img.hash);
-            const dejaImg = db.prepare('SELECT id FROM images WHERE hash=?').get(img.hash);
-            const chemin = dejaImg
-              ? db.prepare('SELECT chemin FROM images WHERE hash=?').get(img.hash).chemin
-              : `${img.hash}.${img.ext}`;
-            if (!dejaImg) fs.writeFileSync(path.join(DATA_DIR, 'images', chemin), img.buffer);
-            // association par TERRITOIRES : chaque produit possède [sa ligne - 1 ; ligne du produit suivant - 1[
-            // (les blocs verticaux type Win Hang ancrent la photo plusieurs lignes sous la ligne « Item No. »)
-            const cand = (lignesProduits[img.feuille] || []);
-            let assoc = cand.find(p => p.ligne === img.ligneAncrage);
-            let ambigue = 0;
-            if (!assoc && Number.isFinite(img.ligneAncrage) && !/^Slide/i.test(String(img.feuille || ''))) {
-              const tries = [...cand].filter(p => Number.isFinite(p.ligne)).sort((a, b) => a.ligne - b.ligne);
-              for (let i = 0; i < tries.length; i++) {
-                const debut = tries[i].ligne - 1;
-                const fin = i + 1 < tries.length ? tries[i + 1].ligne : tries[i].ligne + 12; // tout le bloc jusqu'au produit suivant
-                if (img.ligneAncrage >= debut && img.ligneAncrage < fin) { assoc = tries[i]; ambigue = img.ligneAncrage === tries[i].ligne ? 0 : 1; break; }
-              }
-            }
-            if (!assoc) {
-              const proches = cand.filter(p => Math.abs(p.ligne - img.ligneAncrage) <= 2)
-                                  .sort((a, b) => Math.abs(a.ligne - img.ligneAncrage) - Math.abs(b.ligne - img.ligneAncrage));
-              if (proches.length) { assoc = proches[0]; ambigue = 1; }
-            }
-            if (assoc && !db.prepare('SELECT 1 FROM produits WHERE id=?').get(assoc.id)) { assoc = null; ambigue = 0; }
-            const rimg = insImg.run(fichierId, assoc ? assoc.id : null, img.hash, chemin, img.feuille, img.ligneAncrage, ambigue);
-            if (assoc)
-              db.prepare('INSERT OR IGNORE INTO produit_images (produit_id, image_id) VALUES (?,?)').run(assoc.id, rimg.lastInsertRowid);
-            rapport.images++;
-            if (ambigue && assoc) rapport.infos.push(`Image L${img.ligneAncrage} (${img.feuille}) associée à ${assoc.ref} par proximité — vérifiable via 🖼 Photo.`);
-            if (!assoc) rapport.infos.push(`Image L${img.ligneAncrage} (${img.feuille}) sans fiche — associable via 🖼 Photo.`);
-          }
-        } catch (e) {
-          rapport.avertissements.push(`Images non extraites : ${e.message}`);
-        }
-      }
-      // PARTAGE entre variantes : un même produit décliné (tailles, couleurs) n'a souvent QU'UNE photo,
-      // posée sur n'importe quel membre du groupe -> chaque membre sans photo reçoit celles du membre le plus proche
-      try {
-        const tous = Object.values(lignesProduits).flat().filter(p => db.prepare('SELECT 1 FROM produits WHERE id=?').get(p.id));
-        const aImages = new Map(tous.map(p => [p.id, db.prepare('SELECT COUNT(*) n FROM produit_images WHERE produit_id=?').get(p.id).n]));
-        const parRef = new Map(tous.map(p => [String(p.ref).trim().toUpperCase(), p]));
-        const racine = (x) => { const u = String(x).trim().toUpperCase(); const m = u.match(/^(.*?)[-_ ][A-Z0-9./X]{1,10}$/); return m ? m[1] : u; };
-        // groupes (union-find) : liens IA « variante_de » (bidirectionnels) + même racine de réf à proximité
-        const chef = new Map(tous.map(p => [p.id, p.id]));
-        const trouver = (i) => { while (chef.get(i) !== i) { chef.set(i, chef.get(chef.get(i))); i = chef.get(i); } return i; };
-        const unir = (a, b) => { const ra = trouver(a.id), rb = trouver(b.id); if (ra !== rb) chef.set(ra, rb); };
-        for (const p of tous) {
-          if (p.variante_de && parRef.has(p.variante_de.toUpperCase())) unir(p, parRef.get(p.variante_de.toUpperCase()));
-        }
-        for (let i = 0; i < tous.length; i++) for (let j = i + 1; j < tous.length; j++) {
-          const a = tous[i], b = tous[j], ra = racine(a.ref);
-          if (ra.length >= 6 && ra === racine(b.ref) && Math.abs((a.ligne || 0) - (b.ligne || 0)) <= 12) unir(a, b);
-        }
-        const groupes = {};
-        for (const p of tous) (groupes[trouver(p.id)] ||= []).push(p);
-        for (const membres of Object.values(groupes)) {
-          const avec = membres.filter(m => aImages.get(m.id));
-          if (!avec.length || avec.length === membres.length) continue;
-          for (const p of membres) {
-            if (aImages.get(p.id)) continue;
-            const source = [...avec].sort((a, b) => Math.abs((a.ligne || 0) - (p.ligne || 0)) - Math.abs((b.ligne || 0) - (p.ligne || 0)))[0];
-            for (const li of db.prepare('SELECT image_id, principale FROM produit_images WHERE produit_id=?').all(source.id))
-              db.prepare('INSERT OR IGNORE INTO produit_images (produit_id, image_id, principale) VALUES (?,?,?)').run(p.id, li.image_id, li.principale);
-            aImages.set(p.id, aImages.get(source.id));
-            rapport.infos.push(`${p.ref} : photo partagée avec ${source.ref} (même produit décliné).`);
-          }
-        }
-      } catch (e) { rapport.avertissements.push('Partage de photos entre variantes : ' + e.message); }
-      // héritage : si la nouvelle version a des photos absentes ou nettement plus légères, on garde celles d'origine
-      for (const [nouveauId, h] of heritagesImages) {
-        try {
-          if (!db.prepare('SELECT 1 FROM produits WHERE id=?').get(nouveauId)) continue;
-          const poids = ch => { try { return fs.statSync(path.join(DATA_DIR, 'images', ch)).size; } catch { return 0; } };
-          const imgsNouv = db.prepare(`SELECT pi.image_id, i.chemin FROM produit_images pi JOIN images i ON i.id=pi.image_id WHERE pi.produit_id=?`).all(nouveauId);
-          const maxNouv = Math.max(0, ...imgsNouv.map(x => poids(x.chemin)));
-          const maxAnc = Math.max(0, ...h.images.map(x => poids(x.chemin)));
-          if (!imgsNouv.length) {
-            for (const im of h.images) db.prepare('INSERT OR IGNORE INTO produit_images (produit_id, image_id, principale) VALUES (?,?,?)').run(nouveauId, im.image_id, im.principale || 0);
-            rapport.infos.push(`${h.ref} : photo(s) de la version précédente conservées (la nouvelle version n'en avait pas).`);
-          } else if (maxAnc > 0 && maxNouv < 0.3 * maxAnc) {
-            // les photos recompressées de l'update sont DÉLIÉES (pas de doublons) — les originales prennent leur place
-            db.prepare('DELETE FROM produit_images WHERE produit_id=?').run(nouveauId);
-            for (const im of h.images) db.prepare('INSERT OR IGNORE INTO produit_images (produit_id, image_id, principale) VALUES (?,?,?)').run(nouveauId, im.image_id, im.principale || 0);
-            rapport.infos.push(`${h.ref} : photos d'origine conservées (meilleure qualité) — les versions recompressées de ce fichier n'ont pas été rattachées (récupérables via 🖼 si besoin).`);
-          }
-        } catch {}
-      }
-      heritagesImages.clear();
-      // reversement : l'ordre d'upload est indifférent — un fichier ancien enrichit la fiche récente
-      for (const rv of reversements) {
-        try {
-          const entrante = db.prepare('SELECT * FROM produits WHERE id=?').get(rv.entrante);
-          if (!entrante) continue;
-          const recente = db.prepare('SELECT * FROM produits WHERE id=?').get(rv.recente);
-          if (!recente) continue;
-          const NON = new Set(['id', 'reference', 'fichier_id', 'feuille', 'ligne', 'dossier', 'avertissements', 'maj_de']);
-          const vide = v => v == null || String(v).trim() === '' || String(v).trim() === '[]';
-          const completes = [];
-          for (const col of db.prepare('PRAGMA table_info(produits)').all().map(x => x.name)) {
-            if (NON.has(col)) continue;
-            if (vide(recente[col]) && !vide(entrante[col])) {
-              db.prepare(`UPDATE produits SET ${col}=? WHERE id=?`).run(entrante[col], rv.recente);
-              completes.push(LIBELLES_CHAMPS[col] || col);
-            }
-          }
-          const nbRec = db.prepare('SELECT COUNT(*) n FROM produit_images WHERE produit_id=?').get(rv.recente).n;
-          if (!nbRec) db.prepare('UPDATE OR IGNORE produit_images SET produit_id=? WHERE produit_id=?').run(rv.recente, rv.entrante);
-          db.prepare('UPDATE OR IGNORE liste_items SET produit_id=? WHERE produit_id=?').run(rv.recente, rv.entrante);
-          if (!String(recente.maj_de || '').trim()) db.prepare('UPDATE produits SET maj_de=? WHERE id=?').run(`${nom} · ${rapport.date_document || '?'}`, rv.recente);
-          db.prepare('DELETE FROM produits WHERE id=?').run(rv.entrante);
-          rapport.infos.push(`${entrante.reference} : une fiche plus récente existe (${rv.fnom}, ${rv.fdate}) — conservée${completes.length ? ` et COMPLÉTÉE par ${completes.length} info(s) de ce fichier (${completes.slice(0, 10).join(', ')})` : ''}${!nbRec ? ' ; photos de ce fichier reprises' : ''}.`);
-        } catch (e) { rapport.avertissements.push('Complément de la fiche récente : ' + e.message); }
-      }
-    } else if (type === 'pptx' || type === 'docx') {
-      texteBrut = await ex.textePptx(buffer);
-      rapport.infos.push('Fichier bureautique : indexé en texte pour la recherche (pas d\u2019extraction produit).');
-    } else {
-      rapport.infos.push('Document annexe : conservé et téléchargeable, non indexé (format sans texte lisible).');
-    }
-    if (texteBrut) db.prepare('INSERT OR REPLACE INTO textes (fichier_id, contenu) VALUES (?,?)').run(fichierId, texteBrut);
-    if (rapport.avertissements.length || rapport.rejets.length) rapport.statut = 'avertissements';
-    db.prepare('UPDATE fichiers SET statut=?, rapport=? WHERE id=?')
-      .run(rapport.statut, JSON.stringify({ ...rapport, disque: nomDisque }), fichierId);
-  }
-}
-
-// ---------- RECHERCHE ----------
-app.get('/api/recherche', (req, res) => {
-  const q = String(req.query.q || '').trim();
-  if (!q) {
-    const derniers = db.prepare(`SELECT p.*, f.nom AS fichier_nom FROM produits p
-      JOIN fichiers f ON f.id = p.fichier_id ORDER BY p.id DESC LIMIT 30`).all();
-    return res.json({ produits: derniers.map(enrichir), plein_texte: [] });
-  }
-  const like = `%${q}%`;
-  const produits = db.prepare(`SELECT p.*, f.nom AS fichier_nom, f.dossier AS fichier_dossier FROM produits p
-    JOIN fichiers f ON f.id = p.fichier_id
-    WHERE p.reference LIKE ? OR p.description LIKE ? OR p.fournisseur LIKE ? OR p.remarques LIKE ?
-    ORDER BY (p.reference = ?) DESC, length(p.reference) ASC LIMIT 100`)
-    .all(like, like, like, like, q);
-  // chasse plein-texte : fichiers dont le contenu contient la requête (règle des frontières)
-  const pt = db.prepare(`SELECT f.id, f.nom, f.type, f.depose_le FROM textes t JOIN fichiers f ON f.id=t.fichier_id
-    WHERE t.contenu LIKE ? LIMIT 60`).all(like)
-    .filter(f => !produits.some(p => p.fichier_id === f.id));
-  res.json({ produits: produits.map(enrichir), plein_texte: pt });
-});
-
-function compacterInfosImages(rapport) {
-  const motif = /^Image L\d+ .* sans fiche — associable via/;
-  const orphelines = rapport.infos.filter(i => motif.test(i));
-  if (orphelines.length > 6) {
-    rapport.infos = rapport.infos.filter(i => !motif.test(i));
-    rapport.infos.push(`${orphelines.length} photos extraites sans fiche associée — associables via 🖼 Photo (ou vérifie l'extraction si le fichier devait donner des produits).`);
-  }
-}
-
-function enrichir(p) {
-  p.images = db.prepare(`SELECT i.id, i.ambigue, pi.principale FROM produit_images pi JOIN images i ON i.id = pi.image_id
-    WHERE pi.produit_id = ? ORDER BY pi.principale DESC, i.id LIMIT 6`).all(p.id);
-  p.en_selection = !!db.prepare(`SELECT 1 FROM liste_items li JOIN listes l ON l.id = li.liste_id
-    WHERE li.produit_id = ? AND l.systeme = 1`).get(p.id);
-  try { p.avertissements = JSON.parse(p.avertissements || '[]'); } catch { p.avertissements = []; }
-  try { p.extras = JSON.parse(p.extras || '[]'); } catch { p.extras = []; }
-  p.autres_occurrences = db.prepare(`SELECT pr.id, pr.prix, pr.devise, f.nom AS fichier_nom, f.depose_le
-    FROM produits pr JOIN fichiers f ON f.id = pr.fichier_id
-    WHERE pr.reference = ? AND pr.id != ? ORDER BY pr.id DESC LIMIT 10`).all(p.reference, p.id);
-  return p;
-}
-
-const CHAMPS_EDITABLES = ['reference', 'ean', 'note', 'fournisseur', 'description', 'taille_produit', 'matiere', 'pcb',
-  'colisage_cm', 'volume_m3', 'poids_nb', 'prix', 'devise', 'port', 'moq', 'code_hs_usine', 'kd', 'remarques'];
-app.patch('/api/produits/:id/champs', (req, res) => {
-  const p = db.prepare('SELECT * FROM produits WHERE id=?').get(req.params.id);
-  if (!p) return res.status(404).json({ erreur: 'Fiche introuvable' });
-  const maj = {};
-  for (const c of CHAMPS_EDITABLES) if (c in req.body) {
-    let v = req.body[c];
-    if (c === 'reference') {
-      v = String(v || '').replace(/\s+/g, ' ').trim();
-      if (!v) return res.status(400).json({ erreur: 'La référence ne peut pas être vide' });
-    } else if (c === 'kd') v = v ? 1 : 0;
-    else v = v === '' || v == null ? null : String(v);
-    maj[c] = v;
-  }
-  if ('extras' in req.body) {
-    const ex2 = Array.isArray(req.body.extras)
-      ? req.body.extras.filter(e => e && (String(e.intitule || '').trim() || String(e.valeur || '').trim()))
-          .map(e => ({ intitule: String(e.intitule || '').trim().slice(0, 60), valeur: String(e.valeur || '').trim().slice(0, 300) }))
-      : [];
-    maj.extras = ex2.length ? JSON.stringify(ex2) : null;
-  }
-  if (!Object.keys(maj).length) return res.status(400).json({ erreur: 'Rien à modifier' });
-  maj.modifie_le = new Date().toISOString().slice(0, 16).replace('T', ' ');
-  const setSql = Object.keys(maj).map(k => k + '=?').join(', ');
-  db.prepare('UPDATE produits SET ' + setSql + ' WHERE id=?').run(...Object.values(maj), req.params.id);
-  let doublon = null;
-  if (maj.reference && maj.reference !== p.reference) {
-    const autres = db.prepare('SELECT COUNT(*) n FROM produits WHERE reference=? AND id!=?').get(maj.reference, req.params.id).n;
-    if (autres) doublon = `Attention : ${autres} autre(s) fiche(s) porte(nt) déjà la référence ${maj.reference}`;
-  }
-  res.json({ ok: true, doublon, produit: enrichir(db.prepare('SELECT * FROM produits WHERE id=?').get(req.params.id)) });
-});
-
-app.get('/api/produit/:id', (req, res) => {
-  const p = db.prepare(`SELECT p.*, f.nom AS fichier_nom, f.id AS fid FROM produits p
-    JOIN fichiers f ON f.id=p.fichier_id WHERE p.id=?`).get(req.params.id);
-  if (!p) return res.status(404).json({ erreur: 'Produit introuvable' });
-  res.json(enrichir(p));
-});
-
-app.get('/image/:id', (req, res) => {
-  const img = db.prepare('SELECT chemin FROM images WHERE id=?').get(req.params.id);
-  if (!img) return res.status(404).end();
-  res.sendFile(path.join(DATA_DIR, 'images', img.chemin));
-});
-
-app.get('/fichier/:id', (req, res) => {
-  const f = db.prepare('SELECT nom, rapport FROM fichiers WHERE id=?').get(req.params.id);
-  if (!f) return res.status(404).end();
-  const disque = JSON.parse(f.rapport || '{}').disque;
-  if (!disque) return res.status(404).end();
-  res.download(path.join(DATA_DIR, 'fichiers', disque), f.nom);
-});
-
-// ---------- ASSISTANT ----------
-app.post('/api/assistant', async (req, res) => {
-  const question = String(req.body.question || '').trim().slice(0, 500);
-  if (!question) return res.status(400).json({ erreur: 'Question vide' });
-  const lignes = db.prepare(`SELECT id, reference, fournisseur, prix, devise, matiere, taille_produit, description
-    FROM produits ORDER BY id DESC LIMIT 4000`).all()
-    .map(p => [p.id, p.reference, p.fournisseur || '', p.prix ? (p.devise === 'EUR' ? p.prix + 'EUR' : p.prix + 'USD') : '',
-               p.matiere || '', p.taille_produit || '', (p.description || '').replace(/[\t\n]/g, ' ').slice(0, 220)].join('\t'));
-  const { ids, reponse, erreur } = await ia.repondreAssistant(question,
-    'id\treference\tfournisseur\tprix\tmatiere\ttaille\tdescription\n' + lignes.join('\n'));
-  if (erreur) return res.status(502).json({ erreur });
-  // seules les fiches réellement en base sont retournées (filet anti-invention)
-  const fiches = ids.map(id => db.prepare(`SELECT p.*, f.nom AS fichier_nom, f.dossier AS fichier_dossier
-    FROM produits p JOIN fichiers f ON f.id=p.fichier_id WHERE p.id=?`).get(id)).filter(Boolean).map(enrichir);
-  res.json({ reponse, produits: fiches });
-});
-
-// ---------- DOSSIERS ----------
-app.post('/api/dossiers', (req, res) => {
-  const chemin = nettoyerChemin(req.body.chemin);
-  if (!chemin) return res.status(400).json({ erreur: 'Chemin vide' });
-  db.prepare('INSERT OR IGNORE INTO dossiers (chemin) VALUES (?)').run(chemin);
-  res.json({ ok: true, chemin });
-});
-app.patch('/api/dossiers/deplacer', (req, res) => {
-  const source = nettoyerChemin(req.body.source);
-  const destination = nettoyerChemin(req.body.destination); // '' = racine
-  if (!source) return res.status(400).json({ erreur: 'Source vide' });
-  if (destination === source || destination.startsWith(source + '/'))
-    return res.status(409).json({ erreur: 'Impossible de déplacer un dossier dans lui-même.' });
-  const base = source.split('/').pop();
-  const nouveau = destination ? destination + '/' + base : base;
-  if (nouveau === source) return res.json({ ok: true, nouveau });
-  if (db.prepare("SELECT 1 FROM dossiers WHERE chemin=?").get(nouveau)
-      || db.prepare("SELECT 1 FROM produits WHERE dossier=? LIMIT 1").get(nouveau))
-    return res.status(409).json({ erreur: `Un dossier « ${nouveau} » existe déjà.` });
-  const tx = db.transaction(() => {
-    db.prepare(`UPDATE produits SET dossier = ? || substr(dossier, ?) WHERE dossier = ? OR dossier LIKE ?`)
-      .run(nouveau, source.length + 1, source, source + '/%');
-    db.prepare(`UPDATE OR IGNORE dossiers SET chemin = ? || substr(chemin, ?) WHERE chemin = ? OR chemin LIKE ?`)
-      .run(nouveau, source.length + 1, source, source + '/%');
-    db.prepare('INSERT OR IGNORE INTO dossiers (chemin) VALUES (?)').run(nouveau);
-    db.prepare('DELETE FROM dossiers WHERE chemin = ?').run(source);
-  });
-  tx();
-  res.json({ ok: true, nouveau });
-});
-
-app.delete('/api/dossiers', (req, res) => {
-  const chemin = nettoyerChemin(req.query.chemin);
-  if (!chemin) return res.status(400).json({ erreur: 'Chemin vide' });
-  const nb = db.prepare("SELECT COUNT(*) n FROM produits WHERE dossier = ? OR dossier LIKE ?").get(chemin, chemin + '/%').n;
-  const sous = db.prepare("SELECT COUNT(*) n FROM dossiers WHERE chemin LIKE ?").get(chemin + '/%').n;
-  if ((nb || sous) && req.query.force !== '1')
-    return res.status(409).json({ erreur: 'non vide', fiches: nb, sous_dossiers: sous });
-  const tx = db.transaction(() => {
-    db.prepare("UPDATE produits SET dossier = NULL WHERE dossier = ? OR dossier LIKE ?").run(chemin, chemin + '/%');
-    db.prepare("DELETE FROM dossiers WHERE chemin = ? OR chemin LIKE ?").run(chemin, chemin + '/%');
-  });
-  tx();
-  res.json({ ok: true, fiches_declassees: nb });
-});
-
-// ---------- EXPLORATEUR ----------
-app.get('/api/arbre', (req, res) => {
-  const chemins = db.prepare(`SELECT dossier FROM (SELECT chemin AS dossier FROM dossiers
-      UNION SELECT DISTINCT dossier FROM produits WHERE dossier IS NOT NULL AND dossier != '')
-    ORDER BY dossier`).all().map(r => r.dossier);
-  res.json({ chemins });
-});
-
-const nettoyerChemin = (d) => String(d || '')
-  .replace(/\\/g, '/').split('/').map(x => x.trim()).filter(Boolean)
-  .map(x => x.replace(/[^\w\s.\-()&+]/g, '')).join('/').slice(0, 200);
-
-app.patch('/api/produits/dossier', (req, res) => {
-  const ids = (req.body.ids || []).map(Number).filter(Boolean);
-  if (!ids.length) return res.status(400).json({ erreur: 'Aucune fiche sélectionnée' });
-  const dossier = nettoyerChemin(req.body.dossier);
-  const maj = db.prepare('UPDATE produits SET dossier=? WHERE id=?');
-  let n = 0;
-  for (const id of ids) n += maj.run(dossier || null, id).changes;
-  res.json({ ok: true, classees: n, dossier: dossier || null });
-});
-
-app.patch('/api/produits/:id/dossier', (req, res) => {
-  const p = db.prepare('SELECT id, reference FROM produits WHERE id=?').get(req.params.id);
-  if (!p) return res.status(404).json({ erreur: 'Fiche introuvable' });
-  const dossier = nettoyerChemin(req.body.dossier);
-  db.prepare('UPDATE produits SET dossier=? WHERE id=?').run(dossier || null, p.id);
-  res.json({ ok: true, reference: p.reference, dossier: dossier || null });
-});
-
-app.get('/api/sante', (req, res) => {
-  const CLES = { port: 'port', prix: 'prix', dimensions: 'taille_produit', poids: 'poids_nb', volume: 'volume_m3', colisage: 'colisage_cm', pcb: 'pcb' };
-  const parFichier = {};
-  for (const p of db.prepare(`SELECT p.id, p.reference, p.fichier_id, f.nom, p.port, p.prix, p.taille_produit, p.poids_nb, p.volume_m3, p.colisage_cm, p.pcb
-      FROM produits p JOIN fichiers f ON f.id=p.fichier_id`).all()) {
-    const e = (parFichier[p.fichier_id] ||= { fichier_id: p.fichier_id, nom: p.nom, total: 0, manques: {}, refs_incompletes: new Set() });
-    e.total++;
-    for (const [lib, col] of Object.entries(CLES)) {
-      const v = p[col];
-      if (v == null || String(v).trim() === '') { e.manques[lib] = (e.manques[lib] || 0) + 1; e.refs_incompletes.add(p.reference); }
-    }
-  }
-  const liste = Object.values(parFichier).filter(e => Object.keys(e.manques).length)
-    .map(e => ({ ...e, refs_incompletes: [...e.refs_incompletes].slice(0, 40) }))
-    .sort((a, b) => Object.values(b.manques).reduce((x, y) => x + y, 0) - Object.values(a.manques).reduce((x, y) => x + y, 0));
-  res.json(liste);
-});
-
-app.get('/api/dossiers/arbre', (req, res) => {
-  const chemins = db.prepare('SELECT chemin FROM dossiers ORDER BY chemin').all().map(x => x.chemin);
-  const comptes = {};
-  for (const l of db.prepare("SELECT dossier, COUNT(*) n FROM produits WHERE dossier IS NOT NULL AND dossier<>'' GROUP BY dossier").all())
-    comptes[l.dossier] = l.n;
-  res.json({ chemins, comptes });
-});
-
-app.get('/api/explorateur', (req, res) => {
-  const d = String(req.query.d || '').replace(/^\/+|\/+$/g, '');
-  const tous = db.prepare(`SELECT chemin AS dossier FROM dossiers
-      UNION SELECT DISTINCT dossier FROM produits WHERE dossier IS NOT NULL AND dossier != ''`).all().map(r => r.dossier);
-  const sousDossiers = new Set();
-  for (const c of tous) {
-    if (d === '' ) { sousDossiers.add(c.split('/')[0]); }
-    else if (c === d) continue;
-    else if (c.startsWith(d + '/')) sousDossiers.add(c.slice(d.length + 1).split('/')[0]);
-  }
-  const produitsClasses = d === '' ? [] : db.prepare(`SELECT p.*, f.nom AS fichier_nom, f.dossier AS fichier_dossier
-    FROM produits p JOIN fichiers f ON f.id = p.fichier_id WHERE p.dossier = ? ORDER BY p.reference`).all(d).map(enrichir);
-  const supprimable = d !== '' && !produitsClasses.length && ![...sousDossiers].length;
-  res.json({ dossier: d, sous_dossiers: [...sousDossiers].sort(), produits_classes: produitsClasses, supprimable });
-});
-
-app.get('/api/fichier/:id/images', (req, res) => {
-  const pid = Number(req.query.pid) || 0;
-  const imgs = db.prepare(`SELECT i.id, i.ligne_ancrage, i.ambigue,
-      (SELECT GROUP_CONCAT(p.reference, ' · ') FROM produit_images pi JOIN produits p ON p.id = pi.produit_id WHERE pi.image_id = i.id) AS refs,
-      (SELECT COUNT(*) FROM produit_images WHERE image_id = i.id AND produit_id = :pid) AS associee_cible,
-      (SELECT principale FROM produit_images WHERE image_id = i.id AND produit_id = :pid) AS principale_cible
-    FROM images i WHERE i.fichier_id = :fid ORDER BY i.ligne_ancrage, i.id`).all({ pid, fid: req.params.id });
-  res.json(imgs);
-});
-
-app.post('/api/produits/:pid/images/:iid', (req, res) => {
-  if (!db.prepare('SELECT id FROM produits WHERE id=?').get(req.params.pid)) return res.status(404).json({ erreur: 'Fiche introuvable' });
-  if (!db.prepare('SELECT id FROM images WHERE id=?').get(req.params.iid)) return res.status(404).json({ erreur: 'Image introuvable' });
-  db.prepare('INSERT OR IGNORE INTO produit_images (produit_id, image_id) VALUES (?,?)').run(req.params.pid, req.params.iid);
-  db.prepare('UPDATE images SET ambigue=0 WHERE id=?').run(req.params.iid);
-  res.json({ ok: true, associee: true });
-});
-app.delete('/api/produits/:pid/images/:iid', (req, res) => {
-  db.prepare('DELETE FROM produit_images WHERE produit_id=? AND image_id=?').run(req.params.pid, req.params.iid);
-  res.json({ ok: true, associee: false });
-});
-
-app.patch('/api/images/:id', (req, res) => {
-  const img = db.prepare('SELECT id FROM images WHERE id=?').get(req.params.id);
-  if (!img) return res.status(404).json({ erreur: 'Image introuvable' });
-  const pid = req.body.produit_id == null ? null : Number(req.body.produit_id);
-  if (pid != null && !db.prepare('SELECT id FROM produits WHERE id=?').get(pid))
-    return res.status(404).json({ erreur: 'Fiche introuvable' });
-  db.prepare('UPDATE images SET produit_id=?, ambigue=0 WHERE id=?').run(pid, req.params.id);
-  res.json({ ok: true });
-});
-
-app.get('/api/fichier/:id/produits', (req, res) => {
-  const f = db.prepare('SELECT id, nom, dossier, type, mode, depose_le, statut FROM fichiers WHERE id=?').get(req.params.id);
-  if (!f) return res.status(404).json({ erreur: 'Fichier introuvable' });
-  const produits = db.prepare(`SELECT p.*, ? AS fichier_nom, ? AS fichier_dossier FROM produits p
-    WHERE p.fichier_id = ? ORDER BY p.ligne, p.id`).all(f.nom, f.dossier, f.id).map(enrichir);
-  res.json({ fichier: f, produits });
-});
-
-// ---------- LISTES DE SÉLECTION ----------
-app.post('/api/fichiers/:id/valider', (req, res) => {
-  db.prepare('UPDATE fichiers SET valide=1 WHERE id=?').run(req.params.id);
-  res.json({ ok: true });
-});
-
-app.get('/api/produits/:id/selections', (req, res) => {
-  res.json(db.prepare(`SELECT l.id, l.nom, (SELECT COUNT(*) FROM liste_items WHERE liste_id = l.id) AS nb
-    FROM listes l JOIN liste_items li ON li.liste_id = l.id
-    WHERE li.produit_id = ? AND l.enregistree = 1 ORDER BY l.nom`).all(req.params.id));
-});
-
-app.get('/api/produits/:id/commandes', (req, res) => {
-  const p = db.prepare('SELECT reference FROM produits WHERE id=?').get(req.params.id);
-  if (!p) return res.json([]);
-  const sorties = [];
-  for (const t of db.prepare('SELECT id, nom, resultat, dossier FROM tableaux WHERE resultat IS NOT NULL').all()) {
-    let r2 = null; try { r2 = JSON.parse(t.resultat); } catch {}
-    if (!r2 || !r2.parRef) continue;
-    const o = r2.parRef[p.reference] || Object.values(r2.parRef).find(x => x.refCatalogue === p.reference);
-    if (!o) continue;
-    const grille = o.grille || {};
-    const parPeriode = {};
-    for (const [cle, v] of Object.entries(grille)) {
-      const [theme] = cle.split('|');
-      parPeriode[theme] = parPeriode[theme] || { uvc: 0, colis: 0 };
-      parPeriode[theme].uvc += Number(v.uvc) || 0;
-      parPeriode[theme].colis += Number(v.colis) || 0;
-    }
-    const fobCom = Number(o.fob_com) || 0;
-    const ddp = Number(o.ddp) || 0;
-    const caTotal = ddp && o.final ? +(ddp * o.final).toFixed(2) : null;      // ce que U paie (DDP € × FINAL)
-    const achatTotal = fobCom && o.final ? +(fobCom * o.final).toFixed(2) : null; // coût d'achat usine (FOB USD × FINAL)
-    sorties.push({
-      tableau_id: t.id, tableau_nom: t.nom, dossier: t.dossier || null, etape: r2.etape || null,
-      commande: r2.etape && r2.etape !== 'partie1',
-      final: o.final ?? null, estim: o.estim ?? null,
-      fob_com: o.fob_com ?? null, ddp: o.ddp ?? null, promotion: o.promotion || null,
-      ca_total: caTotal, achat_total: achatTotal,
-      periodes: Object.entries(parPeriode).map(([theme, v]) => ({ theme, ...v })),
-    });
-  }
-  res.json(sorties);
-});
-
-app.post('/api/selection/basculer', (req, res) => {
-  const pid = Number(req.body.id);
-  if (!pid) return res.status(400).json({ erreur: 'id manquant' });
-  const atrier = db.prepare('SELECT id FROM listes WHERE systeme=1').get();
-  const deja = db.prepare('SELECT 1 FROM liste_items WHERE liste_id=? AND produit_id=?').get(atrier.id, pid);
-  if (deja) db.prepare('DELETE FROM liste_items WHERE liste_id=? AND produit_id=?').run(atrier.id, pid);
-  else db.prepare('INSERT INTO liste_items (liste_id, produit_id) VALUES (?,?)').run(atrier.id, pid);
-  res.json({ ok: true, en_selection: !deja });
-});
-
-app.post('/api/selection/enregistrer', (req, res) => {
-  const groupeId = Number(req.body.groupe_id);
-  const groupe = db.prepare('SELECT * FROM listes WHERE id=? AND systeme=0 AND enregistree=0').get(groupeId);
-  if (!groupe) return res.status(404).json({ erreur: 'Groupe de travail introuvable' });
-  let cible;
-  if (req.body.vers_id) {
-    cible = db.prepare('SELECT * FROM listes WHERE id=? AND enregistree=1').get(Number(req.body.vers_id));
-    if (!cible) return res.status(404).json({ erreur: 'Sélection cible introuvable' });
-  } else {
-    const nom = String(req.body.nouveau_nom || '').trim();
-    if (!nom) return res.status(400).json({ erreur: 'Nom de la nouvelle sélection manquant' });
-    const r = db.prepare('INSERT INTO listes (nom, enregistree) VALUES (?, 1)').run(nom);
-    cible = { id: r.lastInsertRowid, nom };
-  }
-  const items = db.prepare('SELECT produit_id FROM liste_items WHERE liste_id=?').all(groupeId);
-  const tx = db.transaction(() => {
-    const ins = db.prepare('INSERT OR IGNORE INTO liste_items (liste_id, produit_id) VALUES (?,?)');
-    for (const it of items) ins.run(cible.id, it.produit_id);
-    db.prepare('DELETE FROM liste_items WHERE liste_id=?').run(groupeId);
-    db.prepare('DELETE FROM listes WHERE id=?').run(groupeId);
-  });
-  tx();
-  res.json({ ok: true, selection: cible, transferes: items.length });
-});
-
-app.post('/api/selection/atrier', (req, res) => {
-  const ids = Array.isArray(req.body.ids) ? req.body.ids.map(Number).filter(Boolean) : [];
-  if (!ids.length) return res.status(400).json({ erreur: 'Aucune fiche' });
-  const atrier = db.prepare('SELECT id FROM listes WHERE systeme=1').get();
-  const ins = db.prepare('INSERT OR IGNORE INTO liste_items (liste_id, produit_id) VALUES (?,?)');
-  let n = 0;
-  for (const id of ids) n += ins.run(atrier.id, id).changes;
-  res.json({ ok: true, ajoutes: n, liste_id: atrier.id });
-});
-
-app.patch('/api/listes/deplacer-item', (req, res) => {
-  const { produit_id, de, vers } = req.body;
-  if (!produit_id || !vers) return res.status(400).json({ erreur: 'Paramètres manquants' });
-  if (!db.prepare('SELECT id FROM listes WHERE id=?').get(vers)) return res.status(404).json({ erreur: 'Groupe cible introuvable' });
-  const deja = db.prepare('SELECT 1 FROM liste_items WHERE liste_id=? AND produit_id=?').get(vers, produit_id);
-  if (deja) return res.json({ ok: true, deja: true });
-  const tx = db.transaction(() => {
-    if (de) db.prepare('DELETE FROM liste_items WHERE liste_id=? AND produit_id=?').run(de, produit_id);
-    db.prepare('INSERT INTO liste_items (liste_id, produit_id) VALUES (?,?)').run(vers, produit_id);
-  });
-  tx();
-  res.json({ ok: true });
-});
-
-app.post('/api/produits/:pid/images/:iid/principale', (req, res) => {
-  const assoc = db.prepare('SELECT 1 FROM produit_images WHERE produit_id=? AND image_id=?').get(req.params.pid, req.params.iid);
-  if (!assoc) return res.status(404).json({ erreur: 'Photo non associée à cette fiche' });
-  const tx = db.transaction(() => {
-    db.prepare('UPDATE produit_images SET principale=0 WHERE produit_id=?').run(req.params.pid);
-    db.prepare('UPDATE produit_images SET principale=1 WHERE produit_id=? AND image_id=?').run(req.params.pid, req.params.iid);
-  });
-  tx();
-  res.json({ ok: true });
-});
-
-app.get('/api/listes', (req, res) => {
-  let listes = db.prepare(`SELECT l.*, (SELECT COUNT(*) FROM liste_items WHERE liste_id = l.id) AS nb
-    FROM listes l ORDER BY l.id DESC`).all();
-  if (!listes.length) {
-    db.prepare('INSERT INTO listes (nom) VALUES (?)').run('Ma sélection');
-    listes = db.prepare(`SELECT l.*, 0 AS nb FROM listes l`).all();
-  }
-  res.json(listes);
-});
-app.post('/api/listes', (req, res) => {
-  const nom = String(req.body.nom || '').trim().slice(0, 80);
-  if (!nom) return res.status(400).json({ erreur: 'Nom vide' });
-  const r = db.prepare('INSERT INTO listes (nom, enregistree) VALUES (?,?)').run(nom, req.body.enregistree ? 1 : 0);
-  res.json({ id: r.lastInsertRowid, nom });
-});
-app.patch('/api/listes/:id', (req, res) => {
-  const nom = String(req.body.nom || '').trim().slice(0, 80);
-  if (!nom) return res.status(400).json({ erreur: 'Nom vide' });
-  const r = db.prepare('UPDATE listes SET nom=? WHERE id=?').run(nom, req.params.id);
-  if (!r.changes) return res.status(404).json({ erreur: 'Liste introuvable' });
-  res.json({ ok: true, nom });
-});
-app.delete('/api/listes/:id', (req, res) => {
-  const l = db.prepare('SELECT nom, (SELECT COUNT(*) FROM liste_items WHERE liste_id=listes.id) AS nb FROM listes WHERE id=?').get(req.params.id);
-  if (!l) return res.status(404).json({ erreur: 'Liste introuvable' });
-  db.prepare('DELETE FROM listes WHERE id=?').run(req.params.id); // items en cascade
-  res.json({ ok: true, nom: l.nom, items_supprimes: l.nb });
-});
-
-app.get('/api/listes/:id', (req, res) => {
-  const liste = db.prepare('SELECT * FROM listes WHERE id=?').get(req.params.id);
-  if (!liste) return res.status(404).json({ erreur: 'Liste introuvable' });
-  const items = db.prepare(`SELECT li.id AS item_id, li.ajoute_le, p.*, f.nom AS fichier_nom, f.dossier AS fichier_dossier
-    FROM liste_items li JOIN produits p ON p.id = li.produit_id JOIN fichiers f ON f.id = p.fichier_id
-    WHERE li.liste_id = ? ORDER BY li.id DESC`).all(liste.id).map(enrichir);
-  res.json({ liste, items });
-});
-app.post('/api/listes/:id/items', (req, res) => {
-  const pid = Number(req.body.produit_id);
-  if (!db.prepare('SELECT id FROM produits WHERE id=?').get(pid)) return res.status(404).json({ erreur: 'Produit introuvable' });
-  try {
-    db.prepare('INSERT INTO liste_items (liste_id, produit_id) VALUES (?,?)').run(req.params.id, pid);
-    res.json({ ok: true });
-  } catch (e) {
-    res.json({ ok: true, deja: true }); // déjà dans la liste : pas une erreur
-  }
-});
-app.delete('/api/listes/:id/items/:pid', (req, res) => {
-  db.prepare('DELETE FROM liste_items WHERE liste_id=? AND produit_id=?').run(req.params.id, req.params.pid);
-  res.json({ ok: true });
-});
-
-// ---------- DOUBLONS ----------
-function groupesDoublons() {
-  const refs = db.prepare(`SELECT reference, COUNT(*) n, GROUP_CONCAT(id) ids FROM produits
-    GROUP BY reference HAVING n > 1 ORDER BY reference`).all();
-  const groupes = [];
-  for (const r of refs) {
-    const signature = r.ids.split(',').map(Number).sort((a,b)=>a-b).join(',');
-    const valide = db.prepare('SELECT signature FROM doublons_valides WHERE reference=?').get(r.reference);
-    if (valide && valide.signature === signature) continue; // déjà tranché, rien de nouveau
-    const occurrences = db.prepare(`SELECT p.*, f.nom AS fichier_nom, f.dossier AS fichier_dossier, f.depose_le
-      FROM produits p JOIN fichiers f ON f.id = p.fichier_id WHERE p.reference = ? ORDER BY p.id`)
-      .all(r.reference).map(enrichir);
-    groupes.push({ reference: r.reference, signature, occurrences });
-  }
-  return groupes;
-}
-app.get('/api/doublons', (req, res) => res.json(groupesDoublons()));
-app.post('/api/doublons/garder-recents', (req, res) => {
-  // pour chaque réf en doublon entre fichiers : on ne garde que la plus récente
-  const groupes = db.prepare(`SELECT reference FROM produits GROUP BY reference HAVING COUNT(DISTINCT fichier_id) > 1`).all();
-  let resolues = 0, supprimees = 0;
-  for (const g of groupes) {
-    const fiches = db.prepare(`SELECT pr.id, pr.dossier, f.depose_le FROM produits pr JOIN fichiers f ON f.id=pr.fichier_id
-      WHERE pr.reference = ? ORDER BY f.depose_le DESC, pr.id DESC`).all(g.reference);
-    const [gardee, ...vieilles] = fiches;
-    if (!vieilles.length) continue;
-    const dossierHerite = !gardee.dossier ? (vieilles.find(v => v.dossier) || {}).dossier : null;
-    if (dossierHerite) db.prepare('UPDATE produits SET dossier=? WHERE id=?').run(dossierHerite, gardee.id);
-    for (const v of vieilles) { db.prepare('DELETE FROM produits WHERE id=?').run(v.id); supprimees++; }
-    resolues++;
-  }
-  res.json({ ok: true, resolues, supprimees });
-});
-app.post('/api/doublons/garder', (req, res) => {
-  const ref = String(req.body.reference || '');
-  const g = groupesDoublons().find(x => x.reference === ref);
-  if (!g) return res.status(404).json({ erreur: 'Groupe introuvable' });
-  db.prepare('INSERT OR REPLACE INTO doublons_valides (reference, signature) VALUES (?,?)').run(ref, g.signature);
-  res.json({ ok: true });
-});
-function relancerFichier(f, mode) {
-  const disque = (() => { try { return JSON.parse(f.rapport || '{}').disque; } catch { return null; } })();
-  if (!disque || !fs.existsSync(path.join(DATA_DIR, 'fichiers', disque))) return false;
-  const hashes = db.prepare('SELECT DISTINCT hash FROM images WHERE fichier_id=?').all(f.id).map(r => r.hash);
-  db.prepare('DELETE FROM images WHERE fichier_id=?').run(f.id);
-  db.prepare('DELETE FROM produits WHERE fichier_id=?').run(f.id);
-  for (const h of hashes) {
-    if (!db.prepare('SELECT 1 FROM images WHERE hash=? LIMIT 1').get(h)) {
-      for (const fchr of fs.readdirSync(path.join(DATA_DIR, 'images')))
-        if (fchr.startsWith(h)) { try { fs.unlinkSync(path.join(DATA_DIR, 'images', fchr)); } catch {} }
-    }
-  }
-  db.prepare("UPDATE fichiers SET mode=?, statut='en_attente', valide=0, rapport=? WHERE id=?")
-    .run(mode || f.mode || 'offre', JSON.stringify({ disque }), f.id);
-  return true;
-}
-app.post('/api/fichiers/:id/reclasser', async (req, res) => {
-  const f = db.prepare('SELECT * FROM fichiers WHERE id=?').get(req.params.id);
-  if (!f) return res.status(404).json({ erreur: 'Fichier introuvable' });
-  const mode = req.body.mode === 'interne' ? 'interne' : 'offre';
-  if (!relancerFichier(f, mode)) return res.status(409).json({ erreur: 'Copie source introuvable sur le disque' });
-  res.json({ ok: true, en_file: true });
-  setTimeout(pomperFile, 400);
-});
-
-app.delete('/api/fichiers/:id', (req, res) => {
-  const f = db.prepare('SELECT * FROM fichiers WHERE id=?').get(req.params.id);
-  if (f) { try { fs.unlinkSync(path.join(DATA_DIR, 'apercus', (f.hash || '') + '.html')); } catch {}
-    try { fs.unlinkSync(path.join(DATA_DIR, 'apercus', req.params.id + '.html')); } catch {} }
-  if (!f) return res.status(404).json({ erreur: 'Fichier introuvable' });
-  const nbProduits = db.prepare('SELECT COUNT(*) n FROM produits WHERE fichier_id=?').get(f.id).n;
-  const imgs = db.prepare('SELECT DISTINCT hash, chemin FROM images WHERE fichier_id=?').all(f.id);
-  db.prepare('DELETE FROM fichiers WHERE id=?').run(f.id); // cascade : produits, images, textes, liste_items
-  // fichiers physiques : original + images devenues orphelines (partage par hash)
-  const disque = JSON.parse(f.rapport || '{}').disque;
-  if (disque) { try { fs.unlinkSync(path.join(DATA_DIR, 'fichiers', disque)); } catch {} }
-  for (const im of imgs) {
-    const encore = db.prepare('SELECT COUNT(*) n FROM images WHERE hash=?').get(im.hash).n;
-    if (!encore) { try { fs.unlinkSync(path.join(DATA_DIR, 'images', im.chemin)); } catch {} }
-  }
-  res.json({ ok: true, nom: f.nom, produits_supprimes: nbProduits });
-});
-
-app.get('/api/fichiers/:id/resume', (req, res) => {
-  const f = db.prepare('SELECT id, nom FROM fichiers WHERE id=?').get(req.params.id);
-  if (!f) return res.status(404).json({ erreur: 'Fichier introuvable' });
-  res.json({
-    nom: f.nom,
-    produits: db.prepare('SELECT COUNT(*) n FROM produits WHERE fichier_id=?').get(f.id).n,
-    images: db.prepare('SELECT COUNT(*) n FROM images WHERE fichier_id=?').get(f.id).n,
-    en_listes: db.prepare(`SELECT COUNT(*) n FROM liste_items li JOIN produits p ON p.id=li.produit_id WHERE p.fichier_id=?`).get(f.id).n,
-  });
-});
-
-app.delete('/api/fichiers/:id', (req, res) => {
-  const f = db.prepare('SELECT id, nom, rapport FROM fichiers WHERE id=?').get(req.params.id);
-  if (!f) return res.status(404).json({ erreur: 'Fichier introuvable' });
-  const hashes = db.prepare('SELECT DISTINCT hash FROM images WHERE fichier_id=?').all(f.id).map(r => r.hash);
-  const disque = (() => { try { return JSON.parse(f.rapport || '{}').disque; } catch { return null; } })();
-  db.prepare('DELETE FROM fichiers WHERE id=?').run(f.id); // cascades : produits, images, textes, liste_items
-  // fichiers image orphelins sur le disque (le hash peut être partagé entre fichiers)
-  for (const h of hashes) {
-    const encore = db.prepare('SELECT chemin FROM images WHERE hash=? LIMIT 1').get(h);
-    if (!encore) {
-      const uneImg = db.prepare('SELECT 1').get; // no-op
-      // le chemin est <hash>.<ext> : on cherche le fichier correspondant
-      for (const fchr of fs.readdirSync(path.join(DATA_DIR, 'images'))) {
-        if (fchr.startsWith(h)) { try { fs.unlinkSync(path.join(DATA_DIR, 'images', fchr)); } catch {} }
-      }
-    }
-  }
-  if (disque) { try { fs.unlinkSync(path.join(DATA_DIR, 'fichiers', disque)); } catch {} }
-  res.json({ ok: true, nom: f.nom });
-});
-
-app.post('/api/produits/refuser', (req, res) => {
-  const ids = Array.isArray(req.body.ids) ? req.body.ids.map(Number).filter(Boolean) : [];
-  if (!ids.length) return res.status(400).json({ erreur: 'Aucune fiche à refuser' });
-  const marques = ids.map(() => '?').join(',');
-  const refs = db.prepare(`SELECT reference FROM produits WHERE id IN (${marques})`).all(...ids).map(r => r.reference);
-  db.prepare(`DELETE FROM produits WHERE id IN (${marques})`).run(...ids);
-  res.json({ ok: true, refusees: refs.length, references: refs });
-});
-
-app.delete('/api/produits/:id', (req, res) => {
-  const p = db.prepare('SELECT reference FROM produits WHERE id=?').get(req.params.id);
-  if (!p) return res.status(404).json({ erreur: 'Fiche introuvable' });
-  db.prepare('DELETE FROM produits WHERE id=?').run(req.params.id); // images -> produit_id NULL, listes -> cascade
-  res.json({ ok: true, reference: p.reference });
-});
-
-app.get('/apercu/:id', async (req, res) => {
-  const f = db.prepare('SELECT id, nom, type, rapport, hash FROM fichiers WHERE id=?').get(req.params.id);
-  if (!f) return res.status(404).send('Fichier introuvable');
-  const echap = (x) => String(x || '').replace(/&/g, '&amp;').replace(/</g, '&lt;');
-  if (f.type === 'msg') {
-    let disqueM = null; try { disqueM = JSON.parse(f.rapport || '{}').disque; } catch {}
-    if (!disqueM || !fs.existsSync(path.join(DATA_DIR, 'fichiers', disqueM))) return res.status(404).send('Copie source introuvable');
-    const bufM = fs.readFileSync(path.join(DATA_DIR, 'fichiers', disqueM));
-    let m = { corps: '', pieces: [] };
-    try { m = ex.lireMsg(bufM); } catch {}
-    const corps = m.corps || ex.texteMsg(bufM);
-    return res.type('html').send(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${echap(f.nom)}</title>
-<body style="font-family:system-ui,sans-serif;max-width:860px;margin:26px auto;padding:0 18px;color:#1c2742">
-<div style="background:#f2f5fb;border:1.5px solid #c6cede;border-radius:12px;padding:14px 18px;margin-bottom:16px">
-  <div style="font-weight:700;font-size:15px">✉ ${echap(f.nom)}</div>
-  ${m.pieces.length ? `<div style="font-size:12.5px;margin-top:6px">📎 ${m.pieces.length} pièce(s) jointe(s) : ${m.pieces.map(p => echap(p.nom)).join(', ')}</div>` : ''}
-</div>
-<pre style="white-space:pre-wrap;font-family:inherit;font-size:14px;line-height:1.55">${echap(corps)}</pre>`);
-  }
-  const convertibles = ['xls', 'xlsx', 'pptx', 'docx'];
-  const disquePdf = (() => { try { return JSON.parse(f.rapport || '{}').disque; } catch { return null; } })();
-  if (f.type === 'pdf') {
-    if (!disquePdf) return res.status(404).send('Copie source introuvable');
-    res.type('application/pdf');
-    res.setHeader('content-disposition', 'inline; filename="' + encodeURIComponent(f.nom) + '"');
-    return res.send(fs.readFileSync(path.join(DATA_DIR, 'fichiers', disquePdf)));
-  }
-  if (!convertibles.includes(f.type)) return res.type('html').send(`<!doctype html><meta charset="utf-8"><body style="font-family:system-ui,sans-serif;max-width:600px;margin:60px auto;text-align:center;color:#1c2742">
-    <h3>Pas d'aperçu pour ce format (.${echap(f.type)})</h3>
-    <p><a href="/fichier/${f.id}" style="display:inline-block;background:#ffd400;color:#1c2742;font-weight:700;padding:10px 22px;border-radius:10px;text-decoration:none">⬇ Télécharger « ${echap(f.nom)} »</a></p>`);
-  const cache = path.join(DATA_DIR, 'apercus', f.hash + '-v3.html');
-  if (fs.existsSync(cache)) return res.type('html').send(fs.readFileSync(cache, 'utf8'));
-  const disque = (() => { try { return JSON.parse(f.rapport || '{}').disque; } catch { return null; } })();
-  if (!disque) return res.status(404).send('Copie source introuvable');
-  if (f.type === 'pptx') {
-    return ex.apercuPptx(fs.readFileSync(path.join(DATA_DIR, 'fichiers', disque)), f.nom)
-      .then(h => { fs.writeFileSync(cache, h); res.type('html').send(h); })
-      .catch(e => res.status(500).send('Aperçu impossible : ' + e.message));
-  }
-  const html = await ex.genererApercuHtml(fs.readFileSync(path.join(DATA_DIR, 'fichiers', disque)), f.type);
-  if (!html) return res.status(503).send('Aperçu indisponible (LibreOffice absent du serveur)');
-  fs.writeFileSync(cache, html);
-  res.type('html').send(html);
-});
-
-app.get('/api/stats', (req, res) => {
-  res.json({
-    doublons: db.prepare(`SELECT COUNT(*) n FROM (SELECT reference FROM produits GROUP BY reference HAVING COUNT(*)>1)`).get().n
-      - db.prepare(`SELECT COUNT(*) n FROM doublons_valides dv WHERE dv.signature =
-          (SELECT GROUP_CONCAT(id) FROM (SELECT id FROM produits WHERE reference = dv.reference ORDER BY id))`).get().n,
-    fichiers: db.prepare('SELECT COUNT(*) n FROM fichiers').get().n,
-    produits: db.prepare('SELECT COUNT(*) n FROM produits').get().n,
-    references: db.prepare('SELECT COUNT(DISTINCT reference) n FROM produits').get().n,
-    images: db.prepare('SELECT COUNT(*) n FROM images').get().n,
-  });
-});
-
-// ---------- ESPACE TABLEAUX ----------
-const tb = require('./lib/tableau');
-
-function construireCatalogue() {
-  const fiches = db.prepare(`SELECT p.*, (SELECT i.id FROM produit_images pi JOIN images i ON i.id = pi.image_id
-      WHERE pi.produit_id = p.id ORDER BY pi.principale DESC, i.id LIMIT 1) AS image_id
-    FROM produits p ORDER BY p.id`).all();
-  const cat = {}, doublons = new Set();
-  for (const p of fiches) {
-    if (!p.reference) continue;
-    if (cat[p.reference]) { doublons.add(p.reference); continue; }
-    cat[p.reference] = {
-      code_douanier: p.code_hs_usine || '', description: p.description || '', kd: p.kd ? 'KD' : '',
-      taille_produit: p.taille_produit || '', pcb: p.pcb ? Number(p.pcb) || p.pcb : null,
-      colisage_cm: p.colisage_cm || '', volume_m3: p.volume_m3 || '', poids_nb: p.poids_nb || '',
-      fob_com: p.prix != null && p.prix !== '' && !isNaN(Number(p.prix)) ? Number(p.prix) : null,
-      port: p.port || '', fournisseur: p.fournisseur || '', produit_id: p.id, image_id: p.image_id || null, ean_fiche: p.ean || null };
-  }
-  // une fiche sans port récupère le port de l'ANNUAIRE de son usine (onglet Fournisseurs)
-  try {
-    const portsAnnuaire = {};
-    for (const u of db.prepare("SELECT nom_norm, port FROM usines WHERE port IS NOT NULL AND port<>''").all())
-      portsAnnuaire[u.nom_norm] = u.port;
-    const multiPorts = new Set();
-    const vus = {};
-    for (const c of Object.values(cat)) {
-      if (!c.port || !c.fournisseur) continue;
-      const k = normUsine(c.fournisseur), p = String(c.port).trim().toUpperCase();
-      (vus[k] ||= new Set()).add(p);
-      if (vus[k].size > 1) multiPorts.add(k);
-    }
-    for (const c of Object.values(cat)) {
-      if (c.port || !c.fournisseur) continue;
-      const k = normUsine(c.fournisseur);
-      c.port = portsAnnuaire[k] || '';
-      if (c.port && multiPorts.has(k)) c.port_ambigu = true; // repli appliqué mais l'usine a chargé depuis plusieurs ports
-    }
-  } catch {}
-  return { cat, doublons: [...doublons] };
-}
-
-function journal(tid, action, detail) {
-  const t = db.prepare('SELECT journal FROM tableaux WHERE id=?').get(tid);
-  let j = []; try { j = JSON.parse(t.journal); } catch {}
-  j.push({ quand: new Date().toISOString().slice(0, 16).replace('T', ' '), action, detail: detail || '' });
-  db.prepare('UPDATE tableaux SET journal=? WHERE id=?').run(JSON.stringify(j), tid);
-}
-
-// ---------- annuaire des usines ----------
-app.get('/api/usines', (req, res) => {
-  const usines = db.prepare('SELECT * FROM usines ORDER BY nom_affiche COLLATE NOCASE').all();
-  const comptes = {}, fichiersU = {}, portsObs = {};
-  for (const l of db.prepare("SELECT fournisseur, port, COUNT(*) n FROM produits WHERE port IS NOT NULL AND TRIM(port)<>'' GROUP BY fournisseur, port").all()) {
-    const k = normUsine(l.fournisseur);
-    ((portsObs[k] ||= {})[String(l.port).trim().toUpperCase()] = (portsObs[k][String(l.port).trim().toUpperCase()] || 0) + l.n);
-  }
-  for (const l of db.prepare("SELECT fournisseur, COUNT(*) n, GROUP_CONCAT(DISTINCT fichier_id) fids FROM produits WHERE fournisseur IS NOT NULL GROUP BY fournisseur").all()) {
-    const k = normUsine(l.fournisseur);
-    comptes[k] = (comptes[k] || 0) + l.n;
-    (fichiersU[k] ||= new Set());
-    for (const fid of String(l.fids || '').split(',')) if (fid) fichiersU[k].add(Number(fid));
-  }
-  const nomsF = {};
-  for (const f of db.prepare('SELECT id, nom FROM fichiers').all()) nomsF[f.id] = f.nom;
-  res.json(usines.map(u => ({ ...u, nb_refs: comptes[u.nom_norm] || 0,
-    ports_observes: Object.entries(portsObs[u.nom_norm] || {}).sort((a, b) => b[1] - a[1]).map(([p, n]) => ({ port: p, n })),
-    fichiers: [...(fichiersU[u.nom_norm] || [])].map(id => ({ id, nom: nomsF[id] })).filter(x => x.nom) })));
-});
-app.patch('/api/usines/:id', (req, res) => {
-  const u = db.prepare('SELECT * FROM usines WHERE id=?').get(req.params.id);
-  if (!u) return res.status(404).json({ erreur: 'Usine inconnue' });
-  const CHAMPS = ['nom_affiche', 'port', 'adresse', 'contact', 'telephone', 'email', 'messagerie', 'site', 'conditions', 'notes'];
-  const sets = [], vals = { id: u.id };
-  for (const c of CHAMPS) if (c in req.body) { sets.push(`${c}=@${c}`); vals[c] = String(req.body[c] ?? '').trim() || null; }
-  if (!sets.length) return res.json(u);
-  db.prepare(`UPDATE usines SET ${sets.join(', ')}, modifie_le=datetime('now','localtime') WHERE id=@id`).run(vals);
-  res.json(db.prepare('SELECT * FROM usines WHERE id=?').get(u.id));
-});
-app.post('/api/usines/nettoyer', (req, res) => {
-  const comptes = {};
-  for (const l of db.prepare("SELECT fournisseur, COUNT(*) n FROM produits WHERE fournisseur IS NOT NULL GROUP BY fournisseur").all())
-    comptes[normUsine(l.fournisseur)] = (comptes[normUsine(l.fournisseur)] || 0) + l.n;
-  const orphelines = db.prepare('SELECT id, nom_affiche, nom_norm FROM usines').all().filter(u => !comptes[u.nom_norm]);
-  for (const u of orphelines) db.prepare('DELETE FROM usines WHERE id=?').run(u.id);
-  res.json({ retirees: orphelines.length, noms: orphelines.map(u => u.nom_affiche) });
-});
-
-app.post('/api/usines/:id/fusionner', (req, res) => {
-  const a = db.prepare('SELECT * FROM usines WHERE id=?').get(req.params.id);
-  const b = db.prepare('SELECT * FROM usines WHERE id=?').get(req.body.cible_id);
-  if (!a || !b || a.id === b.id) return res.status(400).json({ erreur: 'Usines invalides' });
-  const prods = db.prepare('SELECT id, fournisseur FROM produits WHERE fournisseur IS NOT NULL').all()
-    .filter(p => normUsine(p.fournisseur) === a.nom_norm);
-  const tx = db.transaction(() => {
-    const maj = db.prepare('UPDATE produits SET fournisseur=? WHERE id=?');
-    for (const p of prods) maj.run(b.nom_affiche, p.id);
-    // les infos de l'absorbée comblent les vides de la cible
-    for (const c of ['port', 'adresse', 'contact', 'telephone', 'email', 'messagerie', 'site', 'conditions', 'notes'])
-      if (!String(b[c] || '').trim() && String(a[c] || '').trim())
-        db.prepare(`UPDATE usines SET ${c}=? WHERE id=?`).run(a[c], b.id);
-    db.prepare('DELETE FROM usines WHERE id=?').run(a.id);
-  });
-  tx();
-  res.json({ ok: true, refs_deplacees: prods.length, cible: db.prepare('SELECT * FROM usines WHERE id=?').get(b.id) });
-});
-
-// morceaux de texte pertinents d'un fichier : début + fin de chaque feuille + toute ligne "candidate" où qu'elle soit
-function morceauxPourUsine(buffer) {
-  const morceaux = [];
-  const candidate = l => /@|www\.|http|tel|mob|phone|fax|add\b|address|wechat|whatsapp|contact|attn|邮|电话|地址/i.test(l);
-  try {
-    for (const f of ex.lireCellules(buffer)) {
-      const lignes = f.lignes.map(v => v.filter(x => x !== '' && x != null).join(' | ')).filter(l => l.trim());
-      const debut = lignes.slice(0, 14), fin = lignes.slice(-10);
-      const ailleurs = lignes.length > 24 ? lignes.slice(14, -10).filter(candidate).slice(0, 20) : [];
-      morceaux.push(`[feuille ${f.nom}]\n` + [...debut, ...ailleurs, ...fin].join('\n').slice(0, 3200));
-    }
-  } catch {}
-  return morceaux.slice(0, 6);
-}
-app.post('/api/usines/:id/enrichir', async (req, res) => {
-  try {
-    const u = db.prepare('SELECT * FROM usines WHERE id=?').get(req.params.id);
-    if (!u) return res.status(404).json({ erreur: 'Usine inconnue' });
-    const fids = [...new Set(db.prepare('SELECT fichier_id, fournisseur FROM produits WHERE fournisseur IS NOT NULL').all()
-      .filter(p => normUsine(p.fournisseur) === u.nom_norm).map(p => p.fichier_id))].slice(-5);
-    if (!fids.length) return res.status(400).json({ erreur: 'Aucun fichier lié à cette usine.' });
-    const morceaux = [];
-    for (const fid of fids) {
-      const f = db.prepare('SELECT * FROM fichiers WHERE id=?').get(fid);
-      if (!f) continue;
-      let disque = null; try { disque = JSON.parse(f.rapport || '{}').disque; } catch {}
-      if (!disque || !fs.existsSync(path.join(DATA_DIR, 'fichiers', disque))) continue;
-      const buf = fs.readFileSync(path.join(DATA_DIR, 'fichiers', disque));
-      if (['xls', 'xlsx'].includes(f.type)) morceaux.push(...morceauxPourUsine(buf).map(m => `=== ${f.nom} ===\n${m}`));
-      else if (f.type === 'pptx') { try { const sl = await ex.textePptxParSlides(buf); morceaux.push(`=== ${f.nom} ===\n` + sl.slice(0, 2).concat(sl.slice(-1)).map(x => x.texte).join('\n').slice(0, 2500)); } catch {} }
-      else if (f.type === 'msg') { try { morceaux.push(`=== ${f.nom} ===\n` + String(ex.texteMsg(buf)).slice(0, 2500)); } catch {} }
-    }
-    if (!morceaux.length) return res.status(400).json({ erreur: 'Fichiers sources introuvables sur le disque.' });
-    const infos = await ia.extraireInfosUsine(u.nom_affiche, morceaux);
-    if (infos.erreur) return res.status(502).json({ erreur: infos.erreur });
-    // on ne remplit que les cases vides : jamais d'écrasement d'une saisie manuelle
-    const CHAMPS = ['adresse', 'contact', 'telephone', 'email', 'messagerie', 'site', 'port', 'conditions'];
-    const sets = [], vals = { id: u.id };
-    for (const c of CHAMPS) {
-      const v = String(infos[c] ?? '').trim();
-      if (v && !String(u[c] || '').trim()) { sets.push(`${c}=@${c}`); vals[c] = v; }
-    }
-    db.prepare(`UPDATE usines SET ${sets.length ? sets.join(', ') + ',' : ''} enrichie_le=datetime('now','localtime') WHERE id=@id`).run(vals);
-    res.json({ ok: true, remplis: sets.map(x => x.split('=')[0]), usine: db.prepare('SELECT * FROM usines WHERE id=?').get(u.id) });
-  } catch (e) { res.status(500).json({ erreur: e.message || String(e) }); }
-});
-app.post('/api/usines/enrichir-lot', async (req, res) => {
-  try {
-    const aFaire = db.prepare("SELECT id FROM usines WHERE enrichie_le IS NULL ORDER BY id").all().slice(0, 10);
-    let faites = 0;
-    for (const u of aFaire) {
-      const rep = await fetch(`http://127.0.0.1:${PORT}/api/usines/${u.id}/enrichir`, { method: 'POST' });
-      if (rep.ok) faites++;
-      else db.prepare("UPDATE usines SET enrichie_le=datetime('now','localtime') WHERE id=?").run(u.id);
-    }
-    const restantes = db.prepare('SELECT COUNT(*) n FROM usines WHERE enrichie_le IS NULL').get().n;
-    res.json({ faites, restantes });
-  } catch (e) { res.status(500).json({ erreur: e.message || String(e) }); }
-});
-
-async function genererModele(t) {
-  let sources = [], ajust = {};
-  try { sources = JSON.parse(t.sources); } catch {}
-  try { ajust = JSON.parse(t.ajustements || '{}'); } catch {}
-  const selections = [], commandes = [];
-  for (const src of sources) {
-    const buf = fs.readFileSync(path.join(DATA_DIR, 'tableaux', src.disque));
-    if (src.role === 'selection') selections.push(tb.lireSelectionU(buf));
-    else if (src.role === 'commande') commandes.push(await tb.lireCommandePdf(buf));
-  }
-  if (!selections.length) throw new Error('Aucune sélection U dans les pièces du tableau.');
-  // le tableau est un document HISTORIQUE : les fiches déjà entrées gardent leurs valeurs d'origine,
-  // seules les références nouvelles piochent dans la base vivante
-  let figeAvant = {}; try { figeAvant = (JSON.parse(t.resultat || 'null') || {}).catalogue_fige || {}; } catch {}
-  const { cat: catVivant, doublons } = construireCatalogue();
-  // fusion fine : une valeur HISTORIQUE non vide prime, mais un champ resté VIDE au figeage
-  // se comble depuis la base vivante (fiche complétée depuis -> le tableau se complète et se réarrange)
-  const cat = { ...catVivant };
-  // rapprochements manuels du tableau : la réf de la commande utilise les données d'une fiche
-  // qui existe sous une autre écriture — sans jamais toucher la fiche elle-même
-  let ajustTot = {}; try { ajustTot = JSON.parse(t.ajustements || 'null') || {}; } catch {}
-  const infosRapproch = [];
-  for (const [refCmd, refFiche] of Object.entries(ajustTot.rapprochements || {})) {
-    if (catVivant[refFiche] && !catVivant[refCmd]) {
-      cat[refCmd] = { ...catVivant[refFiche] };
-      infosRapproch.push(`ℹ ${refCmd} : données de la fiche « ${refFiche} » (rapprochement manuel — la fiche garde sa référence).`);
-    }
-  }
-  for (const [refF, fige] of Object.entries(figeAvant)) {
-    const fusion = { ...(catVivant[refF] || {}) };
-    for (const [k, v] of Object.entries(fige))
-      if (v != null && String(v).trim() !== '') fusion[k] = v;
-    cat[refF] = fusion;
-  }
-  const modele = tb.assemblerTableau({ selections, commandes, catalogue: cat });
-  for (const s2 of selections) modele.avertissements.unshift(...(s2.avertissements || []));
-  for (const c2 of commandes) modele.avertissements.unshift(...(c2.avertissements || []));
-  modele.avertissements.push(...infosRapproch);
-  // ajustements issus des mises à jour traitées (survivent aux régénérations)
-  modele.annulees = modele.annulees || [];
-  for (const ref of ajust.retirees || []) {
-    if (modele.parRef[ref]) {
-      modele.annulees.push({ ...modele.parRef[ref], annulee: 1 });
-      delete modele.parRef[ref];
-      for (const g of modele.groupes) g.produits = g.produits.filter(p => p.reference !== ref);
-      modele.avertissements.push(`ℹ ${ref} : annulée — déplacée dans la feuille CANCELLED ITEMS.`);
-    }
-  }
-  modele.groupes = modele.groupes.filter(g => g.produits.length);
-  for (const aj of ajust.ajoutees || []) {
-    const ref = aj.ref || aj;
-    if (modele.parRef[ref]) continue;
-    const c = cat[ref];
-    const o = { reference: ref, final: null, grille: {}, catalogueU: false, ean: c?.ean_fiche || null,
-      pcb: c?.pcb || null, pa_net: null, horsSelection: false, refCatalogue: c ? ref : null,
-      ajoutee: true, code_douanier: c?.code_douanier || '', description: c?.description || '',
-      kd: c?.kd || '', product_size: c?.taille_produit || '', pcb_cat: c?.pcb || null, packing: c?.colisage_cm || '',
-      volume: c?.volume_m3 || '', nwgw: c?.poids_nb || '', fob_net: '', fob_com: c?.fob_com ?? '',
-      taxe: '', port: c?.port || '', fournisseur: c?.fournisseur || 'FOURNISSEUR ?' };
-    if (!c) modele.avertissements.push(`${ref} : ajoutée par mise à jour mais fiche introuvable en base — colonnes usine vides.`);
-    if (c) { o.produit_id = c.produit_id; o.image_id = c.image_id; }
-    modele.parRef[ref] = o;
-    let g = modele.groupes.find(x => x.fournisseur === o.fournisseur);
-    if (!g) { g = { fournisseur: o.fournisseur, produits: [] }; modele.groupes.push(g); }
-    g.produits.push(o);
-  }
-  // modifications ciblées issues des mises à jour : appliquées par-dessus, cellules marquées en jaune
-  const CHAMPS_MODIFIABLES = ['description', 'code_douanier', 'kd', 'product_size', 'pcb_cat', 'packing', 'volume', 'nwgw', 'fob_net', 'fob_com', 'ddp', 'taxe', 'port', 'promotion', 'final', 'sav'];
-  for (const m of ajust.modifs || []) {
-    const o = modele.parRef[m.ref] || Object.values(modele.parRef).find(x => x.refCatalogue === m.ref);
-    if (!o || !CHAMPS_MODIFIABLES.includes(m.champ)) continue;
-    o[m.champ] = m.valeur;
-    (o.jaunes ||= []).push(m.champ);
-  }
-  const refsTableau = new Set(Object.keys(modele.parRef));
-  for (const d of doublons) if (refsTableau.has(d))
-    modele.avertissements.push(`${d} : plusieurs fiches portent cette référence en base — la première a été utilisée ; départage (✎) recommandé.`);
-  let eansEcrits = 0;
-  for (const o of Object.values(modele.parRef)) {
-    if (o.ean && o.refCatalogue) {
-      const fiche = cat[o.refCatalogue];
-      if (fiche && !fiche.ean_fiche) {
-        db.prepare("UPDATE produits SET ean=? WHERE id=? AND (ean IS NULL OR ean='')").run(String(o.ean), fiche.produit_id);
-        eansEcrits++;
-      }
-      if (fiche) { o.produit_id = fiche.produit_id; o.image_id = fiche.image_id; }
-    }
-  }
-  const ambigues = Object.values(modele.parRef).filter(o => o.port_ambigu).map(o => `${o.reference} (${o.port})`);
-  if (ambigues.length) modele.avertissements.push(`Port par défaut de l'usine appliqué à ${ambigues.length} référence(s) alors que cette usine a déjà chargé depuis PLUSIEURS ports — à vérifier : ${ambigues.slice(0, 10).join(', ')}${ambigues.length > 10 ? '…' : ''}`);
-  const sansPort = Object.values(modele.parRef).filter(o => !o.port && o.refCatalogue).map(o => o.reference);
-  if (sansPort.length) modele.avertissements.push(`${sansPort.length} référence(s) sans port malgré leurs fiches (à compléter via ✎ pour un rangement par port complet) : ${sansPort.slice(0, 12).join(', ')}${sansPort.length > 12 ? '…' : ''}`);
-  modele.notes = ajust.notes || [];
-  modele.etape = modele.periodes.length ? 'complet' : 'partie1';
-  const REQUIS_TAB = { description: 'description', product_size: 'dimensions', pcb_cat: 'PCB', packing: 'colisage', volume: 'volume', nwgw: 'poids', fob_com: 'prix FOB', port: 'port' };
-  modele.completude = { sans_fiche: [], incompletes: [] };
-  for (const o of Object.values(modele.parRef)) {
-    if (!o.refCatalogue) {
-      const dans = db.prepare("SELECT DISTINCT f.nom FROM textes t2 JOIN fichiers f ON f.id=t2.fichier_id WHERE t2.contenu LIKE ?").all('%' + o.reference + '%').map(x => x.nom);
-      modele.completude.sans_fiche.push({ ref: o.reference, dans_fichiers: dans });
-      continue;
-    }
-    const manques = Object.entries(REQUIS_TAB).filter(([c]) => o[c] == null || String(o[c]).trim() === '').map(([, l]) => l);
-    if (!(cat[o.refCatalogue] || {}).image_id) manques.push('photo');
-    if (manques.length) modele.completude.incompletes.push({ ref: o.reference, manques });
-  }
-  const fige = {};
-  for (const o of Object.values(modele.parRef)) if (o.refCatalogue && cat[o.refCatalogue]) fige[o.refCatalogue] = cat[o.refCatalogue];
-  modele.catalogue_fige = fige;
-  return { ...modele, eans_ecrits: eansEcrits, genere_le: new Date().toISOString().slice(0, 16).replace('T', ' ') };
-}
-
-app.get('/api/tableaux', (req, res) => {
-  res.json(db.prepare('SELECT * FROM tableaux ORDER BY modifie_le DESC').all().map(t => {
-    let sources = [], resultat = null;
-    try { sources = JSON.parse(t.sources); } catch {}
-    try { resultat = JSON.parse(t.resultat || 'null'); } catch {}
-    return { id: t.id, nom: t.nom, type: t.type, genre: t.genre || 'selection', dossier: t.dossier || null, statut: t.statut, cree_le: t.cree_le, modifie_le: t.modifie_le,
-      nb_sources: sources.length, nb_refs: resultat ? Object.keys(resultat.parRef || {}).length : 0 };
-  }));
-});
-
-app.post('/api/tableaux', (req, res) => {
-  const nom = String(req.body.nom || '').trim().slice(0, 120);
-  const type = ['retour_selection', 'offre', 'suivi'].includes(req.body.type) ? req.body.type : 'retour_selection';
-  if (!nom) return res.status(400).json({ erreur: 'Nom manquant' });
-  if (type === 'suivi') return res.status(400).json({ erreur: 'Les tableaux de suivi arrivent bientôt.' });
-  const genre = type === 'offre' ? 'offre' : 'selection';
-  const selectionId = Number(req.body.selection_id) || null;
-  let selections = Array.isArray(req.body.selections) ? req.body.selections
-    .map(x => ({ liste_id: Number(x.liste_id) || 0, circuit: x.circuit === 'fob' ? 'fob' : 'ddp' }))
-    .filter(x => x.liste_id) : [];
-  if (!selections.length && selectionId) selections = [{ liste_id: selectionId, circuit: 'ddp' }];
-  for (const x of selections) if (!db.prepare('SELECT 1 FROM listes WHERE id=? AND enregistree=1').get(x.liste_id))
-    return res.status(400).json({ erreur: 'Sélection enregistrée introuvable (id ' + x.liste_id + ').' });
-  const r = db.prepare('INSERT INTO tableaux (nom, type, genre, selection_id, selections_json) VALUES (?,?,?,?,?)')
-    .run(nom, type, genre, selections[0]?.liste_id || null, selections.length ? JSON.stringify(selections) : null);
-  res.json(db.prepare('SELECT * FROM tableaux WHERE id=?').get(r.lastInsertRowid));
-});
-
-app.get('/api/tableaux/:id', (req, res) => {
-  const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(req.params.id);
-  if (!t) return res.status(404).json({ erreur: 'Tableau introuvable' });
-  try { // les propositions de codes gagnent leur lien fiche à la lecture (même les anciennes)
-    const props = JSON.parse(t.codes_proposes || 'null');
-    if (Array.isArray(props) && props.some(p => !p.produit_id)) {
-      for (const p of props) if (!p.produit_id) p.produit_id = (db.prepare('SELECT id FROM produits WHERE reference=? ORDER BY id DESC').get(p.ref) || {}).id || null;
-      t.codes_proposes = JSON.stringify(props);
-    }
-  } catch {}
-  let sources = [], resultat = null;
-  try { sources = JSON.parse(t.sources); } catch {}
-  try { resultat = JSON.parse(t.resultat || 'null'); } catch {}
-  const sessionSheet = db.prepare("SELECT id, url FROM sheets_sessions WHERE genre=? AND ref_id=? AND expire_le > datetime('now','localtime')").get(t.genre === 'offre' ? 'offre' : 'tableau', t.id) || null;
-  let selectionLiee = null;
-  if (t.selection_id) {
-    const l = db.prepare('SELECT id, nom, (SELECT COUNT(*) FROM liste_items WHERE liste_id=listes.id) AS nb FROM listes WHERE id=?').get(t.selection_id);
-    if (l) selectionLiee = l;
-  }
-  let selectionsListe = [];
-  try { selectionsListe = JSON.parse(t.selections_json || 'null') || []; } catch {}
-  if (!selectionsListe.length) { // rétro-compat : anciennes offres
-    if (t.selection_id) selectionsListe.push({ liste_id: t.selection_id, circuit: 'ddp' });
-    if (t.selection_fob_id) selectionsListe.push({ liste_id: t.selection_fob_id, circuit: 'fob' });
-  }
-  const selectionsLiees = selectionsListe.map(x => {
-    const l = db.prepare('SELECT id, nom, (SELECT COUNT(*) FROM liste_items WHERE liste_id=listes.id) AS nb FROM listes WHERE id=?').get(x.liste_id);
-    return l ? { ...l, circuit: x.circuit } : null;
-  }).filter(Boolean);
-  let offreNouvelles = 0;
-  if (t.genre === 'offre' && resultat && resultat.type === 'offre') {
-    const presentes = new Set(resultat.lignes.map(l => l.reference));
-    const vues = new Set();
-    for (const x of selectionsListe) for (const p of db.prepare('SELECT p.reference FROM liste_items li JOIN produits p ON p.id=li.produit_id WHERE li.liste_id=?').all(x.liste_id)) {
-      if (!presentes.has(p.reference) && !vues.has(p.reference)) { offreNouvelles++; vues.add(p.reference); }
-    }
-  }
-  res.json({ ...t, sources, resultat, sheet: sessionSheet, selection_liee: selectionLiee, selections_liees: selectionsLiees, offre_nouvelles: offreNouvelles });
-});
-
-app.patch('/api/tableaux/:id', (req, res) => {
-  const nom = String(req.body.nom || '').trim().slice(0, 120);
-  if (!nom) return res.status(400).json({ erreur: 'Nom manquant' });
-  db.prepare("UPDATE tableaux SET nom=?, modifie_le=datetime('now','localtime') WHERE id=?").run(nom, req.params.id);
-  res.json({ ok: true });
-});
-
-app.delete('/api/tableaux/:id', (req, res) => {
-  const t = db.prepare('SELECT sources FROM tableaux WHERE id=?').get(req.params.id);
-  if (t) { try { for (const s of JSON.parse(t.sources)) fs.unlinkSync(path.join(DATA_DIR, 'tableaux', s.disque)); } catch {} }
-  db.prepare('DELETE FROM tableaux WHERE id=?').run(req.params.id);
-  res.json({ ok: true });
-});
-
-app.post('/api/tableaux/:id/sources', upload.array('fichiers', 10), (req, res) => {
-  const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(req.params.id);
-  if (!t) return res.status(404).json({ erreur: 'Tableau introuvable' });
-  const role = ['commande', 'maj', 'selection', 'modele'].includes(req.body.role) ? req.body.role : 'selection';
-  let sources = []; try { sources = JSON.parse(t.sources); } catch {}
-  const infos = [];
-  for (const f of req.files || []) {
-    const hash = ex.md5(f.buffer);
-    if (sources.some(s => s.hash === hash)) { infos.push(`${f.originalname} : déjà déposé dans ce tableau — ignoré.`); continue; }
-    const type = (f.originalname.split('.').pop() || '').toLowerCase();
-    if (role === 'commande' && type !== 'pdf') { infos.push(`${f.originalname} : une commande doit être un PDF — ignoré.`); continue; }
-    if (role === 'selection' && !['xls', 'xlsx'].includes(type)) { infos.push(`${f.originalname} : une sélection doit être un Excel — ignoré.`); continue; }
-    if (role === 'modele' && !['xls', 'xlsx', 'xlsm'].includes(type)) { infos.push(`${f.originalname} : le modèle U doit être un Excel — ignoré.`); continue; }
-    if (role === 'maj' && !['xls', 'xlsx', 'msg', 'txt', 'pdf', 'eml'].includes(type)) { infos.push(`${f.originalname} : format de mise à jour non lu (xls, msg, txt, pdf) — ignoré.`); continue; }
-    const disque = `t${t.id}_${Date.now()}_${f.originalname.replace(/[^\w.\-]+/g, '_')}`;
-    fs.writeFileSync(path.join(DATA_DIR, 'tableaux', disque), f.buffer);
-    sources.push({ role, nom: f.originalname, disque, hash, taille: f.buffer.length,
-      ajoute_le: new Date().toISOString().slice(0, 16).replace('T', ' ') });
-  }
-  db.prepare("UPDATE tableaux SET sources=?, modifie_le=datetime('now','localtime') WHERE id=?").run(JSON.stringify(sources), t.id);
-  for (const f of req.files || []) journal(t.id, 'pièce ajoutée', `${role} : ${f.originalname}`);
-  res.json({ ok: true, sources, infos });
-});
-
-app.delete('/api/tableaux/:id/sources/:hash', (req, res) => {
-  const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(req.params.id);
-  if (!t) return res.status(404).json({ erreur: 'Tableau introuvable' });
-  let sources = []; try { sources = JSON.parse(t.sources); } catch {}
-  const src = sources.find(s => s.hash === req.params.hash);
-  if (src) { try { fs.unlinkSync(path.join(DATA_DIR, 'tableaux', src.disque)); } catch {} }
-  sources = sources.filter(s => s.hash !== req.params.hash);
-  db.prepare("UPDATE tableaux SET sources=?, modifie_le=datetime('now','localtime') WHERE id=?").run(JSON.stringify(sources), t.id);
-  res.json({ ok: true, sources });
-});
-
-app.post('/api/tableaux/:id/generer', async (req, res) => {
-  const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(req.params.id);
-  if (!t) return res.status(404).json({ erreur: 'Tableau introuvable' });
-  let sources = []; try { sources = JSON.parse(t.sources); } catch {}
-  if (!sources.some(s => s.role === 'selection')) return res.status(400).json({ erreur: 'Dépose au moins une sélection U.' });
-  try {
-    db.prepare('UPDATE tableaux SET finalise=0 WHERE id=?').run(t.id);
-    for (const sh of db.prepare("SELECT * FROM sheets_sessions WHERE genre='apercu-tableau' AND ref_id=?").all(t.id)) {
-      db.prepare('DELETE FROM sheets_sessions WHERE id=?').run(sh.id);
-      goog.supprimer(sh.file_id).catch(() => {});
-    }
-    const resultat = await genererModele(t);
-    db.prepare("UPDATE tableaux SET resultat=?, statut='genere', modifie_le=datetime('now','localtime') WHERE id=?")
-      .run(JSON.stringify(resultat), t.id);
-    journal(t.id, 'génération', `${Object.keys(resultat.parRef).length} références · ${resultat.etape === 'partie1' ? 'partie 1 (sélection seule)' : resultat.periodes.length + ' périodes'}`);
-    res.json({ ok: true, resultat });
-  } catch (e) {
-    res.status(500).json({ erreur: 'Génération impossible : ' + (e.message || e) });
-  }
-});
-
-// mise à jour en langage libre (texte collé ou pièce déposée) -> IA -> ajustements + régénération
-app.post('/api/tableaux/:id/rapprocher', (req, res) => {
-  try {
-    const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(req.params.id);
-    if (!t) return res.status(404).json({ erreur: 'Tableau introuvable' });
-    const refFiche = String(req.body.ref_fiche || '').trim();
-    const refCible = String(req.body.ref_cible || '').trim();
-    if (!refFiche || !refCible) return res.status(400).json({ erreur: 'ref_fiche et ref_cible requis' });
-    if (!db.prepare('SELECT 1 FROM produits WHERE reference=?').get(refFiche))
-      return res.status(404).json({ erreur: `Aucune fiche « ${refFiche} » en base (référence exacte requise).` });
-    let ajust = {}; try { ajust = JSON.parse(t.ajustements || 'null') || {}; } catch {}
-    ajust.rapprochements = ajust.rapprochements || {};
-    ajust.rapprochements[refCible] = refFiche;
-    db.prepare('UPDATE tableaux SET ajustements=? WHERE id=?').run(JSON.stringify(ajust), t.id);
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ erreur: e.message || String(e) }); }
-});
-const offreU = require('./lib/offre');
-function produitsDeListe(listeId) {
-  return db.prepare(`SELECT p.*, (SELECT i.id FROM produit_images pi JOIN images i ON i.id=pi.image_id
-      WHERE pi.produit_id=p.id ORDER BY pi.principale DESC, i.id LIMIT 1) AS image_id
-    FROM liste_items li JOIN produits p ON p.id=li.produit_id WHERE li.liste_id=? ORDER BY p.fournisseur, p.reference`).all(listeId);
-}
-app.get('/api/tableaux/:id/mapping', (req, res) => {
-  const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(req.params.id);
-  if (!t || !t.cartographie) return res.status(400).json({ erreur: 'Cartographie d\u2019abord.' });
-  const carto = JSON.parse(t.cartographie);
-  res.json({ mapping: carto.mapping || offreU.proposerMapping(carto), valide: !!carto.mapping_valide });
-});
-app.post('/api/tableaux/:id/mapping/valider', (req, res) => {
-  try {
-    const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(req.params.id);
-    if (!t || !t.cartographie) return res.status(400).json({ erreur: 'Cartographie d\u2019abord.' });
-    const carto = JSON.parse(t.cartographie);
-    const recu = Array.isArray(req.body.mapping) ? req.body.mapping : [];
-    const base = offreU.proposerMapping(carto);
-    carto.mapping = base.map(b => {
-      const e = recu.find(x => x.champ === b.champ);
-      return e ? { ...b, actif: !!e.actif, cols: (Array.isArray(e.cols) ? e.cols : b.cols).map(Number).filter(Boolean) } : b;
-    });
-    if (Number(req.body.ligne_debut) >= 2) carto.ligne_debut = Number(req.body.ligne_debut);
-    carto.mapping_valide = true;
-    db.prepare("UPDATE tableaux SET cartographie=?, modifie_le=datetime('now','localtime') WHERE id=?").run(JSON.stringify(carto), t.id);
-    journal(t.id, 'écriture validée', carto.mapping.filter(m => m.actif).length + ' information(s) de fiche autorisée(s) à l\u2019écriture');
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ erreur: e.message || String(e) }); }
-});
-app.post('/api/tableaux/:id/generer-offre', (req, res) => {
-  try {
-    const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(req.params.id);
-    if (!t || t.genre !== 'offre') return res.status(404).json({ erreur: 'Offre introuvable' });
-    let carto = null; try { carto = JSON.parse(t.cartographie || 'null'); } catch {}
-    if (!carto || !carto.mapping_valide) return res.status(400).json({ erreur: 'Valide d\u2019abord les colonnes d\u2019écriture (étape 2).' });
-    let sels = []; try { sels = JSON.parse(t.selections_json || 'null') || []; } catch {}
-    if (!sels.length) { if (t.selection_id) sels.push({ liste_id: t.selection_id, circuit: 'ddp' }); if (t.selection_fob_id) sels.push({ liste_id: t.selection_fob_id, circuit: 'fob' }); }
-    if (!sels.length) return res.status(400).json({ erreur: 'Aucune sélection liée à cette offre.' });
-    let ajust = {}; try { ajust = JSON.parse(t.ajustements || 'null') || {}; } catch {}
-    const produits = []; const circuits = {};
-    for (const s2 of sels) for (const p of produitsDeListe(s2.liste_id)) {
-      if (!produits.some(x => x.reference === p.reference)) { produits.push(p); circuits[p.reference] = s2.circuit === 'fob' ? 'wisen' : 'flaudis'; }
-    }
-    Object.assign(circuits, ajust.circuits || {});
-    if (!produits.length) return res.status(400).json({ erreur: 'Les sélections liées sont vides.' });
-    const champsActifs = carto.mapping.filter(m => m.actif).map(m => m.champ);
-    const etat = offreU.construireEtatOffre({ produits, circuits, champsActifs });
-    // palettes déjà calculées lors d'une génération précédente : conservées (rejouées par le module)
-    let precedent = null; try { precedent = JSON.parse(t.resultat || 'null'); } catch {}
-    if (precedent && precedent.type === 'offre') {
-      for (const l of etat.lignes) {
-        const av = precedent.lignes.find(x => x.reference === l.reference);
-        if (!av) continue;
-        if (av.palette) l.palette = av.palette;
-        for (const [champ, v] of Object.entries(av.valeurs || {}))
-          if (v && v.etat === 'operateur') { l.valeurs[champ] = v; l.manques = l.manques.filter(c2 => c2 !== champ); }
-      }
-      if (precedent.params_palette) etat.params_palette = precedent.params_palette;
-    }
-    // les aperçus Sheet deviennent périmés dès qu'on régénère
-    for (const sess of db.prepare("SELECT * FROM sheets_sessions WHERE genre='apercu-offre' AND ref_id=?").all(t.id)) {
-      goog.supprimer(sess.file_id).catch(() => {});
-      db.prepare('DELETE FROM sheets_sessions WHERE id=?').run(sess.id);
-    }
-    db.prepare("UPDATE tableaux SET resultat=?, statut='genere', modifie_le=datetime('now','localtime') WHERE id=?").run(JSON.stringify(etat), t.id);
-    journal(t.id, 'écriture des fiches', etat.lignes.length + ' ligne(s) — données recopiées depuis les fiches produits');
-    res.json({ ok: true, resultat: etat });
-  } catch (e) { res.status(500).json({ erreur: e.message || String(e) }); }
-});
-app.post('/api/tableaux/:id/offre/circuit', (req, res) => {
-  const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(req.params.id);
-  if (!t) return res.status(404).json({ erreur: 'Offre introuvable' });
-  let ajust = {}; try { ajust = JSON.parse(t.ajustements || 'null') || {}; } catch {}
-  ajust.circuits = ajust.circuits || {};
-  ajust.circuits[String(req.body.ref)] = req.body.circuit === 'wisen' ? 'wisen' : 'flaudis';
-  db.prepare('UPDATE tableaux SET ajustements=? WHERE id=?').run(JSON.stringify(ajust), t.id);
-  res.json({ ok: true });
-});
-app.post('/api/tableaux/:id/offre/selection-fob', (req, res) => {
-  const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(req.params.id);
-  if (!t) return res.status(404).json({ erreur: 'Offre introuvable' });
-  const lid = Number(req.body.liste_id) || null;
-  if (lid && !db.prepare('SELECT 1 FROM listes WHERE id=? AND enregistree=1').get(lid))
-    return res.status(400).json({ erreur: 'Sélection enregistrée introuvable.' });
-  db.prepare('UPDATE tableaux SET selection_fob_id=? WHERE id=?').run(lid, t.id);
-  journal(t.id, 'sélection FOB', lid ? 'liée (ses réfs entrent en circuit WISEN)' : 'détachée');
-  res.json({ ok: true });
-});
-function champsActifsOffre(carto) {
-  const actifs = (carto.mapping || []).filter(m => m.actif && m.cols && m.cols.length && m.champ !== 'reference');
-  actifs.sort((a2, b2) => (a2.cols[0] || 999) - (b2.cols[0] || 999));
-  const refMap = (carto.mapping || []).find(m => m.champ === 'reference' && m.actif && m.cols && m.cols.length);
-  return { actifs, colRef: refMap ? refMap.cols[0] : null };
-}
-function valeursPourCols(champ, v, cols) {
-  if (v == null || v === '') return [];
-  if (cols.length > 1 && /dims_/.test(champ)) {
-    const morceaux = String(v).split(/\s*[x×]\s*/i);
-    return cols.map((c2, j) => ({ col: c2, valeur: morceaux[j] != null ? morceaux[j].trim() : '' })).filter(x => x.valeur !== '');
-  }
-  return [{ col: cols[0], valeur: v }];
-}
-/** LE fichier U, injecté de nos valeurs — mise en forme, macros et menus intacts (repli .xls : valeurs seules). */
-async function excelOffreDepuisModele(t, baseUrl) {
-  const etat = JSON.parse(t.resultat);
-  const carto = JSON.parse(t.cartographie);
-  let sources = []; try { sources = JSON.parse(t.sources); } catch {}
-  const modele = sources.filter(x => x.role === 'modele').slice(-1)[0];
-  if (!modele) throw new Error('Aucun modèle U déposé.');
-  let buf = fs.readFileSync(path.join(DATA_DIR, 'tableaux', modele.disque));
-  if (!(buf[0] === 0x50 && buf[1] === 0x4b) && goog.dispo()) {
-    // .xls ancien format : conversion fidèle via Google (mise en forme préservée), mise en cache
-    const cache = path.join(DATA_DIR, 'tableaux', modele.disque + '.conv.xlsx');
-    if (fs.existsSync(cache)) buf = fs.readFileSync(cache);
-    else {
-      const tmp = await goog.creerSheetDepuisXlsx(buf, '[conversion] ' + modele.nom);
-      buf = await goog.exporterXlsx(tmp.id);
-      goog.supprimer(tmp.id).catch(() => {});
-      fs.writeFileSync(cache, buf);
-    }
-  }
-  const { actifs, colRef } = champsActifsOffre(carto);
-  const ligneDebut = Number(carto.ligne_debut) || 2;
-  const colPhoto = carto.photos && carto.photos.col && !(carto.colonnes_masquees || []).includes(Number(carto.photos.col)) ? Number(carto.photos.col) : null;
-  const placements = [];
-  etat.lignes.forEach((l, i) => {
-    const lig = ligneDebut + i;
-    if (colRef) placements.push({ ligne: lig, col: colRef, valeur: l.reference });
-    if (colPhoto && l.image_id && baseUrl) placements.push({ ligne: lig, col: colPhoto, valeur: { formule: `IMAGE("${baseUrl}/api/images/${l.image_id}")` } });
-    for (const m of actifs) {
-      const v = l.valeurs[m.champ];
-      if (!v || v.v == null) continue;
-      for (const pl of valeursPourCols(m.champ, v.v, m.cols)) placements.push({ ligne: lig, ...pl });
-    }
-  });
-  const { buffer, repli } = await offreU.ecrireDansModele(buf, { feuille: carto.feuille, placements });
-  return { buffer, repli, nomModele: modele.nom };
-}
-app.post('/api/tableaux/:id/offre/sheet', async (req, res) => {
-  try {
-    if (!goog.dispo() && !goog.oauthConfigurable()) return res.status(400).json({ erreur: "Google n'est pas configuré — variables GOOGLE_OAUTH_CLIENT_ID/SECRET puis /google/connexion." });
-    const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(req.params.id);
-    if (!t || !t.resultat || t.genre !== 'offre') return res.status(404).json({ erreur: 'Offre non générée' });
-    const active = db.prepare("SELECT * FROM sheets_sessions WHERE genre='offre' AND ref_id=? AND expire_le > datetime('now','localtime')").get(t.id);
-    if (active) return res.json({ url: active.url, session_id: active.id, existante: true });
-    const { buffer: buf, repli } = await excelOffreDepuisModele(t, `${(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0]}://${req.headers['x-forwarded-host'] || req.headers.host}`);
-    if (repli) journal(t.id, 'sheet', 'modèle .xls ancien format : mise en forme simplifiée dans le Sheet');
-    const sheet = await goog.creerSheetDepuisXlsx(buf, `${t.nom} — session du ${new Date().toLocaleDateString('fr-FR')}`);
-    await goog.partager(sheet.id, 'writer');
-    const r2 = db.prepare("INSERT INTO sheets_sessions (genre, ref_id, file_id, url, expire_le) VALUES ('offre', ?, ?, ?, datetime('now','localtime','+6 hours'))")
-      .run(t.id, sheet.id, sheet.url);
-    res.json({ url: sheet.url, session_id: r2.lastInsertRowid });
-  } catch (e) { res.status(500).json({ erreur: e.message || String(e) }); }
-});
-app.post('/api/tableaux/:id/offre/sheet-apercu', async (req, res) => {
-  try {
-    if (!goog.dispo() && !goog.oauthConfigurable()) return res.status(400).json({ erreur: "Google n'est pas configuré — variables GOOGLE_OAUTH_CLIENT_ID/SECRET puis /google/connexion." });
-    const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(req.params.id);
-    if (!t || !t.resultat || t.genre !== 'offre') return res.status(404).json({ erreur: 'Offre non générée' });
-    const active = db.prepare("SELECT * FROM sheets_sessions WHERE genre='apercu-offre' AND ref_id=? AND expire_le > datetime('now','localtime')").get(t.id);
-    if (active) return res.json({ url: active.url });
-    const { buffer: buf } = await excelOffreDepuisModele(t, `${(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0]}://${req.headers['x-forwarded-host'] || req.headers.host}`);
-    const sheet = await goog.creerSheetDepuisXlsx(buf, `[aperçu] ${t.nom}`);
-    await goog.partager(sheet.id, 'reader');
-    db.prepare("INSERT INTO sheets_sessions (genre, ref_id, file_id, url, expire_le) VALUES ('apercu-offre', ?, ?, ?, datetime('now','localtime','+2 hours'))").run(t.id, sheet.id, sheet.url);
-    res.json({ url: sheet.url });
-  } catch (e) { res.status(500).json({ erreur: e.message || String(e) }); }
-});
-app.post('/api/tableaux/:id/offre/selections', (req, res) => {
-  try {
-    const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(req.params.id);
-    if (!t || t.genre !== 'offre') return res.status(404).json({ erreur: 'Offre introuvable' });
-    let sels = []; try { sels = JSON.parse(t.selections_json || 'null') || []; } catch {}
-    if (!sels.length) { if (t.selection_id) sels.push({ liste_id: t.selection_id, circuit: 'ddp' }); if (t.selection_fob_id) sels.push({ liste_id: t.selection_fob_id, circuit: 'fob' }); }
-    const lid = Number(req.body.liste_id) || 0;
-    if (!lid) return res.status(400).json({ erreur: 'liste_id manquant' });
-    if (req.body.retirer) sels = sels.filter(x => x.liste_id !== lid);
-    else {
-      if (!db.prepare('SELECT 1 FROM listes WHERE id=? AND enregistree=1').get(lid)) return res.status(400).json({ erreur: 'Sélection enregistrée introuvable.' });
-      const ex2 = sels.find(x => x.liste_id === lid);
-      if (ex2) ex2.circuit = req.body.circuit === 'fob' ? 'fob' : 'ddp';
-      else sels.push({ liste_id: lid, circuit: req.body.circuit === 'fob' ? 'fob' : 'ddp' });
-    }
-    db.prepare("UPDATE tableaux SET selections_json=?, selection_id=?, selection_fob_id=NULL, modifie_le=datetime('now','localtime') WHERE id=?")
-      .run(JSON.stringify(sels), sels[0]?.liste_id || null, t.id);
-    journal(t.id, 'sélections', req.body.retirer ? 'sélection retirée' : 'sélection ajoutée/modifiée (' + sels.length + ' liée(s))');
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ erreur: e.message || String(e) }); }
-});
-app.post('/api/tableaux/:id/offre/designations', async (req, res) => {
-  try {
-    const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(req.params.id);
-    if (!t || !t.resultat) return res.status(400).json({ erreur: 'Génère d\u2019abord le tableau.' });
-    const etat = JSON.parse(t.resultat);
-    const cibles = etat.lignes.filter(l => {
-      const d = l.valeurs.designation;
-      return d && d.etat !== 'operateur'; // les saisies manuelles restent intouchées
-    });
-    if (!cibles.length) return res.json({ ok: true, faites: 0 });
-    let faites = 0;
-    for (let i = 0; i < cibles.length; i += 25) {
-      const paquet = cibles.slice(i, i + 25).map(l => {
-        const p = l.produit_id ? db.prepare('SELECT description, taille_produit, pcb, extras FROM produits WHERE id=?').get(l.produit_id) : null;
-        return { reference: l.reference, description: p?.description || l.valeurs.designation?.v || '', dimensions: p?.taille_produit || '', extras: p?.extras || '[]' };
-      });
-      const rep = await ia.redigerDesignations(paquet);
-      if (rep.erreur) return res.status(502).json({ erreur: rep.erreur });
-      for (const l of cibles.slice(i, i + 25)) {
-        const d = (rep.designations || {})[l.reference];
-        if (d) { l.valeurs.designation = { v: String(d).trim(), etat: 'ia' }; l.manques = l.manques.filter(c2 => c2 !== 'designation'); faites++; }
-      }
-    }
-    db.prepare("UPDATE tableaux SET resultat=?, modifie_le=datetime('now','localtime') WHERE id=?").run(JSON.stringify(etat), t.id);
-    journal(t.id, 'désignations', faites + ' désignation(s) rédigée(s) en français (gabarit maison)');
-    res.json({ ok: true, faites });
-  } catch (e) { res.status(500).json({ erreur: e.message || String(e) }); }
-});
-app.post('/api/tableaux/:id/offre/palettes', (req, res) => {
-  try {
-    const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(req.params.id);
-    if (!t || !t.resultat) return res.status(400).json({ erreur: 'Lance d\u2019abord l\u2019écriture des fiches.' });
-    const etat = JSON.parse(t.resultat);
-    const hauteurMaxMm = Number(req.body.hauteur_max_mm) || 1800;
-    let calcules = 0, sans = [];
-    for (const l of etat.lignes) {
-      const pal = offreU.calculerPalette(l.dims_colis, { hauteurMaxMm });
-      if (pal) {
-        const pcb = l.valeurs.pcb?.v || null;
-        const gw = l.valeurs.poids_brut_colis?.v || null;
-        l.palette = { ...pal, hauteur_max_mm: hauteurMaxMm,
-          uvc: pcb ? pal.total * pcb : null,
-          poids_kg: gw ? +(pal.total * gw + 25).toFixed(1) : null };
-        calcules++;
-      } else sans.push(l.reference);
-    }
-    etat.params_palette = { hauteur_max_mm: hauteurMaxMm };
-    db.prepare("UPDATE tableaux SET resultat=?, modifie_le=datetime('now','localtime') WHERE id=?").run(JSON.stringify(etat), t.id);
-    journal(t.id, 'palettisation', `${calcules} ligne(s) calculée(s) (hauteur max ${hauteurMaxMm} mm)`);
-    res.json({ ok: true, calcules, sans, resultat: etat });
-  } catch (e) { res.status(500).json({ erreur: e.message || String(e) }); }
-});
-app.post('/api/tableaux/:id/cartographier', async (req, res) => {
-  try {
-    const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(req.params.id);
-    if (!t || t.genre !== 'offre') return res.status(404).json({ erreur: 'Offre introuvable' });
-    let sources = []; try { sources = JSON.parse(t.sources); } catch {}
-    const modele = sources.filter(s2 => s2.role === 'modele').slice(-1)[0];
-    if (!modele) return res.status(400).json({ erreur: 'Dépose d\u2019abord le modèle Excel fourni par U.' });
-    const buf = fs.readFileSync(path.join(DATA_DIR, 'tableaux', modele.disque));
-    const lecture = offreU.lireModeleU(buf);
-    const plan = await ia.cartographierModeleU(offreU.digestPourIA(lecture));
-    if (plan.erreur) return res.status(502).json({ erreur: plan.erreur });
-    if (lecture.ligne_donnees) plan.ligne_debut = lecture.ligne_donnees; // le mécanique bat l'estimation IA
-    const masquees = new Set(lecture.colonnes_masquees || []);
-    if (masquees.size) {
-      plan.colonnes = (plan.colonnes || []).filter(c2 => !masquees.has(Number(c2.col)));
-      plan.ignorees = [...new Set([...(plan.ignorees || []), ...masquees])].sort((a2, b2) => a2 - b2);
-    }
-    const carto = { ...plan, feuille: lecture.feuille_principale, modele_nom: modele.nom, modele_hash: modele.hash,
-      colonnes_masquees: lecture.colonnes_masquees || [],
-      faite_le: new Date().toISOString().slice(0, 16).replace('T', ' '), validee: true };
-    db.prepare("UPDATE tableaux SET cartographie=?, modifie_le=datetime('now','localtime') WHERE id=?").run(JSON.stringify(carto), t.id);
-    journal(t.id, 'cartographie', `${plan.colonnes.length} colonnes cartographiées, ${(plan.ignorees || []).length} ignorées`);
-    res.json({ ok: true, cartographie: carto });
-  } catch (e) { res.status(500).json({ erreur: e.message || String(e) }); }
-});
-app.post('/api/tableaux/:id/cartographie/valider', (req, res) => {
-  try {
-    const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(req.params.id);
-    if (!t || !t.cartographie) return res.status(404).json({ erreur: 'Pas de cartographie à valider' });
-    const carto = JSON.parse(t.cartographie);
-    // éditions de l'opérateur : {col: nouvelle_source}
-    const editions = req.body.editions || {};
-    for (const c of carto.colonnes) if (editions[c.col] != null) { c.source = String(editions[c.col]).slice(0, 80); c.editee = true; }
-    carto.validee = true;
-    carto.validee_le = new Date().toISOString().slice(0, 16).replace('T', ' ');
-    db.prepare("UPDATE tableaux SET cartographie=?, modifie_le=datetime('now','localtime') WHERE id=?").run(JSON.stringify(carto), t.id);
-    journal(t.id, 'plan validé', Object.keys(editions).length + ' colonne(s) corrigée(s) par l\u2019opérateur');
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ erreur: e.message || String(e) }); }
-});
-app.post('/api/tableaux/:id/codes/proposer', async (req, res) => {
-  try {
-    const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(req.params.id);
-    if (!t || !t.resultat) return res.status(404).json({ erreur: 'Tableau non généré' });
-    const resultat = JSON.parse(t.resultat);
-    const sansCode = Object.values(resultat.parRef || {}).filter(o => !String(o.code_douanier ?? '').trim());
-    if (!sansCode.length) return res.json({ propositions: [] });
-    const entree = sansCode.map(o => {
-      const fiche = db.prepare('SELECT id, description, matiere, taille_produit, poids_nb, extras, remarques FROM produits WHERE reference=? ORDER BY id DESC').get(o.reference) || {};
-      let extras = '';
-      try { extras = (JSON.parse(fiche.extras || '[]') || []).map(x => `${x.intitule}: ${x.valeur}`).join(' ; ').slice(0, 300); } catch {}
-      return { ref: o.reference, produit_id: fiche.id || null, description: fiche.description || o.description || '', matiere: fiche.matiere || '',
-               taille: fiche.taille_produit || o.product_size || '', poids: fiche.poids_nb || '', extras, remarques: (fiche.remarques || '').slice(0, 200) };
-    });
-    const idParRef = Object.fromEntries(entree.map(e => [e.ref, e.produit_id]));
-    const prop = await ia.proposerCodesDouaniers(entree);
-    if (prop.erreur && !prop.propositions.length) return res.status(502).json({ erreur: prop.erreur });
-    for (const p of prop.propositions) p.produit_id = idParRef[p.ref] || null;
-    db.prepare('UPDATE tableaux SET codes_proposes=? WHERE id=?').run(JSON.stringify(prop.propositions), t.id);
-    res.json({ propositions: prop.propositions });
-  } catch (e) { res.status(500).json({ erreur: e.message || String(e) }); }
-});
-app.post('/api/tableaux/:id/codes/appliquer', (req, res) => {
-  try {
-    const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(req.params.id);
-    if (!t) return res.status(404).json({ erreur: 'Tableau introuvable' });
-    const choix = Array.isArray(req.body.choix) ? req.body.choix : [];
-    let surFiches = 0, enModifs = 0;
-    let ajustements = { modifs: [] }; try { ajustements = JSON.parse(t.ajustements || 'null') || {}; } catch {}
-    ajustements.modifs = ajustements.modifs || [];
-    for (const c of choix) {
-      const code = String(c.code || '').replace(/\s+/g, '');
-      if (!c.ref || !code) continue;
-      const fiches = db.prepare('SELECT id FROM produits WHERE reference=?').all(c.ref);
-      if (fiches.length) {
-        for (const fch of fiches) db.prepare('UPDATE produits SET code_hs_usine=? WHERE id=?').run(code, fch.id);
-        surFiches++;
-      } else {
-        const i = ajustements.modifs.findIndex(m => m.ref === c.ref && m.champ === 'code_douanier');
-        if (i !== -1) ajustements.modifs.splice(i, 1);
-        ajustements.modifs.push({ ref: c.ref, champ: 'code_douanier', valeur: code });
-        enModifs++;
-      }
-    }
-    db.prepare('UPDATE tableaux SET ajustements=?, codes_proposes=NULL WHERE id=?').run(JSON.stringify(ajustements), t.id);
-    res.json({ ok: true, sur_fiches: surFiches, en_modifs: enModifs });
-  } catch (e) { res.status(500).json({ erreur: e.message || String(e) }); }
-});
-app.post('/api/tableaux/:id/classer', (req, res) => {
-  const t = db.prepare('SELECT id FROM tableaux WHERE id=?').get(req.params.id);
-  if (!t) return res.status(404).json({ erreur: 'Tableau introuvable' });
-  const dossier = String(req.body.dossier || '').trim().slice(0, 60) || null;
-  db.prepare('UPDATE tableaux SET dossier=? WHERE id=?').run(dossier, t.id);
-  res.json({ ok: true, dossier });
-});
-app.post('/api/tableaux/:id/finaliser', (req, res) => {
-  const t = db.prepare('SELECT id FROM tableaux WHERE id=?').get(req.params.id);
-  if (!t) return res.status(404).json({ erreur: 'Tableau introuvable' });
-  db.prepare('UPDATE tableaux SET finalise=? WHERE id=?').run(req.body.etat ? 1 : 0, t.id);
-  res.json({ ok: true, finalise: req.body.etat ? 1 : 0 });
-});
-app.post('/api/tableaux/:id/rescan-manquants', (req, res) => {
-  try {
-    const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(req.params.id);
-    if (!t || !t.resultat) return res.status(404).json({ erreur: 'Tableau non généré' });
-    const comp = (JSON.parse(t.resultat).completude) || { sans_fiche: [], incompletes: [] };
-    const quoi = req.body.quoi === 'incompletes' ? 'incompletes' : 'sans_fiche';
-    const aRelancer = new Map(); // fichier_id -> nom
-    const introuvables = [];
-    if (quoi === 'sans_fiche') {
-      for (const ref of comp.sans_fiche) {
-        const hits = db.prepare("SELECT f.id, f.nom FROM textes t2 JOIN fichiers f ON f.id=t2.fichier_id WHERE t2.contenu LIKE ?").all('%' + ref + '%');
-        if (!hits.length) { introuvables.push(ref); continue; }
-        for (const h of hits) aRelancer.set(h.id, h.nom);
-      }
-    } else {
-      const refs = comp.incompletes.map(x => x.ref);
-      for (const ref of refs) {
-        for (const p of db.prepare('SELECT p.fichier_id, f.nom FROM produits p JOIN fichiers f ON f.id=p.fichier_id WHERE p.reference=?').all(ref))
-          aRelancer.set(p.fichier_id, p.nom);
-      }
-    }
-    let relances = 0;
-    for (const [fid] of aRelancer) {
-      const f = db.prepare('SELECT * FROM fichiers WHERE id=?').get(fid);
-      if (f && relancerFichier(f, f.mode || 'offre')) relances++;
-    }
-    res.json({ ok: true, fichiers_relances: relances, noms: [...aRelancer.values()].slice(0, 12), introuvables });
-  } catch (e) { res.status(500).json({ erreur: e.message || String(e) }); }
-});
-app.post('/api/tableaux/:id/maj', async (req, res) => {
-  try {
-  const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(req.params.id);
-  if (!t || !t.resultat) return res.status(400).json({ erreur: 'Génère d\u2019abord le tableau (dépose sa sélection U).' });
-  let texte = String(req.body.texte || '').trim();
-  let sources = []; try { sources = JSON.parse(t.sources); } catch {}
-  if (!texte && req.body.piece_hash) {
-    const src = sources.find(x => x.hash === req.body.piece_hash);
-    if (!src) return res.status(404).json({ erreur: 'Pièce introuvable' });
-    const buf = fs.readFileSync(path.join(DATA_DIR, 'tableaux', src.disque));
-    const type = (src.nom.split('.').pop() || '').toLowerCase();
-    if (['xls', 'xlsx'].includes(type)) texte = ex.texteDesFeuilles(ex.lireCellules(buf));
-    else if (type === 'msg') texte = ex.texteMsg(buf);
-    else if (type === 'pdf') texte = (await require('pdf-parse')(buf)).text;
-    else texte = buf.toString('utf8');
-  }
-  if (!texte) return res.status(400).json({ erreur: 'Aucun contenu de mise à jour.' });
-  // le texte collé devient une pièce archivée du dossier
-  if (req.body.texte) {
-    const disque = `t${t.id}_${Date.now()}_maj.txt`;
-    fs.writeFileSync(path.join(DATA_DIR, 'tableaux', disque), texte);
-    sources.push({ role: 'maj', nom: 'Mise à jour saisie le ' + new Date().toISOString().slice(0, 16).replace('T', ' '), disque,
-      hash: ex.md5(Buffer.from(texte)), taille: texte.length, ajoute_le: new Date().toISOString().slice(0, 16).replace('T', ' ') });
-    db.prepare('UPDATE tableaux SET sources=? WHERE id=?').run(JSON.stringify(sources), t.id);
-  }
-  const resultat = JSON.parse(t.resultat);
-  const ctx = Object.values(resultat.parRef || {}).map(o => ({ ref: o.reference,
-    fob_net: (o.jaunes || []).includes('fob_net') ? o.fob_net : (o.fob_com != null && o.fob_com !== '' && !isNaN(Number(o.fob_com)) ? Number((Number(o.fob_com) * 0.95).toFixed(2)) : null),
-    fob_com: o.fob_com ?? null, port: o.port || null, final: o.final ?? null }));
-  const interp = await ia.interpreterMaj(texte, Object.keys(resultat.parRef || {}), ctx);
-  if (interp.erreur) return res.status(502).json({ erreur: interp.erreur });
-  let ajust = {}; try { ajust = JSON.parse(t.ajustements || '{}'); } catch {}
-  ajust.retirees = ajust.retirees || []; ajust.ajoutees = ajust.ajoutees || []; ajust.notes = ajust.notes || []; ajust.modifs = ajust.modifs || [];
-  for (const o of interp.operations) {
-    if (o.op === 'retirer' && !ajust.retirees.includes(o.ref)) { ajust.retirees.push(o.ref); ajust.ajoutees = ajust.ajoutees.filter(a => (a.ref || a) !== o.ref); }
-    else if (o.op === 'ajouter' && !ajust.ajoutees.some(a => (a.ref || a) === o.ref)) { ajust.ajoutees.push({ ref: o.ref, detail: o.detail || '' }); ajust.retirees = ajust.retirees.filter(r => r !== o.ref); }
-    else if (o.op === 'modifier' && o.ref && o.champ) {
-      // filet : si l'IA renvoie quand même un delta (+1, -0.5), on l'applique nous-mêmes à la valeur actuelle
-      const NUM = ['fob_net', 'fob_com', 'ddp', 'taxe', 'final', 'sav', 'pcb_cat'];
-      if (NUM.includes(o.champ) && typeof o.valeur === 'string' && /^[+-]\s*[\d.,]+$/.test(o.valeur.trim())) {
-        const delta = Number(o.valeur.replace(',', '.').replace(/\s/g, ''));
-        const c0 = ctx.find(c => c.ref === o.ref);
-        const base = c0 ? Number(c0[o.champ === 'sav' || o.champ === 'pcb_cat' ? 'final' : o.champ] ?? NaN) : NaN;
-        if (!isNaN(delta) && !isNaN(base)) o.valeur = Number((base + delta).toFixed(2));
-      }
-      if (typeof o.valeur === 'string' && /^[\d.,]+$/.test(o.valeur.trim())) o.valeur = Number(o.valeur.replace(',', '.'));
-      ajust.modifs = ajust.modifs.filter(x => !(x.ref === o.ref && x.champ === o.champ));
-      ajust.modifs.push({ ref: o.ref, champ: o.champ, valeur: o.valeur });
-    }
-    else if (o.op === 'noter') ajust.notes.push(`${o.ref ? o.ref + ' : ' : ''}${o.detail || ''}`);
-  }
-  db.prepare('UPDATE tableaux SET ajustements=? WHERE id=?').run(JSON.stringify(ajust), t.id);
-  journal(t.id, 'mise à jour', (interp.resume || 'traitée') + ' — ' + interp.operations.map(o => `${o.op} ${o.ref || ''}`.trim()).join(', '));
-  const t2 = db.prepare('SELECT * FROM tableaux WHERE id=?').get(t.id);
-  const nouveau = await genererModele(t2);
-  db.prepare("UPDATE tableaux SET resultat=?, statut='genere', modifie_le=datetime('now','localtime') WHERE id=?").run(JSON.stringify(nouveau), t.id);
-  res.json({ ok: true, resume: interp.resume, operations: interp.operations, resultat: nouveau });
-  } catch (e) {
-    console.error('/maj:', e);
-    res.status(500).json({ erreur: 'Mise à jour impossible : ' + (e.message || e) });
-  }
-});
-
-// consultation des pièces du dossier
-app.get('/api/tableaux/:id/pieces/:hash/fichier', (req, res) => {
-  const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(req.params.id);
-  let sources = []; try { sources = JSON.parse(t?.sources || '[]'); } catch {}
-  const src = sources.find(x => x.hash === req.params.hash);
-  if (!src) return res.status(404).send('Pièce introuvable');
-  res.setHeader('content-disposition', 'attachment; filename="' + encodeURIComponent(src.nom.replace(/[/\\]/g, '_')) + '"');
-  res.send(fs.readFileSync(path.join(DATA_DIR, 'tableaux', src.disque)));
-});
-
-app.get('/api/tableaux/:id/pieces/:hash/apercu', async (req, res) => {
-  const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(req.params.id);
-  let sources = []; try { sources = JSON.parse(t?.sources || '[]'); } catch {}
-  const src = sources.find(x => x.hash === req.params.hash);
-  if (!src) return res.status(404).send('Pièce introuvable');
-  const buf = fs.readFileSync(path.join(DATA_DIR, 'tableaux', src.disque));
-  const type = (src.nom.split('.').pop() || 'txt').toLowerCase();
-  if (type === 'pdf') { res.type('application/pdf'); res.setHeader('content-disposition', 'inline'); return res.send(buf); }
-  if (['xls', 'xlsx'].includes(type)) {
-    const html = await ex.genererApercuHtml(buf, type);
-    if (html) return res.type('html').send(html);
-    return res.status(500).send('Aperçu indisponible — télécharge la pièce.');
-  }
-  res.type('html').send(`<!doctype html><meta charset="utf-8"><body style="font-family:system-ui;padding:22px;background:#f4f5f8"><h3>${src.nom.replace(/</g, '&lt;')}</h3><pre style="background:#fff;border:1px solid #ddd;border-radius:9px;padding:16px;white-space:pre-wrap;font-size:13px">${buf.toString('utf8').replace(/</g, '&lt;')}</pre>`);
-});
-
-function imagesPourTableau(modele) {
-  const images = {};
-  for (const [ref, o] of Object.entries(modele.parRef || {})) {
-    if (!o.image_id) continue;
-    const img = db.prepare('SELECT hash FROM images WHERE id=?').get(o.image_id);
-    if (!img) continue;
-    const fichier = fs.readdirSync(path.join(DATA_DIR, 'images')).find(f => f.startsWith(img.hash));
-    if (fichier) images[ref] = path.join(DATA_DIR, 'images', fichier);
-  }
-  return images;
-}
-
-app.get('/api/tableaux/:id/apercu', async (req, res) => {
-  const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(req.params.id);
-  if (!t || !t.resultat) return res.status(404).send('Tableau non généré');
-  try {
-    const modele = JSON.parse(t.resultat);
-    const buf = await tb.genererXlsx(modele, { titre: t.nom }); // sans photos : la conversion les éparpille hors cellules
-    let html = await ex.genererApercuHtml(Buffer.from(buf), 'xlsx');
-    if (!html) return res.status(500).send('Aperçu indisponible sur ce serveur — télécharge l\u2019Excel.');
-    html = html.replace(/(<body[^>]*>)/i, '$1<div style="position:sticky;top:0;background:#1c2434;color:#ffd400;font:600 12.5px system-ui;padding:8px 14px;z-index:9">👁 Aperçu du tableur — les photos ne sont pas affichées ici (la conversion les déplacerait) : elles sont dans l\u2019Excel téléchargé ⬇ et dans le rendu de l\u2019app.</div>');
-    res.type('html').send(html);
-  } catch (e) { res.status(500).send('Aperçu impossible : ' + (e.message || e)); }
-});
-
-async function excelDuTableau(t) {
-  const modele = JSON.parse(t.resultat);
-  return Buffer.from(await tb.genererXlsx(modele, { images: imagesPourTableau(modele), titre: t.nom }));
-}
-app.get('/api/tableaux/:id/excel', async (req, res) => {
-  const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(req.params.id);
-  if (!t || !t.resultat) return res.status(404).send('Tableau non généré');
-  try {
-    const buf = await excelDuTableau(t);
-    res.setHeader('content-disposition', `attachment; filename="${encodeURIComponent(t.nom)}.xlsx"`);
-    res.type('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.send(buf);
-  } catch (e) { res.status(500).send('Excel impossible : ' + (e.message || e)); }
-});
-
-// ---------- Google Sheets : édition temporaire d'un tableau ----------
-app.post('/api/tableaux/:id/sheet', async (req, res) => {
-  try {
-    if (!goog.dispo() && !goog.oauthConfigurable()) return res.status(400).json({ erreur: "Google n'est pas configuré — variables GOOGLE_OAUTH_CLIENT_ID/SECRET puis /google/connexion." });
-    const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(req.params.id);
-    if (!t || !t.resultat) return res.status(404).json({ erreur: 'Tableau non généré' });
-    const active = db.prepare("SELECT * FROM sheets_sessions WHERE genre='tableau' AND ref_id=? AND expire_le > datetime('now','localtime')").get(t.id);
-    if (active) return res.json({ url: active.url, session_id: active.id, existante: true });
-    const buf = await excelDuTableau(t);
-    const sheet = await goog.creerSheetDepuisXlsx(buf, `${t.nom} — session du ${new Date().toLocaleDateString('fr-FR')}`);
-    await goog.partager(sheet.id, 'writer');
-    const r2 = db.prepare("INSERT INTO sheets_sessions (genre, ref_id, file_id, url, expire_le) VALUES ('tableau', ?, ?, ?, datetime('now','localtime','+6 hours'))")
-      .run(t.id, sheet.id, sheet.url);
-    res.json({ url: sheet.url, session_id: r2.lastInsertRowid });
-  } catch (e) { res.status(500).json({ erreur: e.message || String(e) }); }
-});
-// connexion Google (OAuth) : l'app agit sur TON Drive — les fichiers éphémères vont dans « Flaudis — temporaire »
-function urlRetourGoogle(req) {
-  const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0];
-  const hote = req.headers['x-forwarded-host'] || req.headers.host;
-  return `${proto}://${hote}/google/retour`;
-}
-app.get('/google/connexion', (req, res) => {
-  if (!goog.oauthConfigurable())
-    return res.status(400).send('Ajoute d\u2019abord GOOGLE_OAUTH_CLIENT_ID et GOOGLE_OAUTH_CLIENT_SECRET dans Railway (voir la marche à suivre).');
-  res.redirect(goog.urlConnexion(urlRetourGoogle(req)));
-});
-app.get('/google/retour', async (req, res) => {
-  try {
-    if (req.query.error) throw new Error('Autorisation refusée : ' + req.query.error);
-    await goog.echangerCode(String(req.query.code || ''), urlRetourGoogle(req));
-    res.send(`<!doctype html><meta charset="utf-8"><body style="font-family:sans-serif;padding:40px;text-align:center">
-      <h2>✅ Google connecté</h2><p>Les aperçus et sessions Sheets utilisent maintenant ton Drive (dossier « Flaudis — temporaire », nettoyé automatiquement).</p>
-      <p><a href="/">← Retourner à l'app</a> et re-clique ton aperçu.</p>`);
-  } catch (e) {
-    res.status(500).send('<!doctype html><meta charset="utf-8"><body style="font-family:sans-serif;padding:40px"><h2>⚠ Connexion Google échouée</h2><pre>' + String(e.message || e).replace(/</g, '&lt;') + '</pre><a href="/google/connexion">Réessayer</a>');
-  }
-});
-
-app.post('/api/tableaux/:id/sheet-apercu', async (req, res) => {
-  try {
-    if (!goog.dispo() && !goog.oauthConfigurable()) return res.status(400).json({ erreur: "Google n'est pas configuré — variables GOOGLE_OAUTH_CLIENT_ID/SECRET puis /google/connexion." });
-    const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(req.params.id);
-    if (!t || !t.resultat) return res.status(404).json({ erreur: 'Tableau non généré' });
-    const active = db.prepare("SELECT * FROM sheets_sessions WHERE genre='apercu-tableau' AND ref_id=? AND expire_le > datetime('now','localtime')").get(t.id);
-    if (active) return res.json({ url: active.url });
-    const buf = await excelDuTableau(t);
-    const sheet = await goog.creerSheetDepuisXlsx(buf, `[aperçu] ${t.nom}`);
-    await goog.partager(sheet.id, 'reader');
-    db.prepare("INSERT INTO sheets_sessions (genre, ref_id, file_id, url, expire_le) VALUES ('apercu-tableau', ?, ?, ?, datetime('now','localtime','+6 hours'))")
-      .run(t.id, sheet.id, sheet.url);
-    res.json({ url: sheet.url });
-  } catch (e) { res.status(500).json({ erreur: e.message || String(e) }); }
-});
-app.get('/api/tableaux/:id/pieces/:hash/sheet', async (req, res) => {
-  try {
-    if (!goog.dispo() && !goog.oauthConfigurable()) return res.status(400).json({ erreur: "Google n'est pas configuré — variables GOOGLE_OAUTH_CLIENT_ID/SECRET puis /google/connexion." });
-    const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(req.params.id);
-    let sources = []; try { sources = JSON.parse(t?.sources || '[]'); } catch {}
-    const src = sources.find(x => x.hash === req.params.hash);
-    if (!src) return res.status(404).json({ erreur: 'Pièce introuvable' });
-    const type = (src.nom.split('.').pop() || '').toLowerCase();
-    if (!['xls', 'xlsx'].includes(type)) return res.status(400).json({ erreur: 'Aperçu Sheets : uniquement pour les Excel.' });
-    const active = db.prepare("SELECT * FROM sheets_sessions WHERE genre='apercu-piece' AND ref_id=? AND extra=? AND expire_le > datetime('now','localtime')").get(t.id, src.hash);
-    if (active) return res.json({ url: active.url });
-    const buf = fs.readFileSync(path.join(DATA_DIR, 'tableaux', src.disque));
-    const sheet = await goog.creerSheetDepuisXlsx(buf, '[aperçu] ' + src.nom);
-    await goog.partager(sheet.id, 'reader');
-    db.prepare("INSERT INTO sheets_sessions (genre, ref_id, file_id, url, extra, expire_le) VALUES ('apercu-piece', ?, ?, ?, ?, datetime('now','localtime','+6 hours'))")
-      .run(t.id, sheet.id, sheet.url, src.hash);
-    res.json({ url: sheet.url });
-  } catch (e) { res.status(500).json({ erreur: e.message || String(e) }); }
-});
-app.post('/api/sheets/:id/terminer', async (req, res) => {
-  try {
-    const s = db.prepare('SELECT * FROM sheets_sessions WHERE id=?').get(req.params.id);
-    if (!s) return res.status(404).json({ erreur: 'Session introuvable (déjà terminée ?)' });
-    let piece = null;
-    if (req.body.rapatrier && s.genre === 'offre') {
-      const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(s.ref_id);
-      if (t && t.resultat) {
-        const buf = await goog.exporterXlsx(s.file_id);
-        const nom = 'Sheet offre modifié le ' + new Date().toISOString().slice(0, 16).replace('T', ' ') + '.xlsx';
-        const disque = `t${t.id}_${Date.now()}_sheet.xlsx`;
-        fs.writeFileSync(path.join(DATA_DIR, 'tableaux', disque), buf);
-        let sources = []; try { sources = JSON.parse(t.sources); } catch {}
-        sources.push({ role: 'maj', nom, disque, hash: ex.md5(buf), taille: buf.length,
-          ajoute_le: new Date().toISOString().slice(0, 16).replace('T', ' ') });
-        db.prepare('UPDATE tableaux SET sources=? WHERE id=?').run(JSON.stringify(sources), t.id);
-        piece = nom;
-        try {
-          const etat = JSON.parse(t.resultat);
-          const carto = JSON.parse(t.cartographie);
-          const { actifs } = champsActifsOffre(carto);
-          const ligneDebut = Number(carto.ligne_debut) || 2;
-          const XLSX2 = require('xlsx');
-          const wb2 = XLSX2.read(buf, { type: 'buffer' });
-          const ws2 = wb2.Sheets[wb2.SheetNames.includes(carto.feuille) ? carto.feuille : wb2.SheetNames[0]];
-          const grille = XLSX2.utils.sheet_to_json(ws2, { header: 1, defval: '' });
-          let saisies = 0;
-          etat.lignes.forEach((ligne, i) => {
-            const lig = grille[ligneDebut + i - 1] || [];
-            for (const m of actifs) {
-              let nv;
-              if (m.cols.length > 1 && /dims_/.test(m.champ))
-                nv = m.cols.map(c2 => String(lig[c2 - 1] ?? '').trim()).filter(Boolean).join(' × ');
-              else nv = String(lig[m.cols[0] - 1] ?? '').trim();
-              const av = ligne.valeurs[m.champ]?.v;
-              if (nv !== '' && nv !== String(av ?? '')) { ligne.valeurs[m.champ] = { v: nv, etat: 'operateur' }; saisies++; }
-            }
-            ligne.manques = ligne.manques.filter(c => !(ligne.valeurs[c] && ligne.valeurs[c].etat !== 'vide'));
-          });
-          if (saisies) {
-            db.prepare("UPDATE tableaux SET resultat=?, modifie_le=datetime('now','localtime') WHERE id=?").run(JSON.stringify(etat), t.id);
-            journal(t.id, 'saisies Sheet', saisies + ' case(s) saisie(s) ou corrigée(s) à la main');
-            piece = nom + ' — ' + saisies + ' saisie(s) manuelle(s) intégrée(s)';
-          }
-        } catch (e2) { console.error('rapatriement offre:', e2.message); }
-      }
-    }
-    if (req.body.rapatrier && s.genre === 'tableau') {
-      const t = db.prepare('SELECT * FROM tableaux WHERE id=?').get(s.ref_id);
-      if (t) {
-        const buf = await goog.exporterXlsx(s.file_id);
-        const nom = 'Sheet modifié le ' + new Date().toISOString().slice(0, 16).replace('T', ' ') + '.xlsx';
-        const disque = `t${t.id}_${Date.now()}_sheet.xlsx`;
-        fs.writeFileSync(path.join(DATA_DIR, 'tableaux', disque), buf);
-        let sources = []; try { sources = JSON.parse(t.sources); } catch {}
-        sources.push({ role: 'maj', nom, disque, hash: ex.md5(buf), taille: buf.length,
-          ajoute_le: new Date().toISOString().slice(0, 16).replace('T', ' ') });
-        db.prepare('UPDATE tableaux SET sources=? WHERE id=?').run(JSON.stringify(sources), t.id);
-        piece = nom;
-        // saisies manuelles : toute case REMPLIE dans le Sheet là où le tableau était VIDE devient une modif (jaune)
-        try {
-          const resultat = JSON.parse(t.resultat || 'null');
-          if (resultat && resultat.parRef) {
-            const XLSX2 = require('xlsx');
-            const wb2 = XLSX2.read(buf, { type: 'buffer' });
-            const ws2 = wb2.Sheets[wb2.SheetNames[0]];
-            const grille = XLSX2.utils.sheet_to_json(ws2, { header: 1, defval: '' });
-            const CHAMPS_SAISIE = { code_douanier: 3, description: 4, kd: 5, product_size: 7, pcb_cat: 8, packing: 9, volume: 10, nwgw: 11, fob_com: 13, port: 16, promotion: 17, sav: 20 };
-            let ajustements = { modifs: [] }; try { ajustements = JSON.parse(t.ajustements || 'null') || { modifs: [] }; } catch {}
-            ajustements.modifs = ajustements.modifs || [];
-            let saisies = 0;
-            for (const ligne of grille) {
-              const refCell = String(ligne[0] || '').trim();
-              const o = resultat.parRef[refCell];
-              if (!o) continue;
-              for (const [champ, col] of Object.entries(CHAMPS_SAISIE)) {
-                const enTableau = o[champ];
-                const auSheet = String(ligne[col - 1] ?? '').trim();
-                if ((enTableau == null || String(enTableau).trim() === '') && auSheet !== '') {
-                  const i = ajustements.modifs.findIndex(m => m.ref === refCell && m.champ === champ);
-                  if (i !== -1) ajustements.modifs.splice(i, 1);
-                  ajustements.modifs.push({ ref: refCell, champ, valeur: auSheet });
-                  saisies++;
+            const token = await getSheetsToken();
+            // Lire SYSTEME U (col H=CNB, B=date_envoi, G=tracking)
+            // et REMBOURSEMENT SU (col I=CNB, A=date_recep)
+            const [sheetSav, sheetRemb] = await Promise.all([
+              fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent('SYSTEME U!A:H')}`, { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json()),
+              fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent('REMBOURSEMENT SU!A:J')}`, { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json())
+            ]);
+            const cnbIndex = {};
+            (sheetSav.values || []).forEach(r => {
+              const cnb = (r[7]||'').trim();
+              if (cnb) cnbIndex[cnb] = { date_envoi: r[1]||'', tracking: r[6]||'' };
+            });
+            (sheetRemb.values || []).forEach(r => {
+              const cnb = (r[8]||'').trim();
+              if (cnb && !cnbIndex[cnb]) cnbIndex[cnb] = { date_envoi: r[1]||'', tracking: '' };
+            });
+            return rows.map(r => {
+              const extra = r.numero_dossier ? cnbIndex[r.numero_dossier] : null;
+              if (extra) {
+                // SYNC RETOUR : si le Sheet a un tracking/date_envoi absent ou différent
+                // en base, on met à jour PostgreSQL (en arrière-plan, sans bloquer)
+                const newTracking = extra.tracking || r.tracking || '';
+                const newEnvoi = extra.date_envoi || r.date_envoi || '';
+                if (pool && r.numero_dossier &&
+                    ((extra.tracking && extra.tracking !== (r.tracking || '')) ||
+                     (extra.date_envoi && extra.date_envoi !== (r.date_envoi || '')))) {
+                  pool.query(
+                    'UPDATE dossiers SET tracking = $1, date_envoi = $2 WHERE numero_dossier = $3',
+                    [newTracking, newEnvoi, r.numero_dossier]
+                  ).then(() => console.log('Sync tracking → DB:', r.numero_dossier, newTracking))
+                   .catch(e => console.error('Sync tracking erreur:', e.message));
                 }
+                return {
+                  ...r,
+                  date_envoi: newEnvoi,
+                  tracking: newTracking
+                };
               }
-            }
-            if (saisies) {
-              db.prepare('UPDATE tableaux SET ajustements=? WHERE id=?').run(JSON.stringify(ajustements), t.id);
-              piece = nom + ` — ${saisies} saisie(s) manuelle(s) détectée(s) et intégrée(s) au tableau (jaune)`;
+              return r;
+            });
+          } catch(e) {
+            console.error('Sheets enrichissement error:', e.message);
+            return rows;
+          }
+        };
+
+        const [par_ref, complet] = await Promise.all([
+          enrichir(resRef.rows),
+          enrichir(resComplet.rows)
+        ]);
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ par_ref, complet }));
+        return;
+      }
+
+      // ── INFOS PRODUIT ENTREPÔT (Firebase) ────────────────
+      if (req.url === '/get-produit-info') {
+        const { ref } = payload;
+        if (!ref) { res.writeHead(200); res.end(JSON.stringify({ found: false })); return; }
+
+        // 1. Association manuelle du Cerveau (ref → notice) : elle fait foi
+        let ficheNom = null;
+        if (pool) {
+          try {
+            const ov = await pool.query('SELECT notice_file FROM notices_override WHERE UPPER(ref) = UPPER($1)', [String(ref).trim()]);
+            if (ov.rows.length) ficheNom = String(ov.rows[0].notice_file).replace(/\.pdf$/i, '');
+          } catch(e) {}
+        }
+        // 2. Sinon clé exacte, sinon matching flou
+        let key = getKey(ficheNom || ref);
+        let data = await firebaseGet('produits/' + key);
+        if (data && ficheNom) { /* fiche trouvée via association */ }
+
+        if (!data) {
+          // Matching flou contre les clés Firebase réelles — même algorithme
+          // que les notices (les clés entrepôt viennent des noms de notices)
+          const allProduits = await firebaseGet('produits');
+          if (allProduits) {
+            const keys = Object.keys(allProduits);
+            const matchKey = findBestMatch(keys, ref);
+            if (matchKey) {
+              console.log('Entrepôt — match flou:', ref, '→', matchKey);
+              key = getKey(matchKey);
+              data = allProduits[matchKey];
             }
           }
-        } catch (e) { /* lecture du sheet rapatrié best-effort */ }
+        }
+
+        if (!data) {
+          res.writeHead(200); res.end(JSON.stringify({ found: false })); return;
+        }
+
+        // Collecter tous les emplacements (loc, loc2, loc3...)
+        const emplacements = [];
+        let i = 0;
+        while (true) {
+          const slotKey = i === 0 ? 'loc' : 'loc' + (i + 1);
+          // Vérifier aussi les nouvelles clés loc2, loc3...
+          const locKey = i === 0 ? 'loc' : 'loc' + (i + 1);
+          const loc = data[locKey];
+          if (!loc && i > 0) break;
+          if (loc && loc.allee) {
+            let label = '';
+            if (loc.allee === 'AREA') label = 'Zone AREA';
+            else if (loc.cote === 'SOL') label = 'Allée ' + loc.allee + ' SOL';
+            else {
+              label = 'Allée ' + loc.allee;
+              if (loc.cote) label += ' ' + loc.cote;
+              if (loc.rack != null) label += ' R' + loc.rack;
+              if (loc.hauteur != null) label += ' H' + loc.hauteur;
+            }
+            emplacements.push(label);
+          }
+          i++;
+          if (i > 10) break; // sécurité
+        }
+
+        // Stock cartons
+        const pieces = data.pieces || {};
+        const pids = Object.keys(pieces);
+        let cartons_complets = 0;
+        let cartons_total = 0;
+        if (pids.length > 0) {
+          const fp = pieces[pids[0]];
+          const allC = Object.keys(fp.cartons || {}).filter(c => /^c[0-9]+$/.test(c));
+          cartons_total = fp.totalCartons || allC.length;
+          cartons_complets = allC.filter(c => fp.cartons[c]?.sealed === true).length;
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          found: true,
+          fiche: key,                            // nom EXACT de la fiche entrepôt (clé Firebase)
+          emplacements,                          // ['Allée 1 G R2 H1', 'Allée 3 D R1 H0']
+          emplacements_str: emplacements.join(' / ') || 'Non renseigné',
+          visserie: data.visserie ?? null,        // true / false / null
+          cartons_complets,                       // nb cartons sealed
+          cartons_total,                          // nb total cartons
+          qty: data.qty ?? null,                  // pour produits sans pièces
+          note: data.note || ''
+        }));
+        return;
       }
-    }
-    await goog.supprimer(s.file_id);
-    db.prepare('DELETE FROM sheets_sessions WHERE id=?').run(s.id);
-    res.json({ ok: true, piece });
-  } catch (e) { res.status(500).json({ erreur: e.message || String(e) }); }
-});
-// aperçu fidèle d'un fichier déposé, converti par Google (lecture seule, éphémère)
-app.get('/api/fichiers/:id/sheet', async (req, res) => {
-  try {
-    if (!goog.dispo() && !goog.oauthConfigurable()) return res.status(400).json({ erreur: "Google n'est pas configuré — variables GOOGLE_OAUTH_CLIENT_ID/SECRET puis /google/connexion." });
-    const f = db.prepare('SELECT * FROM fichiers WHERE id=?').get(req.params.id);
-    if (!f) return res.status(404).json({ erreur: 'Fichier introuvable' });
-    if (!['xls', 'xlsx'].includes(f.type)) return res.status(400).json({ erreur: 'Aperçu Sheets : uniquement pour les Excel.' });
-    const active = db.prepare("SELECT * FROM sheets_sessions WHERE genre='apercu' AND ref_id=? AND expire_le > datetime('now','localtime')").get(f.id);
-    if (active) return res.json({ url: active.url });
-    let disque = null; try { disque = JSON.parse(f.rapport || '{}').disque; } catch {}
-    const chemin = disque ? path.join(DATA_DIR, 'fichiers', disque) : null;
-    if (!chemin || !fs.existsSync(chemin)) return res.status(404).json({ erreur: 'Copie source introuvable sur le disque.' });
-    const sheet = await goog.creerSheetDepuisXlsx(fs.readFileSync(chemin), '[aperçu] ' + f.nom);
-    await goog.partager(sheet.id, 'reader');
-    db.prepare("INSERT INTO sheets_sessions (genre, ref_id, file_id, url, expire_le) VALUES ('apercu', ?, ?, ?, datetime('now','localtime','+6 hours'))")
-      .run(f.id, sheet.id, sheet.url);
-    res.json({ url: sheet.url });
-  } catch (e) { res.status(500).json({ erreur: e.message || String(e) }); }
-});
 
-app.patch('/api/dossiers/renommer', (req, res) => {
-  const chemin = String(req.body.chemin || '').trim();
-  const nouveauNom = String(req.body.nouveau_nom || '').trim().replace(/[\/\\]/g, '').replace(/[^\w\s.\-()&+]/g, '').slice(0, 80);
-  if (!chemin || !nouveauNom) return res.status(400).json({ erreur: 'Paramètres manquants' });
-  const parent = chemin.includes('/') ? chemin.slice(0, chemin.lastIndexOf('/')) : '';
-  const nouveau = parent ? parent + '/' + nouveauNom : nouveauNom;
-  if (nouveau === chemin) return res.json({ ok: true, chemin: nouveau });
-  const tx = db.transaction(() => {
-    const touches = db.prepare("SELECT chemin FROM dossiers WHERE chemin = ? OR chemin LIKE ? || '/%'").all(chemin, chemin);
-    for (const d of touches) {
-      const c2 = nouveau + d.chemin.slice(chemin.length);
-      db.prepare('DELETE FROM dossiers WHERE chemin=?').run(d.chemin);
-      db.prepare('INSERT OR IGNORE INTO dossiers (chemin) VALUES (?)').run(c2);
+      // ── ANNUAIRE MAGASINS U (crawl magasins-u.com pour saisie transporteur) ──
+      if (req.url.startsWith('/magasins-u-crawl')) {
+        // Source : OpenStreetMap via Overpass (magasins-u.com bloque les serveurs — Cloudflare 403)
+        if (pool) await pool.query(`CREATE TABLE IF NOT EXISTS magasins_u (
+          slug TEXT PRIMARY KEY, enseigne TEXT, nom TEXT, adresse TEXT, cp TEXT,
+          ville TEXT, dept TEXT, tel TEXT, url TEXT, maj TIMESTAMPTZ DEFAULT now())`).catch(() => {});
+        if (global._muCrawl && global._muCrawl.actif) {
+          const fige = !global._muCrawl.touch || (Date.now() - global._muCrawl.touch) > 3 * 60 * 1000;
+          if (!fige) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, deja: true, etat: global._muCrawl })); return;
+          }
+        }
+        global._muCrawl = { actif: true, phase: 'OpenStreetMap', total: 0, fait: 0, ok: 0, erreurs: 0, touch: Date.now(), demarre: new Date().toISOString() };
+        console.log('Import magasins U (OpenStreetMap) : démarrage');
+        (async () => {
+          const et = global._muCrawl;
+          try {
+            const requete = `[out:json][timeout:180];
+area["ISO3166-1"="FR"][admin_level=2]->.fr;
+(
+  nwr["shop"]["brand"~"^(Super U|Hyper U|U Express|Utile|Marché U)$"](area.fr);
+  nwr["shop"]["name"~"^(Super U|Hyper U|U Express|Utile)( |$)",i](area.fr);
+);
+out center tags;`;
+            let data = null;
+            for (const api of ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter']) {
+              try {
+                const r2 = await fetch(api, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                  body: 'data=' + encodeURIComponent(requete)
+                });
+                if (r2.ok) { data = await r2.json(); break; }
+                console.log('Overpass', api, '→', r2.status);
+              } catch(e2) { console.log('Overpass', api, 'erreur :', e2.message); }
+            }
+            if (!data || !data.elements) { et.phase = 'Overpass indisponible — réessaie dans quelques minutes'; et.actif = false; return; }
+            const els = data.elements.filter(el => el.tags && (el.tags['addr:postcode'] || el.tags['addr:city']));
+            et.total = els.length; et.phase = 'enregistrement';
+            const nrm = v => String(v || '').trim();
+            for (const el of els) {
+              et.fait++; et.touch = Date.now();
+              try {
+                const t = el.tags;
+                const brandOuNom = nrm(t.brand) || nrm(t.name);
+                const em = brandOuNom.toLowerCase();
+                const ens = em.includes('hyper') ? 'Hyper U' : em.includes('express') ? 'U Express' : em.includes('utile') ? 'Utile' : em.includes('marché') || em.includes('marche') ? 'Marché U' : 'Super U';
+                const ville = nrm(t['addr:city']);
+                // Nom : la précision locale si dispo (branch, ou name différent de l'enseigne), sinon la ville
+                let nom = nrm(t.branch);
+                if (!nom) {
+                  const n2 = nrm(t.name).replace(new RegExp('^' + ens.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'), '').trim();
+                  nom = n2 && n2.toLowerCase() !== ens.toLowerCase() ? n2 : '';
+                }
+                if (!nom) nom = ville.toUpperCase();
+                const adresse = [nrm(t['addr:housenumber']), nrm(t['addr:street'])].filter(Boolean).join(' ');
+                const cp = nrm(t['addr:postcode']);
+                const tel = nrm(t.phone) || nrm(t['contact:phone']);
+                const slug = 'osm-' + el.type + '-' + el.id;
+                if (pool && (ville || cp)) {
+                  await pool.query(`INSERT INTO magasins_u (slug, enseigne, nom, adresse, cp, ville, dept, tel, url, maj)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now())
+                    ON CONFLICT (slug) DO UPDATE SET enseigne=$2, nom=$3, adresse=$4, cp=$5, ville=$6, dept=$7, tel=$8, url=$9, maj=now()`,
+                    [slug, ens, nom, adresse, cp, ville, cp.slice(0, 2), tel, 'https://www.openstreetmap.org/' + el.type + '/' + el.id]);
+                  et.ok++;
+                } else et.erreurs++;
+              } catch(e3) { et.erreurs++; }
+            }
+            et.phase = 'terminé'; et.actif = false;
+            console.log('Import magasins U terminé :', et.ok, 'ok /', et.erreurs, 'ignorés');
+          } catch(e) { et.phase = 'erreur : ' + e.message; et.actif = false; }
+        })();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, lance: true }));
+        return;
+      }
+
+      if (req.url.startsWith('/magasins-u-test')) {
+        const cible = 'https://www.magasins-u.com/annuaire-magasin';
+        let out = { cible };
+        try {
+          const r2 = await fetch(cible, { redirect: 'follow', headers: {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'fr-FR,fr;q=0.9'
+          } });
+          const t = await r2.text();
+          out.status = r2.status;
+          out.finalUrl = r2.url;
+          out.taille = t.length;
+          out.nbLiensMagasin = (t.match(/\/magasin\/[a-z0-9-]+/gi) || []).length;
+          out.serveur = r2.headers.get('server') || '';
+          out.extrait = t.slice(0, 600);
+        } catch(e) { out.erreur = e.message; }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(out, null, 2));
+        return;
+      }
+
+      if (req.url.startsWith('/magasins-u-status')) {
+        let nb = 0;
+        if (pool) { const q2 = await pool.query('SELECT COUNT(*) FROM magasins_u').catch(() => null); if (q2) nb = parseInt(q2.rows[0].count); }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ enBase: nb, crawl: global._muCrawl || null }));
+        return;
+      }
+
+      if (req.url === '/magasins-u-purge-osm') {
+        let n = 0;
+        if (pool) { const r2 = await pool.query("DELETE FROM magasins_u WHERE slug LIKE 'osm-%'").catch(() => null); if (r2) n = r2.rowCount; }
+        console.log('Purge OSM :', n, 'entrées retirées');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, retires: n }));
+        return;
+      }
+
+      if (req.url === '/wisen-ecrire') {
+        // Feuille Wisen : n° d'avoir en col K pour tous les CNB (col I) fournis
+        // Deux modes : {usvs, numero} (FOB, numéro unique) ou {paires:[{usv, numero}]} (DDP, un numéro par ligne)
+        let paires = [];
+        if (Array.isArray(payload.paires) && payload.paires.length) {
+          paires = payload.paires.map(p => ({ usv: String(p.usv || '').toUpperCase().trim(), numero: String(p.numero || '').trim() })).filter(p => p.usv && p.numero);
+        } else {
+          const numero = String(payload.numero || '').trim();
+          paires = (Array.isArray(payload.usvs) ? payload.usvs : []).map(u => ({ usv: String(u).toUpperCase().trim(), numero })).filter(p => p.usv && p.numero);
+        }
+        if (!paires.length) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'usvs+numero ou paires requis' })); return; }
+        const token = await getSheetsToken();
+        const q = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'REMBOURSEMENT SU'!A:M")}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const rows = q.values || [];
+        const index = {}; // CNB normalisé → [{row (1-based), k}]
+        for (let i = 1; i < rows.length; i++) {
+          const cnb = (rows[i][8] || '').toString().toUpperCase().trim();
+          if (!cnb) continue;
+          (index[cnb] = index[cnb] || []).push({ row: i + 1, k: (rows[i][10] || '').toString().trim() });
+        }
+        const data = [], conflits = [], introuvables = [];
+        let ecrits = 0, deja = 0;
+        for (const p of paires) {
+          const hits = index[p.usv];
+          if (!hits || !hits.length) { introuvables.push(p.usv); continue; }
+          for (const h of hits) {
+            if (!h.k) { data.push({ range: "'REMBOURSEMENT SU'!K" + h.row, values: [[p.numero]] }); ecrits++; }
+            else if (h.k.toUpperCase() === p.numero.toUpperCase()) deja++;
+            else conflits.push({ usv: p.usv, k: h.k });
+          }
+        }
+        if (data.length) {
+          await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchUpdate`, {
+            method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ valueInputOption: 'RAW', data })
+          });
+        }
+        console.log('Wisen :', ecrits, 'écrits,', deja, 'déjà,', conflits.length, 'conflits,', introuvables.length, 'introuvables');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, ecrits, deja, conflits, introuvables }));
+        return;
+      }
+
+      if (req.url === '/magasins-u-bulk') {
+        // Fiches collectées côté navigateur (synchro officielle, passe Cloudflare)
+        if (pool) await pool.query(`CREATE TABLE IF NOT EXISTS magasins_u (
+          slug TEXT PRIMARY KEY, enseigne TEXT, nom TEXT, adresse TEXT, cp TEXT,
+          ville TEXT, dept TEXT, tel TEXT, url TEXT, maj TIMESTAMPTZ DEFAULT now())`).catch(() => {});
+        const mags = Array.isArray(payload.magasins) ? payload.magasins : [];
+        let ok = 0;
+        for (const mg of mags) {
+          try {
+            if (!pool || !mg.slug) continue;
+            await pool.query(`INSERT INTO magasins_u (slug, enseigne, nom, adresse, cp, ville, dept, tel, url, maj)
+              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now())
+              ON CONFLICT (slug) DO UPDATE SET enseigne=$2, nom=$3, adresse=$4, cp=$5, ville=$6, dept=$7, tel=$8, url=$9, maj=now()`,
+              [String(mg.slug).slice(0,200), mg.enseigne || '', mg.nom || '', mg.adresse || '', mg.cp || '', mg.ville || '', (mg.cp || '').slice(0,2), mg.tel || '', mg.url || '']);
+            ok++;
+          } catch(e) {}
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, enregistres: ok }));
+        return;
+      }
+
+      if (req.url === '/magasins-u-recherche') {
+        const q2 = (payload.q || '').trim();
+        if (!pool || q2.length < 2) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ magasins: [] })); return; }
+        const like = '%' + q2.toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '') + '%';
+        const r2 = await pool.query(
+          `SELECT * FROM magasins_u WHERE
+             translate(UPPER(nom), 'ÉÈÊÀÂÎÔÛÇ', 'EEEAAIOUC') LIKE $1 OR
+             translate(UPPER(ville), 'ÉÈÊÀÂÎÔÛÇ', 'EEEAAIOUC') LIKE $1 OR
+             cp LIKE $2 OR UPPER(enseigne) LIKE $1
+           ORDER BY ville, nom LIMIT 50`, [like, q2 + '%']);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ magasins: r2.rows }));
+        return;
+      }
+
+      // ── EN ATTENTE ITS : demandes de renvoi (feuille INTERSPORT) ────
+      if (req.url === '/attente-its-liste') {
+        const token = await getSheetsToken();
+        const q = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'INTERSPORT'!A:J")}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const rows = q.values || [];
+        const attente = [];
+        for (let i = 1; i < rows.length; i++) {
+          const etat = ((rows[i] || [])[8] || '').toString().trim();
+          if (/^DEMANDE\s+(DE\s+)?RENVOI$/i.test(etat)) {
+            attente.push({ row: i + 1, cells: (rows[i] || []).slice(0, 10).map(c => (c || '').toString()) });
+          }
+        }
+        attente.reverse();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ attente }));
+        return;
+      }
+
+      if (req.url === '/attente-its-reception' || req.url === '/attente-its-avoir' || req.url === '/attente-its-renvoyer') {
+        const rowN = parseInt(payload.row);
+        if (!rowN || rowN < 2) { res.writeHead(400); res.end(JSON.stringify({ error: 'row requis' })); return; }
+        const token = await getSheetsToken();
+        const vr = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'INTERSPORT'!A" + rowN + ":J" + rowN)}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const lr = ((vr.values || [])[0] || []).map(c => (c || '').toString());
+        if (!/^DEMANDE\s+(DE\s+)?RENVOI$/i.test((lr[8] || '').trim())) {
+          res.writeHead(409); res.end(JSON.stringify({ error: 'Cette ligne n\u2019est plus en DEMANDE RENVOI (tableau modifié entre-temps ?) — recharge la liste.' })); return;
+        }
+        const now = new Date();
+        const jj = String(now.getDate()).padStart(2, '0'), mo = String(now.getMonth() + 1).padStart(2, '0');
+        const todayFR2 = jj + '/' + mo + '/' + String(now.getFullYear()).slice(2);
+
+        if (req.url === '/attente-its-reception') {
+          // Retour reçu → date du jour en G, rien d'autre ne bouge
+          await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'INTERSPORT'!G" + rowN)}?valueInputOption=RAW`, {
+            method: 'PUT', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ values: [[todayFR2]] })
+          });
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, date: todayFR2 }));
+          return;
+        }
+
+        const gid = await getSheetGid(token, 'INTERSPORT');
+
+        if (req.url === '/attente-its-renvoyer') {
+          // Testé sans défaut → RETOUR EN L'ETAT, F renseigné, ligne blanche
+          await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchUpdate`, {
+            method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ valueInputOption: 'RAW', data: [
+              { range: "'INTERSPORT'!I" + rowN, values: [["RETOUR EN L'ETAT"]] },
+              { range: "'INTERSPORT'!F" + rowN, values: [['Produit testé et fonctionnel']] }
+            ] })
+          });
+          if (gid !== null) await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}:batchUpdate`, {
+            method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ requests: [{ repeatCell: {
+              range: { sheetId: gid, startRowIndex: rowN - 1, endRowIndex: rowN, startColumnIndex: 0, endColumnIndex: 10 },
+              cell: { userEnteredFormat: { backgroundColor: { red: 1, green: 1, blue: 1 } } },
+              fields: 'userEnteredFormat.backgroundColor'
+            } }] })
+          });
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+          return;
+        }
+
+        // ── AVOIR : statut + vert + écriture classique dans REMBOURSEMENT ITS ──
+        const refProd = (lr[1] || '').trim();
+        const magasin = (lr[4] || '').trim();
+        const dateDossier = (lr[0] || '').trim() || todayFR2;
+        // Statut DDP depuis le référentiel (PRIX AVOIR) — cache 10 min sinon rechargé
+        let isDDP = false;
+        try {
+          let items = (global._itsRefCache && (Date.now() - global._itsRefCache.ts) < 10 * 60 * 1000) ? global._itsRefCache.items : null;
+          if (!items) {
+            const bg0 = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchGet?ranges=${encodeURIComponent("'CODE PRODUITS'!A:G")}&ranges=${encodeURIComponent("'PRIX AVOIR'!A:F")}`,
+              { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+            const nrm0 = v => String(v || '').toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^A-Z0-9]/g, '');
+            const pByC = {}, pByN = {};
+            ((bg0.valueRanges || [])[1]?.values || []).slice(2).forEach(r2 => {
+              const code = (r2[0] || '').toString().trim(), lib = (r2[1] || '').toString().trim();
+              const v = r2[4] !== undefined ? String(r2[4]).trim() : '';
+              if (!v) return;
+              if (code) pByC[nrm0(code)] = v;
+              if (lib) pByN[nrm0(lib)] = v;
+            });
+            items = [];
+            ((bg0.valueRanges || [])[0]?.values || []).slice(2).forEach(r2 => {
+              const rf = (r2[0] || '').toString().trim();
+              if (!rf) return;
+              items.push({ ref: rf, prix: pByC[nrm0((r2[3] || '').toString().trim())] || pByN[nrm0(rf)] || '' });
+            });
+          }
+          const nrm1 = v => String(v || '').toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^A-Z0-9]/g, '');
+          const hit = items.find(it => nrm1(it.ref) === nrm1(refProd));
+          isDDP = !!(hit && String(hit.prix || '').toUpperCase().includes('DDP'));
+        } catch(e) {}
+
+        // Ligne libre + accord suivant (règle ITSaamm### habituelle)
+        const bg = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchGet?ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!B:B")}&ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!G:G")}&ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!J:J")}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const vr2 = bg.valueRanges || [];
+        const lens = vr2.map(v => (v.values || []).length);
+        const ligne = Math.max(4, ...lens) + 1;
+        const aa2 = String(now.getFullYear()).slice(2);
+        const prefix = 'ITS' + aa2 + mo;
+        let maxSeq = 0;
+        const reNum = new RegExp('^' + prefix + '(\\d{3})$');
+        ((vr2[2] || {}).values || []).forEach(x => { const m = ((x[0] || '') + '').trim().match(reNum); if (m) maxSeq = Math.max(maxSeq, parseInt(m[1])); });
+        let accord = '';
+        if (!isDDP) accord = prefix + String(maxSeq + 1).padStart(3, '0');
+        const dp = dateDossier.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+        const dateFull = dp ? dp[1].padStart(2,'0') + '/' + dp[2].padStart(2,'0') + '/' + (dp[3].length === 4 ? dp[3].slice(2) : dp[3].padStart(2,'0')) : dateDossier;
+        const updates = [
+          { range: "'REMBOURSEMENT ITS'!B" + ligne, values: [[dateFull]] },
+          { range: "'REMBOURSEMENT ITS'!D" + ligne, values: [[1]] },
+          { range: "'REMBOURSEMENT ITS'!G" + ligne, values: [[refProd]] },
+          { range: "'REMBOURSEMENT ITS'!H" + ligne, values: [[magasin]] }
+        ];
+        if (accord) updates.push({ range: "'REMBOURSEMENT ITS'!J" + ligne, values: [[accord]] });
+        await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchUpdate`, {
+          method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ valueInputOption: 'USER_ENTERED', data: updates })
+        });
+        // Statut + vert sur la ligne INTERSPORT
+        await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'INTERSPORT'!I" + rowN)}?valueInputOption=RAW`, {
+          method: 'PUT', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ values: [['AVOIR']] })
+        });
+        if (gid !== null) await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}:batchUpdate`, {
+          method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ requests: [{ repeatCell: {
+            range: { sheetId: gid, startRowIndex: rowN - 1, endRowIndex: rowN, startColumnIndex: 0, endColumnIndex: 10 },
+            cell: { userEnteredFormat: { backgroundColor: { red: 146/255, green: 208/255, blue: 80/255 } } },
+            fields: 'userEnteredFormat.backgroundColor'
+          } }] })
+        });
+        // Historique base
+        if (pool) pool.query(
+          'INSERT INTO its_dossiers (date_reception, reference, pannes, magasin, decision, accord, date_expe, quantite) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+          [dateDossier, refProd, (lr[3] || '').trim(), magasin, 'AVOIR', accord || (isDDP ? '(DDP — sans numéro)' : ''), todayFR2, '1']
+        ).catch(() => {});
+        console.log('En attente ITS — AVOIR ligne', rowN, '→ REMBOURSEMENT ITS ligne', ligne, accord || '(DDP)');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, ligne, accord, ref: refProd, ddp: isDDP }));
+        return;
+      }
+
+      // ── GESTES COMMERCIAUX : propositions en attente ────────────────
+      if (req.url === '/gestes-co-liste') {
+        const token = await getSheetsToken();
+        const q = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'REMBOURSEMENT SU'!A:M")}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const rows = q.values || [];
+        const propositions = [];
+        for (let i = 1; i < rows.length; i++) {
+          const h = ((rows[i] || [])[7] || '').toString().trim();
+          if (/^Proposition geste co/i.test(h)) {
+            propositions.push({
+              row: i + 1,
+              date: ((rows[i] || [])[0] || '').toString().trim(),
+              ref: ((rows[i] || [])[2] || '').toString().trim(),
+              ville: ((rows[i] || [])[6] || '').toString().trim(),
+              montant_txt: (h.match(/Proposition geste co\s*([^\u2014—]*)/i) || [, h])[1].trim(),
+              cnb: ((rows[i] || [])[8] || '').toString().trim(),
+              fla: ((rows[i] || [])[12] || '').toString().trim(),
+              cells: (rows[i] || []).slice(0, 13).map(c => (c || '').toString())
+            });
+          }
+        }
+        propositions.reverse(); // les plus récentes d'abord
+        // URLs Revers.io des dossiers déjà scannés par l'app
+        if (pool && propositions.length) {
+          const cnbs = propositions.map(p => p.cnb).filter(Boolean);
+          if (cnbs.length) {
+            try {
+              const uq = await pool.query('SELECT numero_dossier, revers_url FROM dossiers WHERE numero_dossier = ANY($1) AND revers_url IS NOT NULL', [cnbs]);
+              const uMap = {};
+              uq.rows.forEach(r2 => { uMap[r2.numero_dossier] = r2.revers_url; });
+              propositions.forEach(p => { p.revers_url = uMap[p.cnb] || null; });
+            } catch(e) {}
+          }
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ propositions }));
+        return;
+      }
+
+      if (req.url === '/geste-co-valider' || req.url === '/geste-co-refuser') {
+        const rowN = parseInt(payload.row);
+        if (!rowN || rowN < 2) { res.writeHead(400); res.end(JSON.stringify({ error: 'row requis' })); return; }
+        const token = await getSheetsToken();
+        // Relire la ligne : elle doit toujours être une proposition (anti-décalage)
+        const vr = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'REMBOURSEMENT SU'!A" + rowN + ":M" + rowN)}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const lr = ((vr.values || [])[0] || []);
+        const hTxt = (lr[7] || '').toString().trim();
+        if (!/^Proposition geste co/i.test(hTxt)) {
+          res.writeHead(409); res.end(JSON.stringify({ error: 'Cette ligne n\u2019est plus une proposition (tableau modifié entre-temps ?) — recharge la liste.' })); return;
+        }
+        const gid = await getSheetGid(token, 'REMBOURSEMENT SU');
+
+        if (req.url === '/geste-co-refuser') {
+          // La ligne RESTE : texte de refus en H, ligne rouge (traçabilité)
+          const mMnt = hTxt.match(/Proposition geste co\s*([^\u2014]+?)(?:\s*\u2014|$)/i);
+          const montantTxt = mMnt ? mMnt[1].trim() : '';
+          const resteComm = (hTxt.split('\u2014')[1] || '').trim();
+          const hRefus = 'Refus de la proposition' + (montantTxt ? ' de ' + montantTxt : '') + (resteComm ? ' \u2014 ' + resteComm : '');
+          await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'REMBOURSEMENT SU'!H" + rowN)}?valueInputOption=RAW`, {
+            method: 'PUT', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ values: [[hRefus]] })
+          });
+          await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}:batchUpdate`, {
+            method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ requests: [{ repeatCell: {
+              range: { sheetId: gid, startRowIndex: rowN - 1, endRowIndex: rowN, startColumnIndex: 0, endColumnIndex: 12 },
+              cell: { userEnteredFormat: { backgroundColor: { red: 1, green: 0, blue: 0 } } },
+              fields: 'userEnteredFormat.backgroundColor'
+            } }] })
+          });
+          console.log('Geste co REFUSÉ — ligne', rowN, '→ rouge :', hRefus);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, action: 'refuse' }));
+          return;
+        }
+
+        // VALIDATION : n° d'accord suivant (même règle que l'export), H réécrit, vert
+        const jq = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'REMBOURSEMENT SU'!J:J")}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const now = new Date();
+        const aa = String(now.getFullYear()).slice(2);
+        const mm = String(now.getMonth() + 1).padStart(2, '0');
+        const reNum = new RegExp('^SU[\\s.-]*' + aa + '[\\s.-]*' + mm + '[\\s.-]*(\\d{1,4})$', 'i');
+        const existants = new Set(); let maxSeq = -1, padLen = 2;
+        (jq.values || []).forEach(x => {
+          const m = ((x[0] || '') + '').trim().match(reNum);
+          if (m) { existants.add(parseInt(m[1])); if (parseInt(m[1]) > maxSeq) { maxSeq = parseInt(m[1]); padLen = Math.max(2, m[1].length); } }
+        });
+        let seq = maxSeq + 1;
+        while (existants.has(seq)) seq++;
+        const accord = 'SU' + aa + mm + String(seq).padStart(padLen, '0');
+        const hValide = hTxt.replace(/^Proposition geste co/i, 'Geste co');
+        await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchUpdate`, {
+          method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ valueInputOption: 'RAW', data: [
+            { range: "'REMBOURSEMENT SU'!H" + rowN, values: [[hValide]] },
+            { range: "'REMBOURSEMENT SU'!J" + rowN, values: [[accord]] }
+          ] })
+        });
+        await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}:batchUpdate`, {
+          method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ requests: [{ repeatCell: {
+            range: { sheetId: gid, startRowIndex: rowN - 1, endRowIndex: rowN, startColumnIndex: 0, endColumnIndex: 12 },
+            cell: { userEnteredFormat: { backgroundColor: { red: 146/255, green: 208/255, blue: 80/255 } } },
+            fields: 'userEnteredFormat.backgroundColor'
+          } }] })
+        });
+        if (pool) {
+          const cnb = (lr[8] || '').toString().trim(), fla = (lr[12] || '').toString().trim();
+          const cle = cnb || fla;
+          if (cle) await pool.query('UPDATE dossiers SET accord = $1 WHERE numero_dossier = $2', [accord, cle]).catch(() => {});
+        }
+        console.log('Geste co VALIDÉ — ligne', rowN, '→', accord);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, action: 'valide', accord }));
+        return;
+      }
+
+      // ── RÉFÉRENTIEL ITS : prix import (cascade après PRIX AVOIR) ────
+      // Feuilles par année (2026→2017), en-têtes détectés PAR NOM (ligne 1 ou 2,
+      // positions variables selon l'année). Cache 30 min.
+      if (req.url === '/ref-its-lookup') {
+        const query = (payload.ref || '').trim();
+        if (!query) { res.writeHead(200); res.end(JSON.stringify({ found: false })); return; }
+        if (!global.REF_ITS_CACHE || (Date.now() - global.REF_ITS_CACHE.t) > 30 * 60 * 1000) {
+          const token = await getSheetsToken();
+          const meta = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${REF_ITS_SHEET_ID}?fields=sheets.properties.title`,
+            { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+          const annees = (meta.sheets || []).map(x => x.properties.title)
+            .filter(t => /^\d{4}$/.test(t)).sort((a, b) => b.localeCompare(a)); // 2026 → 2017
+          const entries = [];
+          for (const an of annees) {
+            const v = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${REF_ITS_SHEET_ID}/values/${encodeURIComponent("'" + an + "'!A:AU")}`,
+              { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+            const rows = v.values || [];
+            const normH = h => String(h || '').replace(/\s+/g, ' ').trim().toUpperCase();
+            let hIdx = -1;
+            for (let i = 0; i < Math.min(3, rows.length); i++) {
+              if ((rows[i] || []).some(c => normH(c) === 'ITS REFERENCE')) { hIdx = i; break; }
+            }
+            if (hIdx < 0) continue;
+            const H = (rows[hIdx] || []).map(normH);
+            const col = n2 => H.indexOf(n2);
+            const cEan = col('EAN'), cIts = col('ITS REFERENCE'), cWis = col('WISEN REFERENCE');
+            const cFob = col('ITS FOB'), cDdp = col('ITS DDP'), cPrice = col('ITS PRICE');
+            for (let i = hIdx + 1; i < rows.length; i++) {
+              const r = rows[i] || [];
+              const its = (r[cIts] || '').toString().trim();
+              const wis = cWis >= 0 ? (r[cWis] || '').toString().trim() : '';
+              if (!its && !wis) continue;
+              entries.push({
+                annee: an, its, wis,
+                ean: cEan >= 0 ? (r[cEan] || '').toString().replace(/\.0$/, '').trim() : '',
+                fob: cFob >= 0 ? (r[cFob] || '').toString().trim() : '',
+                ddp: cDdp >= 0 ? (r[cDdp] || '').toString().trim() : '',
+                price: cPrice >= 0 ? (r[cPrice] || '').toString().trim() : ''
+              });
+            }
+          }
+          global.REF_ITS_CACHE = { t: Date.now(), entries };
+          console.log('Référentiel ITS chargé :', entries.length, 'lignes,', annees.length, 'feuilles');
+        }
+        const entries = global.REF_ITS_CACHE.entries;
+        const norm = v => String(v || '').toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^A-Z0-9]+/g, ' ').trim();
+        const q = norm(query);
+        const isEan = /^\d{8,14}$/.test(query.replace(/\s/g, ''));
+        let hit = entries.find(e => norm(e.its) === q)
+          || entries.find(e => norm(e.wis) === q)
+          || (isEan ? entries.find(e => e.ean === query.replace(/\s/g, '')) : null)
+          || entries.find(e => q.length >= 4 && (norm(e.its).includes(q) || q.includes(norm(e.its)) && norm(e.its).length >= 4))
+          || entries.find(e => q.length >= 4 && norm(e.wis).includes(q));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(hit
+          ? { found: true, annee: hit.annee, its_ref: hit.its, wisen_ref: hit.wis, fob: hit.fob, ddp: hit.ddp, price: hit.price }
+          : { found: false }));
+        return;
+      }
+
+      // ── RÉFÉRENTIEL ITS : cartographie du classeur (diagnostic) ────
+      if (req.url.startsWith('/ref-its-structure')) {
+        try {
+          const token = await getSheetsToken();
+          const meta = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${REF_ITS_SHEET_ID}?fields=sheets.properties.title`,
+            { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+          if (meta.error) throw new Error(meta.error.message || 'accès refusé — le classeur est-il partagé au compte de service ?');
+          const titres = (meta.sheets || []).map(x => x.properties.title);
+          const feuilles = [];
+          for (const t of titres) {
+            const v = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${REF_ITS_SHEET_ID}/values/${encodeURIComponent("'" + t + "'!A1:Z3")}`,
+              { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+            const rows = v.values || [];
+            feuilles.push({ feuille: t, entetes: rows[0] || [], exemple1: rows[1] || [], exemple2: rows[2] || [] });
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ classeur: REF_ITS_SHEET_ID, feuilles }, null, 2));
+        } catch(e) {
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ error: e.message }));
+        }
+        return;
+      }
+
+      // ── STOCK ENTREPÔT : toutes les fiches de l'app notices ────────
+      if (req.url === '/stock-liste') {
+        const allProduits = await firebaseGet('produits');
+        if (!allProduits) { res.writeHead(200); res.end(JSON.stringify({ fiches: [] })); return; }
+        const fiches = Object.entries(allProduits).map(([nom, data]) => {
+          // Emplacements (loc, loc2, loc3…)
+          const emplacements = [];
+          let i = 0;
+          while (i <= 10) {
+            const loc = data[i === 0 ? 'loc' : 'loc' + (i + 1)];
+            if (!loc && i > 0) break;
+            if (loc && loc.allee) {
+              let label = '';
+              if (loc.allee === 'AREA') label = 'Zone AREA';
+              else if (loc.cote === 'SOL') label = 'Allée ' + loc.allee + ' SOL';
+              else {
+                label = 'Allée ' + loc.allee;
+                if (loc.cote) label += ' ' + loc.cote;
+                if (loc.rack != null) label += ' R' + loc.rack;
+                if (loc.hauteur != null) label += ' H' + loc.hauteur;
+              }
+              emplacements.push(label);
+            }
+            i++;
+          }
+          // Cartons : transverses aux pièces, comme dans l'app
+          const pieces = data.pieces || {};
+          const pids = Object.keys(pieces);
+          const cidSet = new Set();
+          pids.forEach(pid => Object.keys(pieces[pid].cartons || {}).forEach(cid => cidSet.add(cid)));
+          const cids = [...cidSet].sort((a, b) => {
+            const na = /^c(\d+)$/.exec(a), nb2 = /^c(\d+)$/.exec(b);
+            if (na && nb2) return parseInt(na[1]) - parseInt(nb2[1]);
+            if (na) return -1; if (nb2) return 1;
+            return a.localeCompare(b);
+          });
+          const firstNPid = pids.find(pid => pieces[pid] && pieces[pid].totalCartons);
+          const totalC = firstNPid ? pieces[firstNPid].totalCartons : cids.filter(c => /^c\d+$/.test(c)).length;
+          let numIdx = 0;
+          const cartons = cids.map(cid => {
+            const isCustom = cid.startsWith('custom_');
+            const label = isCustom
+              ? cid.replace(/^custom_/, '').replace(/_\d+$/, '').replace(/_/g, ' ').toUpperCase()
+              : 'Carton ' + (++numIdx);
+            const sealed = pids.some(pid => pieces[pid].cartons && pieces[pid].cartons[cid] && pieces[pid].cartons[cid].sealed === true);
+            const contenu = pids.map(pid => {
+              const cart = (pieces[pid].cartons || {})[cid];
+              if (!cart) return null;
+              const qte = cart.qte || 0;
+              return { nom: pieces[pid].nom || pid, qte, initial: cart.initial || qte };
+            }).filter(Boolean);
+            return { id: cid, label, custom: isCustom, sealed, contenu };
+          });
+          return {
+            ref: nom,
+            emplacements,
+            visserie: data.visserie ?? null,
+            qty: data.qty ?? null,
+            note: data.note || '',
+            cartons_total: totalC,
+            cartons_fermes: cartons.filter(c => c.sealed).length,
+            cartons_ouverts: cartons.filter(c => !c.sealed)
+          };
+        }).sort((a, b) => a.ref.localeCompare(b.ref));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ fiches }));
+        return;
+      }
+
+      // ── MAGASINS ITS : liste (feuille CODE SOCIETAIRE) ──────────────
+      if (req.url === '/its-magasins-liste') {
+        if (!GOOGLE_SHEET_ID) { res.writeHead(200); res.end(JSON.stringify({ magasins: [] })); return; }
+        if (global.MAG_ITS_CACHE && (Date.now() - global.MAG_ITS_CACHE.t) < 10 * 60 * 1000) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ magasins: global.MAG_ITS_CACHE.liste }));
+          return;
+        }
+        const token = await getSheetsToken();
+        const q = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'CODE SOCIETAIRE'!A:D")}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const rows = q.values || [];
+        // La colonne des magasins = celle qui contient le plus de "NN VILLE"
+        let best = 0, bestScore = -1;
+        for (let c = 0; c < 4; c++) {
+          const score = rows.filter(r => /^\d{2,3}\s+\S/.test(((r[c] || '') + '').trim())).length;
+          if (score > bestScore) { bestScore = score; best = c; }
+        }
+        const seen = new Set();
+        const magasins = rows.map(r => ((r[best] || '') + '').trim())
+          .filter(v => /^\d{2,3}\s+\S/.test(v))
+          .filter(v => { const k = v.toUpperCase(); if (seen.has(k)) return false; seen.add(k); return true; })
+          .sort();
+        global.MAG_ITS_CACHE = { t: Date.now(), liste: magasins };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ magasins }));
+        return;
+      }
+
+      // ── ACCORD SUIVANT : prochain numéro SUaamm### (affichage) ──
+      if (req.url === '/accord-suivant') {
+        if (!GOOGLE_SHEET_ID) { res.writeHead(200); res.end(JSON.stringify({ accord: null })); return; }
+        const token = await getSheetsToken();
+        const now = new Date();
+        const aa = String(now.getFullYear()).slice(2);
+        const mm = String(now.getMonth() + 1).padStart(2, '0');
+        const prefix = 'SU' + aa + mm;
+        const q = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'REMBOURSEMENT SU'!J:J")}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        // Règle Sly : chaque mois repart à 00 (SU260700), le plus haut du mois
+        // + 1 ensuite (les gestes co insérés après coup comptent aussi — on
+        // scanne TOUTE la colonne, pas seulement la fin), anti-doublon strict.
+        const existants = new Set();
+        let maxSeq = -1, padLen = 2;
+        const reNum = new RegExp('^SU[\\s.-]*' + aa + '[\\s.-]*' + mm + '[\\s.-]*(\\d{1,4})$', 'i');
+        ((q.values || []).flat()).forEach(v => {
+          const m = String(v || '').trim().match(reNum);
+          if (m) {
+            existants.add(parseInt(m[1]));
+            if (parseInt(m[1]) > maxSeq) { maxSeq = parseInt(m[1]); padLen = Math.max(2, m[1].length); }
+          }
+        });
+        let seq = maxSeq + 1; // colonne vierge ce mois → -1 + 1 = 0 → SUaamm00
+        while (existants.has(seq)) seq++;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ accord: prefix + String(seq).padStart(padLen, '0') }));
+        return;
+      }
+
+      // ── EXPORT U DIRECT : SYSTEME U / REMBOURSEMENT SU ────────
+      // Écrit sur la première ligne libre des feuilles réelles.
+      // SYSTEME U : append pur A:I (dates au format texte JJ/MM/AA maison).
+      // REMBOURSEMENT SU : écriture ciblée cellule par cellule (L = formule,
+      // jamais touchée), n° accord auto SUaamm### si non-DDP, vert A→L.
+      if (req.url === '/export-u-direct') {
+        if (!GOOGLE_SHEET_ID) { res.writeHead(200); res.end(JSON.stringify({ ok: false, error: 'GOOGLE_SHEET_ID manquant' })); return; }
+        const { mode, row } = payload;
+        if (!row || !Array.isArray(row)) { res.writeHead(400); res.end(JSON.stringify({ error: 'row requis' })); return; }
+        const token = await getSheetsToken();
+        const shortDate = v => {
+          const m = String(v || '').trim().match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})$/);
+          if (!m) return v;
+          return m[1].padStart(2,'0') + '/' + m[2].padStart(2,'0') + '/' + (m[3].length === 4 ? m[3].slice(2) : m[3].padStart(2,'0'));
+        };
+
+        if (mode === 'sav') {
+          // Anti-doublon CNB (H idx 7) / FLA (I idx 8) dans SYSTEME U
+          const key = (row[7] || '').trim() || (row[8] || '').trim();
+          if (key) {
+            const existing = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'SYSTEME U'!H:I")}`,
+              { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+            const dup = (existing.values || []).some(r2 =>
+              ((r2[0] || '').trim() === key) || ((r2[1] || '').trim() === key));
+            if (dup) { res.writeHead(200); res.end(JSON.stringify({ ok: true, duplicate: true, key })); return; }
+          }
+          const clean = row.slice(0, 9);
+          clean[0] = shortDate(clean[0]); clean[1] = shortDate(clean[1]);
+          const ap = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'SYSTEME U'!A:I")}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`, {
+            method: 'POST',
+            headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ values: [clean] })
+          }).then(r => r.json());
+          if (ap.error) { res.writeHead(500); res.end(JSON.stringify({ ok: false, error: ap.error.message })); return; }
+          console.log('Export direct SYSTEME U:', key);
+          res.writeHead(200); res.end(JSON.stringify({ ok: true }));
+          return;
+        }
+
+        if (mode === 'remb') {
+          // Anti-doublon CNB (I idx 8) / FLA (M idx 12) dans REMBOURSEMENT SU
+          const key = (row[8] || '').trim() || (row[12] || '').trim();
+          if (key) {
+            const existing = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'REMBOURSEMENT SU'!I:M")}`,
+              { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+            const dup = (existing.values || []).some(r2 =>
+              ((r2[0] || '').trim() === key) || ((r2[4] || '').trim() === key));
+            if (dup) { res.writeHead(200); res.end(JSON.stringify({ ok: true, duplicate: true, key })); return; }
+          }
+
+          // Première ligne libre (colonnes A, I, J les plus remplies)
+          const bg = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchGet?ranges=${encodeURIComponent("'REMBOURSEMENT SU'!A:A")}&ranges=${encodeURIComponent("'REMBOURSEMENT SU'!I:I")}&ranges=${encodeURIComponent("'REMBOURSEMENT SU'!J:J")}`,
+            { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+          const vr = bg.valueRanges || [];
+          const lens = vr.map(v => (v.values || []).length);
+          const target = Math.max(...lens, 1) + 1;
+
+          // N° accord : SU + aa + mm + séquence (mois repart à 00)
+          let accord = (row[9] || '').trim();
+          const isDDP = !!payload.ddp;
+          const now = new Date();
+          const aa = String(now.getFullYear()).slice(2);
+          const mm = String(now.getMonth() + 1).padStart(2, '0');
+          const prefix = 'SU' + aa + mm;
+          const jvals = ((vr[2] || {}).values || []).map(x => (x[0] || '').toString().trim());
+          const existants = new Set();
+          let maxSeq = -1, padLen = 2;
+          const reNum = new RegExp('^SU[\\s.-]*' + aa + '[\\s.-]*' + mm + '[\\s.-]*(\\d{1,4})$', 'i');
+          jvals.forEach(v => { const m = v.match(reNum); if (m) { existants.add(parseInt(m[1])); if (parseInt(m[1]) > maxSeq) { maxSeq = parseInt(m[1]); padLen = Math.max(2, m[1].length); } } });
+          const suivantLibre = () => {
+            let seq = maxSeq + 1; // mois vierge → 00
+            while (existants.has(seq)) seq++;
+            return prefix + String(seq).padStart(padLen, '0');
+          };
+          // Proposition de geste commercial : PAS de n° d'accord (en attente
+          // d'acceptation), texte en H, ligne orange
+          const gesteCo = (payload.geste_co || '').toString().trim();
+          if (gesteCo) {
+            accord = '';
+            // On ne retire que les zéros DÉCIMAUX inutiles : 50 → 50, 50.00 → 50, 42.50 → 42,5
+            const mnt = gesteCo.replace(/\.(\d*?)0+$/, '.$1').replace(/\.$/, '').replace('.', ',');
+            row[7] = 'Proposition geste co ' + mnt + '\u20ac' + (row[7] ? ' \u2014 ' + row[7] : '');
+          } else if (!accord && !isDDP) {
+            accord = suivantLibre();
+          } else if (accord) {
+            // Numéro pré-rempli par l'app : s'il est déjà pris entre-temps
+            // (autre export), on bascule sur le suivant libre — jamais de doublon
+            const m = accord.match(reNum);
+            if (m && existants.has(parseInt(m[1]))) accord = suivantLibre();
+          }
+
+          // Écriture ciblée : A..K + M — la colonne L (formule) n'est JAMAIS touchée
+          const colsTexte = { C: row[2], D: row[3], F: row[5], G: row[6], H: row[7], I: row[8], J: accord, K: row[10], M: row[12] };
+          const colsTypes = { A: shortDate(row[0]), B: shortDate(row[1]), E: parseInt(row[4]) || 1 };
+          const mkUpdates = obj => Object.entries(obj)
+            .filter(([c, v]) => v !== '' && v !== null && v !== undefined)
+            .map(([c, v]) => ({ range: "'REMBOURSEMENT SU'!" + c + target, values: [[v]] }));
+          // Textes (EAN, refs, CNB…) en RAW pour préserver leur type texte
+          await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchUpdate`, {
+            method: 'POST',
+            headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ valueInputOption: 'RAW', data: mkUpdates(colsTexte) })
+          });
+          // Dates courtes + quantité en USER_ENTERED : vraies dates, vrai nombre
+          await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchUpdate`, {
+            method: 'POST',
+            headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ valueInputOption: 'USER_ENTERED', data: mkUpdates(colsTypes) })
+          });
+
+          // Vert #92d050 de A à L
+          const gid = await getSheetGid(token, 'REMBOURSEMENT SU');
+          if (gid !== null) {
+            await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}:batchUpdate`, {
+              method: 'POST',
+              headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ requests: [{
+                repeatCell: {
+                  range: { sheetId: gid, startRowIndex: target - 1, endRowIndex: target, startColumnIndex: 0, endColumnIndex: 12 },
+                  cell: { userEnteredFormat: { backgroundColor: gesteCo
+                    ? { red: 1, green: 192/255, blue: 0 }          // orange #ffc000 : proposition en attente
+                    : { red: 146/255, green: 208/255, blue: 80/255 } } },
+                  fields: 'userEnteredFormat.backgroundColor'
+                }
+              }] })
+            });
+          }
+          console.log('Export direct REMBOURSEMENT SU: ligne', target, '| accord', accord || '(vide/DDP)');
+          res.writeHead(200); res.end(JSON.stringify({ ok: true, ligne: target, accord: accord || null }));
+          return;
+        }
+
+        res.writeHead(400); res.end(JSON.stringify({ error: 'mode inconnu' }));
+        return;
+      }
+
+      // ── EXPORT VERS GOOGLE SHEET (Import — conservé compat) ───
+      if (req.url === '/export-to-sheet') {
+        if (!GOOGLE_SHEET_ID) { res.writeHead(200); res.end(JSON.stringify({ ok: false, error: 'GOOGLE_SHEET_ID manquant' })); return; }
+        const { mode, row } = payload;
+        if (!row || !Array.isArray(row)) { res.writeHead(400); res.end(JSON.stringify({ error: 'row requis' })); return; }
+        try {
+          const token = await getSheetsToken();
+          const sheetName = mode === 'remb' ? 'Import Refund' : 'Import SAV';
+
+          // ── ANTI-DOUBLON ──────────────────────────────────
+          // Clé d'identification : CNB en priorité, FLA à défaut
+          // Import SAV : CNB col H (idx 7), FLA col I (idx 8)
+          // Import Refund : CNB col I (idx 8), FLA col M (idx 12)
+          const cnbIdx = mode === 'remb' ? 8 : 7;
+          const flaIdx = mode === 'remb' ? 12 : 8;
+          const key = (row[cnbIdx] || '').trim() || (row[flaIdx] || '').trim();
+          if (key) {
+            const checkRange = encodeURIComponent(sheetName + '!A:N');
+            const existing = await fetch(
+              `https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${checkRange}`,
+              { headers: { Authorization: 'Bearer ' + token } }
+            ).then(r => r.json());
+            const dup = (existing.values || []).some(r =>
+              ((r[cnbIdx] || '').trim() === key) || ((r[flaIdx] || '').trim() === key)
+            );
+            if (dup) {
+              console.log('Export ignoré — déjà présent dans', sheetName, ':', key);
+              res.writeHead(200); res.end(JSON.stringify({ ok: true, duplicate: true, key }));
+              return;
+            }
+          }
+
+          const range = encodeURIComponent(sheetName + '!A:A');
+          const appendRes = await fetch(
+            `https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${range}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
+            {
+              method: 'POST',
+              headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ values: [row] })
+            }
+          );
+          const appendData = await appendRes.json();
+          if (appendData.error) throw new Error(appendData.error.message);
+          res.writeHead(200); res.end(JSON.stringify({ ok: true }));
+        } catch(e) {
+          res.writeHead(500); res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
+        return;
+      }
+
+      // ── SCAN NOTICE ───────────────────────────────────────
+      if (req.url === '/scan-notice') {
+        const { pdfUrl } = payload;
+        if (!pdfUrl) { res.writeHead(400); res.end(JSON.stringify({ error: 'pdfUrl required' })); return; }
+        const pdfData = await new Promise((resolve, reject) => {
+          const client = pdfUrl.startsWith('https') ? https : http;
+          client.get(pdfUrl, (r) => {
+            const chunks = [];
+            r.on('data', c => chunks.push(c));
+            r.on('end', () => resolve(Buffer.concat(chunks)));
+            r.on('error', reject);
+          }).on('error', reject);
+        });
+        const b64 = pdfData.toString('base64');
+        const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01' },
+          body: JSON.stringify({
+            model: 'claude-sonnet-4-6',
+            max_tokens: 2000,
+            messages: [{ role: 'user', content: [{
+              type: 'document',
+              source: { type: 'base64', media_type: 'application/pdf', data: b64 }
+            }, {
+              type: 'text',
+              text: "Cette notice PDF contient une nomenclature de pièces. Extrait TOUTES les pièces. Retourne la référence exacte telle qu'elle apparaît (ex: A, B, 1, 2, A2, K) et la quantité. Aucune description. JSON uniquement : {\"pieces\": [{\"nom\": \"A\", \"qte\": 2}]}"
+            }]}]
+          })
+        });
+        const claudeData = JSON.parse(stripCircled(JSON.stringify(await claudeRes.json())));
+        const text = claudeData.content?.map(b => b.text || '').join('') || '';
+        const jsonMatch = text.match(/\{[\s\S]*\}/);
+        const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : text);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(parsed));
+        return;
+      }
+
+      // ── HISTORIQUE MAGASIN (ancien endpoint — conservé compat) ──
+      if (req.url === '/get-dossiers-magasin') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ dossiers: [] })); return; }
+        const { enseigne, departement_ville } = payload;
+        const villeKeyword = (departement_ville||'').replace(/^\d+\s*/, '').trim();
+        const result = await pool.query(
+          `SELECT * FROM dossiers WHERE departement_ville ILIKE $1 AND (enseigne ILIKE $2 OR $2 = '')
+           ORDER BY date_traitement DESC LIMIT 30`,
+          ['%' + villeKeyword + '%', enseigne ? '%' + enseigne + '%' : '']
+        );
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ dossiers: result.rows }));
+        return;
+      }
+
+      // ── CHECK HISTORIQUE (ancien — conservé compat) ───────
+      if (req.url === '/check-historique-magasin') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ alerte: null })); return; }
+        const { enseigne, departement_ville, ref_produit, designation_piece } = payload;
+        const villeKeyword = (departement_ville||'').replace(/^\d+\s*/, '').trim();
+        const resultMagasin = await pool.query(
+          `SELECT * FROM dossiers WHERE departement_ville ILIKE $1 AND (enseigne ILIKE $2 OR $2 = '')
+           ORDER BY date_traitement DESC LIMIT 20`,
+          ['%' + villeKeyword + '%', enseigne ? '%' + enseigne + '%' : '']
+        );
+        if (resultMagasin.rows.length === 0) {
+          res.writeHead(200); res.end(JSON.stringify({ alerte: null })); return;
+        }
+        const historique = resultMagasin.rows.map(r =>
+          '- ' + (r.date_reception||'?') + ' | Ref: ' + (r.ref_produit||'?') + ' | Piece: ' + (r.piece||'?') + ' | Decision: ' + (r.decision||'?')
+        ).join('\n');
+        const aiResult = await callAnthropic({
+          messages: [{ role: 'user', content:
+            'Nouveau dossier SAV :\nEnseigne: ' + enseigne + '\nVille: ' + departement_ville +
+            '\nRef produit: ' + ref_produit + '\nPiece: ' + designation_piece + '\n\n' +
+            'Historique des ' + resultMagasin.rows.length + ' derniers dossiers de CE magasin :\n' + historique + '\n\n' +
+            'Analyse si ce magasin a deja fait une demande pour EXACTEMENT le meme probleme sur le MEME produit ET la MEME piece. ' +
+            'IMPORTANT : une demande sur un produit similaire mais pour une piece differente N EST PAS un doublon. ' +
+            'Reponds UNIQUEMENT si tu identifies un vrai doublon. Format : "Deja traite le JJ/MM - meme piece : [nom piece]". Si pas de doublon : reponds AUCUN'
+          }],
+          max_tokens: 100
+        });
+        const aiText = aiResult.content?.[0]?.text?.trim() || 'AUCUN';
+        res.writeHead(200); res.end(JSON.stringify({ alerte: aiText === 'AUCUN' ? null : aiText }));
+        return;
+      }
+
+      // ── NUMÉRO D'ACCORD ──────────────────────────────────────
+      // Format : SU + année (2 chiffres) + mois (2 chiffres) — ex: SU2606
+      // Identique pour tous les dossiers du mois, change automatiquement chaque mois
+      if (req.url === '/get-next-accord') {
+        const now = new Date();
+        const yy = String(now.getFullYear()).slice(2);
+        const mm = String(now.getMonth()+1).padStart(2,'0');
+        res.writeHead(200); res.end(JSON.stringify({ accord: 'SU' + yy + mm }));
+        return;
+      }
+
+      // ── ANALYSE AVEC NOTICE ───────────────────────────────
+      // ⛔ NOTICES TEMPORAIREMENT DÉSACTIVÉES (économie RAM Railway)
+      // Pour réactiver : passer NOTICES_ENABLED à true (ou définir la
+      // variable d'env NOTICES_ENABLED=true dans Railway).
+      // ── RÉPONSES TYPES PARTAGÉES (tous postes) ────────────────
+      if (req.url === '/reponses-list') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ items: [] })); return; }
+        const q = await pool.query('SELECT id, cat, label, msg FROM reponses_types ORDER BY cat, label');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ items: q.rows }));
+        return;
+      }
+      if (req.url === '/reponses-add') {
+        if (!pool) { res.writeHead(500); res.end(JSON.stringify({ error: 'no db' })); return; }
+        const { cat, label, msg } = payload;
+        if (!label || !msg) { res.writeHead(400); res.end(JSON.stringify({ error: 'label et msg requis' })); return; }
+        await pool.query('INSERT INTO reponses_types (cat, label, msg) VALUES ($1,$2,$3)', [cat || 'Divers', label, msg]);
+        res.writeHead(200); res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      if (req.url === '/reponses-delete') {
+        if (!pool) { res.writeHead(500); res.end(JSON.stringify({ error: 'no db' })); return; }
+        await pool.query('DELETE FROM reponses_types WHERE id = $1', [parseInt(payload.id)]);
+        res.writeHead(200); res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      if (req.url === '/reponses-cat') {
+        if (!pool) { res.writeHead(500); res.end(JSON.stringify({ error: 'no db' })); return; }
+        if (payload.action === 'rename') {
+          await pool.query('UPDATE reponses_types SET cat = $1 WHERE cat = $2', [payload.nouveau, payload.cat]);
+        } else if (payload.action === 'delete') {
+          await pool.query('DELETE FROM reponses_types WHERE cat = $1', [payload.cat]);
+        }
+        res.writeHead(200); res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      if (req.url === '/reponses-seed') {
+        if (!pool) { res.writeHead(500); res.end(JSON.stringify({ error: 'no db' })); return; }
+        const count = await pool.query('SELECT COUNT(*) AS n FROM reponses_types');
+        if (parseInt(count.rows[0].n) === 0 && Array.isArray(payload.items)) {
+          for (const it of payload.items.slice(0, 60)) {
+            await pool.query('INSERT INTO reponses_types (cat, label, msg) VALUES ($1,$2,$3)',
+              [it.cat || 'Divers', it.label || '?', it.msg || '']);
+          }
+          console.log('Réponses types : seed initial de', payload.items.length, 'réponses');
+        }
+        res.writeHead(200); res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      // ── TABLEAU DE BORD : agrégats SU + ITS (fenêtre 12 mois) ─────
+      if (req.url === '/dashboard') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ error: 'no db' })); return; }
+        const ITS_DATE = `date_reception ~ '^\\d{1,2}/\\d{1,2}/\\d{2}$' AND TO_DATE(date_reception,'DD/MM/YY')`;
+
+        const su7 = await pool.query(`SELECT COUNT(*) AS n FROM dossiers WHERE date_reception::date BETWEEN NOW()::date - 7 AND NOW()::date`);
+        const su30 = await pool.query(`
+          SELECT COALESCE(SUM(CASE WHEN decision = 'remboursement' THEN 1 ELSE 0 END),0) AS remb,
+                 COALESCE(SUM(CASE WHEN decision <> 'remboursement' THEN 1 ELSE 0 END),0) AS envois
+          FROM dossiers WHERE date_reception::date BETWEEN NOW()::date - 30 AND NOW()::date`);
+        const su12m = await pool.query(`
+          SELECT COALESCE(SUM(CASE WHEN decision = 'remboursement' THEN 1 ELSE 0 END),0) AS remb,
+                 COALESCE(SUM(CASE WHEN decision <> 'remboursement' THEN 1 ELSE 0 END),0) AS envois
+          FROM dossiers WHERE date_reception::date BETWEEN NOW()::date - 365 AND NOW()::date`);
+        const moisSu = await pool.query(`
+          SELECT TO_CHAR(DATE_TRUNC('month', date_reception::date), 'MM/YY') AS mois,
+                 SUM(CASE WHEN decision = 'remboursement' THEN 1 ELSE 0 END) AS remb,
+                 SUM(CASE WHEN decision <> 'remboursement' THEN 1 ELSE 0 END) AS envois
+          FROM dossiers WHERE date_reception::date BETWEEN NOW()::date - 365 AND NOW()::date
+          GROUP BY DATE_TRUNC('month', date_reception::date)
+          ORDER BY DATE_TRUNC('month', date_reception::date)`);
+        const topQ = (table, col, jours, dateCond) => pool.query(`
+          SELECT ${col} AS ref, COUNT(*) AS n FROM ${table}
+          WHERE ${dateCond} AND ${col} IS NOT NULL AND TRIM(${col}) <> ''
+          GROUP BY ${col} ORDER BY n DESC LIMIT 6`);
+        const topSu30  = await topQ('dossiers', 'ref_produit', 30, `date_reception::date BETWEEN NOW()::date - 30 AND NOW()::date`);
+        const topSu12  = await topQ('dossiers', 'ref_produit', 365, `date_reception::date BETWEEN NOW()::date - 365 AND NOW()::date`);
+        const topIts30 = await topQ('its_dossiers', 'reference', 30, `${ITS_DATE} BETWEEN NOW()::date - 30 AND NOW()::date`);
+        const topQ8 = (table, col, dateCond) => pool.query(`
+          SELECT ${col} AS ref, COUNT(*) AS n FROM ${table}
+          WHERE ${dateCond} AND ${col} IS NOT NULL AND TRIM(${col}) <> ''
+          GROUP BY ${col} ORDER BY n DESC LIMIT 8`);
+        const magSu12  = await topQ8('dossiers', 'departement_ville', `date_reception::date BETWEEN NOW()::date - 365 AND NOW()::date`);
+        const magSu30  = await topQ8('dossiers', 'departement_ville', `date_reception::date BETWEEN NOW()::date - 30 AND NOW()::date`);
+        const magIts12 = await topQ8('its_dossiers', 'magasin', `${ITS_DATE} BETWEEN NOW()::date - 365 AND NOW()::date`);
+        const magIts30 = await topQ8('its_dossiers', 'magasin', `${ITS_DATE} BETWEEN NOW()::date - 30 AND NOW()::date`);
+        const topIts12 = await topQ('its_dossiers', 'reference', 365, `${ITS_DATE} BETWEEN NOW()::date - 365 AND NOW()::date`);
+
+        const its7 = await pool.query(`SELECT COUNT(*) AS n FROM its_dossiers WHERE ${ITS_DATE} BETWEEN NOW()::date - 7 AND NOW()::date`);
+        const its30 = await pool.query(`
+          SELECT COALESCE(NULLIF(TRIM(decision), ''), 'À DÉCIDER') AS d, COUNT(*) AS n
+          FROM its_dossiers WHERE ${ITS_DATE} BETWEEN NOW()::date - 30 AND NOW()::date
+          GROUP BY 1 ORDER BY n DESC`);
+        const its30Total = its30.rows.reduce((a, r) => a + parseInt(r.n), 0);
+        const its12m = await pool.query(`
+          SELECT COALESCE(NULLIF(TRIM(decision), ''), 'À DÉCIDER') AS d, COUNT(*) AS n
+          FROM its_dossiers WHERE ${ITS_DATE} BETWEEN NOW()::date - 365 AND NOW()::date
+          GROUP BY 1 ORDER BY n DESC`);
+        const moisIts = await pool.query(`
+          SELECT TO_CHAR(DATE_TRUNC('month', TO_DATE(date_reception,'DD/MM/YY')), 'MM/YY') AS mois,
+                 SUM(CASE WHEN UPPER(COALESCE(decision,'')) = 'AVOIR' THEN 1 ELSE 0 END) AS avoirs,
+                 SUM(CASE WHEN UPPER(COALESCE(decision,'')) <> 'AVOIR' THEN 1 ELSE 0 END) AS autres
+          FROM its_dossiers WHERE ${ITS_DATE} BETWEEN NOW()::date - 365 AND NOW()::date
+          GROUP BY DATE_TRUNC('month', TO_DATE(date_reception,'DD/MM/YY'))
+          ORDER BY DATE_TRUNC('month', TO_DATE(date_reception,'DD/MM/YY'))`);
+        const itsAvoirsMois = await pool.query(`
+          SELECT COUNT(*) AS n FROM its_dossiers
+          WHERE UPPER(COALESCE(decision,'')) = 'AVOIR' AND ${ITS_DATE} BETWEEN DATE_TRUNC('month', NOW())::date AND NOW()::date`);
+
+        // ── Montants € : lignes AVEC CLÉ uniquement (CNB / référence),
+        //    fenêtre 12 mois, cache 10 min ──
+        if (!global.EUR_CACHE || (Date.now() - global.EUR_CACHE.t) > 10 * 60 * 1000) {
+          try {
+            const token = await getSheetsToken();
+            // NB : REMBOURSEMENT SU n'a PAS de colonne montant (C = référence
+            // produit !) — les € ne sont donc calculés que pour ITS (C = prix).
+            const bg = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchGet` +
+              `?ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!B:B")}&ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!C:C")}&ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!G:G")}`,
+              { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+            const vr2 = bg.valueRanges || [];
+            const col = i => (vr2[i] || {}).values || [];
+            const parseMontant = v => {
+              const t = String(v || '').replace(/[€\s]/g, '').replace(',', '.');
+              if (!t || /DDP/i.test(t)) return 0;
+              const f = parseFloat(t);
+              return (isFinite(f) && f >= 0.01 && f <= 10000) ? f : 0;
+            };
+            const cleMois = v => {
+              const m = String(v || '').trim().match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})/);
+              if (!m) return null;
+              return m[2].padStart(2, '0') + '/' + (m[3].length === 4 ? m[3].slice(2) : m[3]);
+            };
+            const moisKeys = [];
+            const d0 = new Date();
+            for (let j = 11; j >= 0; j--) {
+              const d2 = new Date(d0.getFullYear(), d0.getMonth() - j, 1);
+              moisKeys.push(String(d2.getMonth() + 1).padStart(2, '0') + '/' + String(d2.getFullYear()).slice(2));
+            }
+            const agreger = (dates, prix, cles) => {
+              const set = new Set(moisKeys);
+              const parMois = {};
+              let total = 0;
+              const n = Math.max(dates.length, prix.length);
+              for (let i = 0; i < n; i++) {
+                if (!((cles[i] || [])[0] || '').toString().trim()) continue; // pas de clé → hors données
+                const montant = parseMontant((prix[i] || [])[0]);
+                if (!montant) continue;
+                const k = cleMois((dates[i] || [])[0]);
+                if (!k || !set.has(k)) continue; // fenêtre 12 mois
+                parMois[k] = (parMois[k] || 0) + montant;
+                total += montant;
+              }
+              const mois = moisKeys.map(k => ({ mois: k, somme: Math.round(parMois[k] || 0) }));
+              return { total: Math.round(total), mois, mois_courant: mois[11].somme };
+            };
+            global.EUR_CACHE = { t: Date.now(), data: {
+              su: null, // pas de montants dans le tableau U — rien à sommer
+              its: agreger(col(0), col(1), col(2))
+            } };
+          } catch(e) {
+            console.warn('Montants €:', e.message);
+            global.EUR_CACHE = { t: Date.now(), data: null, err: e.message };
+          }
+        }
+        const euros = (global.EUR_CACHE || {}).data || null;
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          su_7j: parseInt(su7.rows[0].n),
+          su_30j: { envois: parseInt(su30.rows[0].envois), remb: parseInt(su30.rows[0].remb) },
+          su_12m: { envois: parseInt(su12m.rows[0].envois), remb: parseInt(su12m.rows[0].remb) },
+          mois_su: moisSu.rows,
+          top_su_30: topSu30.rows, top_su_12: topSu12.rows,
+          top_its_30: topIts30.rows, top_its_12: topIts12.rows,
+          mag_su_12: magSu12.rows, mag_su_30: magSu30.rows,
+          mag_its_12: magIts12.rows, mag_its_30: magIts30.rows,
+          its_7j: parseInt(its7.rows[0].n),
+          its_30j: its30.rows,
+          its_30j_total: its30Total,
+          its_12m: its12m.rows,
+          mois_its: moisIts.rows,
+          its_avoirs_mois: parseInt(itsAvoirsMois.rows[0].n),
+          euros,
+          euros_erreur: (global.EUR_CACHE || {}).err || null
+        }));
+        return;
+      }
+
+      // ── DIAG € : plus grosses lignes d'un mois (vérification Sheet) ──
+      if (req.url === '/euros-diag') {
+        if (!GOOGLE_SHEET_ID) { res.writeHead(500); res.end(JSON.stringify({ error: 'sheet manquant' })); return; }
+        const univers = payload.univers === 'its' ? 'its' : 'su';
+        const moisCible = (payload.mois || '').trim(); // 'MM/AA'
+        const token = await getSheetsToken();
+        if (univers === 'su') { res.writeHead(200); res.end(JSON.stringify({ info: "REMBOURSEMENT SU n'a pas de colonne montant — aucun € côté U" })); return; }
+        const conf = { d: "'REMBOURSEMENT ITS'!B:B", p: "'REMBOURSEMENT ITS'!C:C", k: "'REMBOURSEMENT ITS'!G:G" };
+        const bg = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchGet?ranges=${encodeURIComponent(conf.d)}&ranges=${encodeURIComponent(conf.p)}&ranges=${encodeURIComponent(conf.k)}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const [cd, cp2, ck] = (bg.valueRanges || []).map(v => v.values || []);
+        const lignes = [];
+        for (let i = 0; i < Math.max(cd.length, cp2.length); i++) {
+          const t = String((cp2[i] || [])[0] || '').replace(/[€\s]/g, '').replace(',', '.');
+          const f = parseFloat(t);
+          if (!isFinite(f) || f < 0.01) continue;
+          const dm = String((cd[i] || [])[0] || '').trim().match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})/);
+          const mk = dm ? dm[2].padStart(2, '0') + '/' + (dm[3].length === 4 ? dm[3].slice(2) : dm[3]) : null;
+          if (moisCible && mk !== moisCible) continue;
+          lignes.push({ ligne: i + 1, date: (cd[i] || [])[0] || '', montant: Math.round(f * 100) / 100,
+                        cle: ((ck[i] || [])[0] || '').toString().trim() || '(sans clé — ignorée des stats)' });
+        }
+        lignes.sort((a, b) => b.montant - a.montant);
+        const somme = Math.round(lignes.filter(l => !l.cle.startsWith('(')).reduce((a, l) => a + Math.min(l.montant, 10000), 0));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ mois: moisCible || 'tous', somme_comptee: somme, top: lignes.slice(0, 15) }));
+        return;
+      }
+
+      // ── RECHERCHE : bases SU / ITS (miroir des feuilles) ──────
+      if (req.url === '/recherche') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ resultats: [] })); return; }
+        const univers = payload.univers === 'its' ? 'its' : 'su';
+        const q = (payload.q || '').trim();
+        if (!q) { res.writeHead(400); res.end(JSON.stringify({ error: 'q requis' })); return; }
+        const mots = q.split(/\s+/).filter(Boolean).slice(0, 6);
+
+        // Un mot "date FR" (23/07 ou 23/07/26) doit matcher les deux conventions :
+        // ISO 2026-07-23 (base SU) et JJ/MM/AA (base ITS)
+        const variantes = (mot) => {
+          const v = ['%' + mot + '%'];
+          const m = mot.match(/^(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?$/);
+          if (m) {
+            const jj = m[1].padStart(2, '0'), mm = m[2].padStart(2, '0');
+            const aa = m[3] ? (m[3].length === 4 ? m[3].slice(2) : m[3]) : null;
+            v.push('%' + (aa ? '20' + aa : '') + '-' + mm + '-' + jj + '%'); // ISO
+            v.push('%' + jj + '/' + mm + (aa ? '/' + aa : '') + '%');        // JJ/MM/AA
+          }
+          return v;
+        };
+
+        const champs = univers === 'su'
+          ? ['numero_dossier', 'enseigne', 'departement_ville', 'ref_produit', 'piece', 'decision', 'date_reception', 'notes', 'tracking']
+          : ['date_reception', 'reference', 'pannes', 'magasin', 'decision', 'accord', 'tracking'];
+        const params = [];
+        const conds = mots.map(mot => {
+          const ors = [];
+          for (const v of variantes(mot)) {
+            for (const c of champs) {
+              params.push(v);
+              ors.push(c + ' ILIKE $' + params.length);
+            }
+          }
+          return '(' + ors.join(' OR ') + ')';
+        });
+        const table = univers === 'su' ? 'dossiers' : 'its_dossiers';
+        const orderCol = univers === 'su' ? 'date_reception' : 'created_at';
+        const sql = 'SELECT * FROM ' + table + ' WHERE ' + conds.join(' AND ') +
+                    ' ORDER BY ' + orderCol + ' DESC NULLS LAST LIMIT 1000';
+        const r = await pool.query(sql, params);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ resultats: r.rows, total: r.rows.length }));
+        return;
+      }
+
+      // ── IMPORT COMPLET : tout l'historique du Sheet, par tranches ──
+      // Appelé en boucle par l'app : chaque appel traite ~8000 lignes puis
+      // rend la main (progression affichée, aucun risque de timeout/RAM).
+      // Phases : 1 = SYSTEME U, 2 = REMBOURSEMENT SU, 3 = INTERSPORT.
+      if (req.url === '/sync-complet') {
+        if (!pool || !GOOGLE_SHEET_ID) { res.writeHead(500); res.end(JSON.stringify({ error: 'base ou sheet manquant' })); return; }
+        const phase = parseInt(payload.phase) || 1;
+        const from = Math.max(1, parseInt(payload.from) || 1);
+        const CHUNK = 8000;
+        const token = await getSheetsToken();
+        const toIso2 = v => {
+          const m = String(v || '').trim().match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})$/);
+          if (!m) return null;
+          return (m[3].length === 2 ? '20' + m[3] : m[3]) + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0');
+        };
+        const conf = {
+          1: { feuille: 'SYSTEME U', keyCol: 'H', width: 'I' },
+          2: { feuille: 'REMBOURSEMENT SU', keyCol: 'I', width: 'M' },
+          3: { feuille: 'INTERSPORT', keyCol: 'A', width: 'J' }
+        }[phase];
+        if (!conf) { res.writeHead(400); res.end(JSON.stringify({ error: 'phase inconnue' })); return; }
+
+        // Longueur totale de la feuille (colonne clé)
+        const lenQ = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'" + conf.feuille + "'!" + conf.keyCol + ":" + conf.keyCol)}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const total = (lenQ.values || []).length;
+        if (from > total) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ done_phase: true, phase, total, maj: 0, trk: 0, skip: 0 }));
+          return;
+        }
+        const to = Math.min(total, from + CHUNK - 1);
+        const q = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'" + conf.feuille + "'!A" + from + ":" + conf.width + to)}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const rows = q.values || [];
+
+        let maj = 0, skip = 0, trk = 0;
+
+        if (phase === 1 || phase === 2) {
+          // Dédoublonnage intra-lot par clé (le dernier gagne)
+          const parCle = new Map();
+          for (const r of rows) {
+            const cnb = phase === 1 ? (r[7] || '') : (r[8] || '');
+            const fla = phase === 1 ? (r[8] || '') : (r[12] || '');
+            const iso = toIso2(r[0]);
+            const key = cnb.toString().trim() || fla.toString().trim()
+              || (iso ? cleDirecte(iso, r[2], phase === 1 ? r[5] : r[6], phase === 1 ? r[3] : '') : '');
+            if (!key || !iso) { skip++; continue; }
+            parCle.set(key, { r, iso, fla: fla.toString().trim() });
+          }
+          const lot = [...parCle.entries()];
+          // Upsert par paquets de 400 lignes (rapide, léger pour la base)
+          for (let i = 0; i < lot.length; i += 400) {
+            const part = lot.slice(i, i + 400);
+            const vals = [], params = [];
+            part.forEach(([key, o], j) => {
+              const r = o.r, b = j * 11;
+              const tv = phase === 1 ? (r[6] || '').toString().trim() : '';
+              if (tv) trk++;
+              const dEnv = (() => { if (phase !== 1) return ''; const v = (r[1] || '').toString().trim(); return (v && v.toLowerCase() !== 'x') ? (toIso2(v) || v) : ''; })();
+              vals.push('($' + (b+1) + ',$' + (b+2) + ',$' + (b+3) + ',$' + (b+4) + ',$' + (b+5) + ',$' + (b+6) + ',$' + (b+7) + ',$' + (b+8) + ',$' + (b+9) + ',$' + (b+10) + ',$' + (b+11) + ')');
+              params.push(key,
+                (phase === 1 ? r[4] : r[5] || '').toString().trim(),
+                (phase === 1 ? r[5] : r[6] || '').toString().trim(),
+                (r[2] || '').toString().trim(),
+                (phase === 1 ? (r[3] || '') : '').toString().trim(),
+                phase === 1 ? 'envoi_piece' : 'remboursement',
+                o.iso,
+                o.fla ? 'FLA:' + o.fla : '',
+                tv,
+                dEnv,
+                (o.fla || '').toString().trim());
+            });
+            await pool.query(`
+              INSERT INTO dossiers (numero_dossier, enseigne, departement_ville, ref_produit, piece, decision, date_reception, notes, tracking, date_envoi, fla)
+              VALUES ` + vals.join(',') + `
+              ON CONFLICT (numero_dossier) DO UPDATE SET
+                enseigne = EXCLUDED.enseigne,
+                departement_ville = EXCLUDED.departement_ville,
+                ref_produit = EXCLUDED.ref_produit,
+                piece = CASE WHEN EXCLUDED.piece <> '' THEN EXCLUDED.piece ELSE dossiers.piece END,
+                decision = EXCLUDED.decision,
+                date_reception = EXCLUDED.date_reception,
+                tracking = CASE WHEN EXCLUDED.tracking <> '' THEN EXCLUDED.tracking ELSE dossiers.tracking END,
+                date_envoi = CASE WHEN EXCLUDED.date_envoi <> '' THEN EXCLUDED.date_envoi ELSE dossiers.date_envoi END,
+                notes = CASE WHEN EXCLUDED.notes ~ 'FLA:.' THEN EXCLUDED.notes ELSE dossiers.notes END,
+                fla = CASE WHEN EXCLUDED.fla <> '' THEN EXCLUDED.fla ELSE dossiers.fla END
+            `, params);
+            maj += part.length;
+          }
+        } else {
+          // Phase 3 : INTERSPORT → its_dossiers
+          const parCle = new Map();
+          for (const r of rows) {
+            const date = (r[0] || '').toString().trim();
+            const ref = (r[1] || '').toString().trim();
+            const mag = (r[4] || '').toString().trim();
+            if (!date || !ref || !mag || !/\d/.test(date)) { skip++; continue; }
+            parCle.set(date + '|' + ref + '|' + mag, r);
+          }
+          for (const [k, r] of parCle) {
+            const tv = (r[9] || '').toString().trim();
+            if (tv) trk++;
+            const dEx = (() => { const v = (r[7] || '').toString().trim(); return (v && v.toLowerCase() !== 'x') ? v : ''; })();
+            await pool.query(`
+              INSERT INTO its_dossiers (date_reception, reference, pannes, magasin, decision, tracking, date_expe)
+              VALUES ($1,$2,$3,$4,$5,$6,$7)
+              ON CONFLICT (date_reception, reference, magasin) DO UPDATE SET
+                pannes = EXCLUDED.pannes, decision = EXCLUDED.decision,
+                tracking = CASE WHEN EXCLUDED.tracking <> '' THEN EXCLUDED.tracking ELSE its_dossiers.tracking END,
+                date_expe = CASE WHEN EXCLUDED.date_expe <> '' THEN EXCLUDED.date_expe ELSE its_dossiers.date_expe END
+            `, [(r[0]||'').toString().trim(), (r[1]||'').toString().trim(), (r[3]||'').toString().trim(),
+                (r[4]||'').toString().trim(), (r[8]||'').toString().trim(), tv, dEx]).catch(() => { skip++; });
+            maj++;
+          }
+        }
+        console.log('Sync complet phase', phase, ':', from + '-' + to, '/', total, '→', maj, 'maj');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ phase, from, to, total, maj, trk, skip, next: to + 1, done_phase: to >= total }));
+        return;
+      }
+
+      // ── HARMONISATION MAGASINS ITS 1/2 : détection des variantes ──
+      // Groupées par département + nom normalisé (accents/tirets/SAINT-ST).
+      if (req.url === '/magasins-variantes') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ groupes: [] })); return; }
+        const normV = v => String(v || '').toUpperCase()
+          .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+          .replace(/[^A-Z0-9]/g, '').replace(/SAINT/g, 'ST');
+        const univers = payload.univers === 'su' ? 'su' : 'its';
+        const q = univers === 'su'
+          ? await pool.query(`SELECT departement_ville AS magasin, COUNT(*) AS n,
+                MAX(date_reception::date) AS dernier FROM dossiers GROUP BY departement_ville`)
+          : await pool.query(`SELECT magasin, COUNT(*) AS n,
+                MAX(COALESCE(created_at::date, NOW()::date)) AS dernier FROM its_dossiers GROUP BY magasin`);
+        const groupes = {};
+        for (const r of q.rows) {
+          const mag = String(r.magasin || '').trim();
+          if (!mag) continue;
+          const dept = (mag.match(/^(\d{2,3})/) || [])[1] || '?';
+          const cle = dept + '|' + normV(mag.replace(/^\d{2,3}\s*/, ''));
+          (groupes[cle] = groupes[cle] || []).push({ nom: mag, n: parseInt(r.n), dernier: r.dernier ? String(r.dernier).slice(0, 10) : null });
+        }
+        const variantes = Object.values(groupes)
+          .filter(g => g.length >= 2)
+          .map(g => g.sort((a, b) => b.n - a.n))
+          .sort((a, b) => (b[0].n + (b[1] ? b[1].n : 0)) - (a[0].n + (a[1] ? a[1].n : 0)));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ groupes: variantes }));
+        return;
+      }
+
+      // ── HARMONISATION MAGASINS ITS 2/2 : fusion VALIDÉE ───────────
+      // Remplace UNIQUEMENT les cellules dont le contenu est EXACTEMENT
+      // une variante à fusionner (comparaison stricte après trim), dans :
+      // INTERSPORT col E, REMBOURSEMENT ITS col H, base its_dossiers.
+      if (req.url === '/magasins-fusion') {
+        if (!pool || !GOOGLE_SHEET_ID) { res.writeHead(500); res.end(JSON.stringify({ error: 'base ou sheet manquant' })); return; }
+        if (payload.confirme !== true) { res.writeHead(400); res.end(JSON.stringify({ error: 'confirmation requise' })); return; }
+        const fusions = (Array.isArray(payload.fusions) ? payload.fusions : []).slice(0, 15)
+          .map(f => ({ garder: String(f.garder || '').trim(), remplacer: (f.remplacer || []).map(x => String(x).trim()).filter(x => x && x !== String(f.garder || '').trim()) }))
+          .filter(f => f.garder && f.remplacer.length);
+        if (!fusions.length) { res.writeHead(400); res.end(JSON.stringify({ error: 'aucune fusion valide' })); return; }
+        const univers = payload.univers === 'su' ? 'su' : 'its';
+        const token = await getSheetsToken();
+        const rapport = [];
+
+        // Colonnes concernées selon l'univers (et rien d'autre)
+        const feuilles = univers === 'su'
+          ? [{ nom: 'SYSTEME U', col: 'F' }, { nom: 'REMBOURSEMENT SU', col: 'G' }]
+          : [{ nom: 'INTERSPORT', col: 'E' }, { nom: 'REMBOURSEMENT ITS', col: 'H' }];
+        const ranges = feuilles.map(f2 => 'ranges=' + encodeURIComponent("'" + f2.nom + "'!" + f2.col + ':' + f2.col)).join('&');
+        const bg = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchGet?${ranges}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const cols = feuilles.map((f2, i) => ({ ...f2, values: ((bg.valueRanges || [])[i] || {}).values || [] }));
+
+        const updates = [];
+        for (const f of fusions) {
+          const compte = {};
+          cols.forEach(c => {
+            compte[c.nom] = 0;
+            c.values.forEach((row, i) => {
+              if (f.remplacer.includes(String(row[0] || '').trim())) {
+                updates.push({ range: "'" + c.nom + "'!" + c.col + (i + 1), values: [[f.garder]] });
+                compte[c.nom]++;
+              }
+            });
+          });
+          const db = univers === 'su'
+            ? await pool.query('UPDATE dossiers SET departement_ville = $1 WHERE TRIM(departement_ville) = ANY($2)', [f.garder, f.remplacer])
+            : await pool.query('UPDATE its_dossiers SET magasin = $1 WHERE TRIM(magasin) = ANY($2)', [f.garder, f.remplacer]);
+          rapport.push({ garder: f.garder, base: db.rowCount, feuilles: compte });
+        }
+        // Écriture en paquets de 200 cellules
+        for (let i = 0; i < updates.length; i += 200) {
+          await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchUpdate`, {
+            method: 'POST',
+            headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ valueInputOption: 'RAW', data: updates.slice(i, i + 200) })
+          });
+        }
+        console.log('Fusion magasins:', JSON.stringify(rapport));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, rapport }));
+        return;
+      }
+
+      // ── SUPPRESSION d'un dossier de l'historique (base seule) ─────
+      // Garde-fous : confirmation explicite requise, clé exacte, le Sheet
+      // n'est JAMAIS touché par cet endpoint.
+      if (req.url === '/dossier-delete') {
+        if (!pool) { res.writeHead(500); res.end(JSON.stringify({ error: 'base indisponible' })); return; }
+        if (payload.confirme !== true) { res.writeHead(400); res.end(JSON.stringify({ error: 'confirmation requise' })); return; }
+        let q;
+        if (payload.univers === 'its') {
+          const { date, ref, magasin } = payload;
+          if (!date || !ref || !magasin) { res.writeHead(400); res.end(JSON.stringify({ error: 'clé ITS incomplète' })); return; }
+          q = await pool.query('DELETE FROM its_dossiers WHERE date_reception = $1 AND reference = $2 AND magasin = $3', [date, ref, magasin]);
+        } else {
+          const usv = (payload.usv || '').trim();
+          if (!usv) { res.writeHead(400); res.end(JSON.stringify({ error: 'usv requis' })); return; }
+          q = await pool.query('DELETE FROM dossiers WHERE numero_dossier = $1', [usv]);
+        }
+        console.log('Dossier supprimé de la base:', JSON.stringify(payload));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, supprimes: q.rowCount }));
+        return;
+      }
+
+      // ── LIVRAISONS : jours d'expédition + détail d'un jour ────────
+      if (req.url === '/livraisons-jours') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ jours: [] })); return; }
+        const q = await pool.query(`
+          SELECT date_envoi, COUNT(*) AS n FROM dossiers
+          WHERE COALESCE(tracking,'') <> '' AND COALESCE(date_envoi,'') <> '' AND LOWER(date_envoi) <> 'x'
+          GROUP BY date_envoi`);
+        // La base mélange ISO (sync) et JJ/MM/AA (app) → on regroupe par jour réel
+        const toISO3 = v => {
+          const t = String(v || '').trim();
+          let m = t.match(/^(\d{4})-(\d{2})-(\d{2})/);
+          if (m) return m[1] + '-' + m[2] + '-' + m[3];
+          m = t.match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})$/);
+          if (m) return (m[3].length === 2 ? '20' + m[3] : m[3]) + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0');
+          return null;
+        };
+        const parJour = {};
+        q.rows.forEach(r => {
+          const iso = toISO3(r.date_envoi);
+          if (!iso) return;
+          parJour[iso] = (parJour[iso] || 0) + parseInt(r.n);
+        });
+        const jours = Object.entries(parJour)
+          .sort((a, b) => b[0].localeCompare(a[0]))
+          .slice(0, 90)
+          .map(([iso, n]) => ({ iso, fr: iso.slice(8, 10) + '/' + iso.slice(5, 7) + '/' + iso.slice(2, 4), n }));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ jours }));
+        return;
+      }
+      if (req.url === '/livraisons-jour') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ lignes: [] })); return; }
+        const iso = (payload.iso || '').trim();
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(iso)) { res.writeHead(400); res.end(JSON.stringify({ error: 'iso requis' })); return; }
+        const fr = iso.slice(8, 10) + '/' + iso.slice(5, 7) + '/' + iso.slice(2, 4);
+        const q = await pool.query(`
+          SELECT numero_dossier, enseigne, departement_ville, ref_produit, piece, tracking, date_envoi, notes, fla, revers_url
+          FROM dossiers
+          WHERE COALESCE(tracking,'') <> '' AND (date_envoi = $1 OR date_envoi = $2)
+          ORDER BY departement_ville`, [iso, fr]);
+        const lignes = q.rows.map(r => ({
+          tracking: r.tracking,
+          usv: r.numero_dossier,
+          fla: r.fla || (((r.notes || '').match(/FLA:([^\s]+)/) || [])[1] || ''),
+          date_envoi: fr,
+          magasin: r.departement_ville || '',
+          enseigne: r.enseigne || '',
+          ref: r.ref_produit || '',
+          piece: r.piece || '',
+          revers_url: r.revers_url || null
+        }));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ jour: fr, lignes }));
+        return;
+      }
+
+      // ── SYNC HISTORIQUE : Sheet → PostgreSQL ──────────────────
+      // Relit la fin des feuilles réelles et met à jour les bases
+      // historique (UPSERT — aucune suppression possible).
+      if (req.url === '/sync-historique') {
+        if (!pool || !GOOGLE_SHEET_ID) { res.writeHead(500); res.end(JSON.stringify({ error: 'base ou sheet manquant' })); return; }
+        const cible = payload.cible; // 'su' | 'its'
+        const token = await getSheetsToken();
+        const toIso = v => {
+          const m = String(v || '').trim().match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})$/);
+          if (!m) return null;
+          const y = m[3].length === 2 ? '20' + m[3] : m[3];
+          return y + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0');
+        };
+        const tail = async (sheet, keyCol, span, width) => {
+          const lenQ = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'" + sheet + "'!" + keyCol + ":" + keyCol)}`,
+            { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+          const last = (lenQ.values || []).length;
+          const from = Math.max(1, last - span);
+          const q = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'" + sheet + "'!A" + from + ":" + width + last)}`,
+            { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+          return q.values || [];
+        };
+
+        try {
+          if (cible === 'su') {
+            let up = 0, skip = 0, trk = 0;
+            // SYSTEME U (envois) — clé CNB/FLA
+            const rows = await tail('SYSTEME U', 'H', 12000, 'I');
+            for (const r of rows) {
+              const cnb = (r[7] || '').toString().trim(), fla = (r[8] || '').toString().trim();
+              const iso = toIso(r[0]);
+              const key = cnb || fla || (iso ? cleDirecte(iso, r[2], r[5], r[3]) : '');
+              if (!key || !iso) { skip++; continue; }
+              const dateEnvoiT = (() => { const v = (r[1] || '').toString().trim(); return (v && v.toLowerCase() !== 'x') ? (toIso(v) || v) : ''; })();
+              await pool.query(`
+                INSERT INTO dossiers (numero_dossier, enseigne, departement_ville, ref_produit, piece, decision, date_reception, notes, tracking, date_envoi, fla)
+                VALUES ($1,$2,$3,$4,$5,'envoi_piece',$6,$7,$8,$9,$10)
+                ON CONFLICT (numero_dossier) DO UPDATE SET
+                  enseigne = EXCLUDED.enseigne,
+                  departement_ville = EXCLUDED.departement_ville,
+                  ref_produit = EXCLUDED.ref_produit,
+                  piece = EXCLUDED.piece,
+                  date_reception = EXCLUDED.date_reception,
+                  tracking = CASE WHEN EXCLUDED.tracking <> '' THEN EXCLUDED.tracking ELSE dossiers.tracking END,
+                  date_envoi = CASE WHEN EXCLUDED.date_envoi <> '' THEN EXCLUDED.date_envoi ELSE dossiers.date_envoi END,
+                  notes = CASE WHEN EXCLUDED.notes ~ 'FLA:.' THEN EXCLUDED.notes ELSE dossiers.notes END,
+                  fla = CASE WHEN EXCLUDED.fla <> '' THEN EXCLUDED.fla ELSE dossiers.fla END
+              `, [key, (r[4] || '').toString().trim(), (r[5] || '').toString().trim(),
+                  (r[2] || '').toString().trim(), (r[3] || '').toString().trim(), iso,
+                  fla ? 'FLA:' + fla : '', (r[6] || '').toString().trim(), dateEnvoiT, fla]);
+              if ((r[6] || '').toString().trim()) trk++;
+              up++;
+            }
+            // REMBOURSEMENT SU — clé CNB (I) / FLA (M)
+            const rrows = await tail('REMBOURSEMENT SU', 'I', 1500, 'M');
+            for (const r of rrows) {
+              const cnb = (r[8] || '').toString().trim(), fla = (r[12] || '').toString().trim();
+              const iso = toIso(r[0]);
+              const key = cnb || fla || (iso ? cleDirecte(iso, r[2], r[6], '') : '');
+              if (!key || !iso) { skip++; continue; }
+              await pool.query(`
+                INSERT INTO dossiers (numero_dossier, enseigne, departement_ville, ref_produit, piece, decision, date_reception, notes, fla, accord, wisen)
+                VALUES ($1,$2,$3,$4,'','remboursement',$5,$6,$7,$8,$9)
+                ON CONFLICT (numero_dossier) DO UPDATE SET
+                  enseigne = EXCLUDED.enseigne,
+                  departement_ville = EXCLUDED.departement_ville,
+                  ref_produit = EXCLUDED.ref_produit,
+                  decision = 'remboursement',
+                  date_reception = EXCLUDED.date_reception,
+                  notes = CASE WHEN EXCLUDED.notes ~ 'FLA:.' THEN EXCLUDED.notes ELSE dossiers.notes END,
+                  fla = CASE WHEN EXCLUDED.fla <> '' THEN EXCLUDED.fla ELSE dossiers.fla END,
+                  accord = CASE WHEN EXCLUDED.accord <> '' THEN EXCLUDED.accord ELSE dossiers.accord END,
+                  wisen = CASE WHEN EXCLUDED.wisen <> '' THEN EXCLUDED.wisen ELSE dossiers.wisen END
+              `, [key, (r[5] || '').toString().trim(), (r[6] || '').toString().trim(),
+                  (r[2] || '').toString().trim(), iso, fla ? 'FLA:' + fla : '', fla,
+                  (r[9] || '').toString().trim(), (r[10] || '').toString().trim()]);
+              up++;
+            }
+            console.log('Sync SU:', up, 'dossiers,', trk, 'trackings,', skip, 'lignes sans clé/date');
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, maj: up, ignorees: skip, trackings: trk }));
+            return;
+          }
+
+          if (cible === 'its') {
+            let up = 0, skip = 0;
+            const rows = await tail('INTERSPORT', 'A', 1500, 'J');
+            for (const r of rows) {
+              const date = (r[0] || '').toString().trim();
+              const ref = (r[1] || '').toString().trim();
+              const mag = (r[4] || '').toString().trim();
+              if (!date || !ref || !mag || !/\d/.test(date)) { skip++; continue; }
+              const dExpeT = (() => { const v = (r[7] || '').toString().trim(); return (v && v.toLowerCase() !== 'x') ? v : ''; })();
+              await pool.query(`
+                INSERT INTO its_dossiers (date_reception, reference, pannes, magasin, decision, tracking, date_expe)
+                VALUES ($1,$2,$3,$4,$5,$6,$7)
+                ON CONFLICT (date_reception, reference, magasin) DO UPDATE SET
+                  pannes = EXCLUDED.pannes,
+                  decision = EXCLUDED.decision,
+                  tracking = EXCLUDED.tracking,
+                  date_expe = CASE WHEN EXCLUDED.date_expe <> '' THEN EXCLUDED.date_expe ELSE its_dossiers.date_expe END
+              `, [date, ref, (r[3] || '').toString().trim(), mag, (r[8] || '').toString().trim(), (r[9] || '').toString().trim(), dExpeT]);
+              up++;
+            }
+            console.log('Sync ITS:', up, 'dossiers,', skip, 'lignes ignorées');
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, maj: up, ignorees: skip }));
+            return;
+          }
+
+          res.writeHead(400); res.end(JSON.stringify({ error: 'cible su ou its requise' }));
+        } catch(e) {
+          console.error('Sync historique:', e.message);
+          res.writeHead(500); res.end(JSON.stringify({ error: e.message }));
+        }
+        return;
+      }
+
+      // ── INTERSPORT : données de réponse mail (relecture des lignes
+      // exportées dans REMBOURSEMENT ITS — les formules C/E/F/I y ont
+      // calculé prix, code article, EAN et code sociétaire) ──────────
+      if (req.url === '/its-reply-data') {
+        if (!GOOGLE_SHEET_ID) { res.writeHead(500); res.end(JSON.stringify({ error: 'GOOGLE_SHEET_ID manquant' })); return; }
+        const rows = (Array.isArray(payload.rows) ? payload.rows : []).map(n => parseInt(n)).filter(n => n > 0).slice(0, 20);
+        if (!rows.length) { res.writeHead(400); res.end(JSON.stringify({ error: 'rows requis' })); return; }
+        const token = await getSheetsToken();
+        const ranges = rows.map(n => 'ranges=' + encodeURIComponent("'REMBOURSEMENT ITS'!A" + n + ":K" + n)).join('&');
+        const bg = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchGet?${ranges}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const data = (bg.valueRanges || []).map((vr, i) => {
+          const r = (vr.values && vr.values[0]) || [];
+          return {
+            ligne: rows[i],
+            prix: (r[2] || '').toString().trim(),
+            qte: (r[3] || '').toString().trim(),
+            code_article: (r[4] || '').toString().trim(),
+            ean: (r[5] || '').toString().trim(),
+            ref: (r[6] || '').toString().trim(),
+            dept_ville: (r[7] || '').toString().trim(),
+            code_societaire: (r[8] || '').toString().trim(),
+            accord: (r[9] || '').toString().trim()
+          };
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ data }));
+        return;
+      }
+
+      // ── VILLES VALIDÉES : le format choisi par l'opérateur fait foi ──
+      if (req.url === '/ville-ref-get' || req.url === '/ville-ref-set') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ format: null })); return; }
+        const normV2 = v => String(v || '').toUpperCase()
+          .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+          .replace(/[^A-Z0-9]/g, '').replace(/SAINT/g, 'ST');
+        if (req.url === '/ville-ref-set') {
+          const format = (payload.format || '').trim();
+          if (!format) { res.writeHead(400); res.end(JSON.stringify({ error: 'format requis' })); return; }
+          const cle = normV2(format.replace(/^\d{2,3}\s*/, ''));
+          if (!cle) { res.writeHead(400); res.end(JSON.stringify({ error: 'format invalide' })); return; }
+          await pool.query(`
+            INSERT INTO villes_ref (norm, format) VALUES ($1, $2)
+            ON CONFLICT (norm) DO UPDATE SET format = EXCLUDED.format, created_at = NOW()
+          `, [cle, format]);
+          console.log('Ville validée:', format);
+          res.writeHead(200); res.end(JSON.stringify({ ok: true }));
+          return;
+        }
+        // GET : retrouver le format validé pour un nom scanné.
+        // Tolérant : exact d'abord, puis inclusion (le dossier du jour peut
+        // écrire "BREST CEDEX 9" là où l'écriture validée est "29 BREST").
+        const cle = normV2((payload.nom || '').replace(/^\d{2,3}\s*/, ''));
+        if (!cle) { res.writeHead(200); res.end(JSON.stringify({ format: null })); return; }
+        const q = await pool.query('SELECT norm, format FROM villes_ref');
+        let hit = q.rows.find(r => r.norm === cle);
+        if (!hit && cle.length >= 3) {
+          hit = q.rows.find(r => r.norm.length >= 3 && (r.norm.includes(cle) || cle.includes(r.norm)));
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ format: hit ? hit.format : null }));
+        return;
+      }
+
+      // ── INTERSPORT : retrouver le "NN VILLE" connu d'un magasin ──
+      if (req.url === '/its-magasin-lookup' || req.url === '/magasin-lookup') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ magasin: null })); return; }
+        const nomBrut = (payload.nom || '').trim();
+        if (!nomBrut) { res.writeHead(400); res.end(JSON.stringify({ error: 'nom requis' })); return; }
+        const normL = v => String(v || '').toUpperCase()
+          .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+          .replace(/[^A-Z0-9]/g, '').replace(/SAINT/g, 'ST');
+        const cible = normL(nomBrut.replace(/^\d{2,3}\s*/, ''));
+        if (!cible) { res.writeHead(200); res.end(JSON.stringify({ magasin: null })); return; }
+        const q = payload.univers === 'su'
+          ? await pool.query(`
+              SELECT departement_ville AS magasin, MAX(date_reception) AS dernier FROM dossiers
+              WHERE departement_ville ~ '^\\d{2,3} ' GROUP BY departement_ville ORDER BY dernier DESC NULLS LAST LIMIT 600`)
+          : await pool.query(`
+              SELECT magasin, MAX(created_at) AS dernier FROM its_dossiers
+              WHERE magasin ~ '^\\d{2,3} ' GROUP BY magasin ORDER BY dernier DESC LIMIT 400`);
+        const hit = q.rows.find(r => {
+          const n = normL(String(r.magasin).replace(/^\d{2,3}\s*/, ''));
+          return n === cible || n.includes(cible) || cible.includes(n);
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ magasin: hit ? hit.magasin : null }));
+        return;
+      }
+
+      // ── INTERSPORT : historique par magasin (4 mois) ──────────
+      if (req.url === '/its-historique') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ total: 0, dossiers: [] })); return; }
+        const mag = (payload.magasin || '').trim();
+        if (!mag) { res.writeHead(400); res.end(JSON.stringify({ error: 'magasin requis' })); return; }
+        // Matching TOLÉRANT : accents, tirets, points, espaces et SAINT/ST
+        // sont neutralisés — "85 ST-JEAN-DE-MONTS" ≡ "85 SAINT JEAN DE MONTS"
+        const normMag = v => String(v || '').toUpperCase()
+          .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+          .replace(/[^A-Z0-9]/g, '').replace(/SAINT/g, 'ST');
+        const dept = (mag.match(/^(\d{2,3})/) || [])[1] || '';
+        const cible = normMag(mag.replace(/^\d{2,3}\s*/, ''));
+        const q = await pool.query(`
+          SELECT magasin, date_reception, reference, pannes, decision, accord, tracking, quantite, date_expe, created_at
+          FROM its_dossiers
+          WHERE magasin ILIKE $1 AND created_at > NOW() - INTERVAL '4 months'
+          ORDER BY created_at DESC LIMIT 500
+        `, [dept ? dept + '%' : '%']);
+        const dossiers = q.rows.filter(r => {
+          const n = normMag(String(r.magasin || '').replace(/^\d{2,3}\s*/, ''));
+          return n === cible || n.includes(cible) || cible.includes(n);
+        }).slice(0, 60);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ total: dossiers.length, dossiers }));
+        return;
+      }
+
+      // ── INTERSPORT 0/2 : référentiel produits lu DANS le Sheet ──
+      // Feuilles CODE PRODUITS + PRIX AVOIR, jointes et mises en cache 30 min.
+      // Toujours à jour : modifier le Sheet suffit, aucun fichier à régénérer.
+      if (req.url === '/its-referentiel') {
+        if (!GOOGLE_SHEET_ID) { res.writeHead(500); res.end(JSON.stringify({ error: 'GOOGLE_SHEET_ID manquant' })); return; }
+        global._itsRefCache = global._itsRefCache || { ts: 0, items: [] };
+        const FRESH = 30 * 60 * 1000;
+        if (!payload.force && global._itsRefCache.items.length && Date.now() - global._itsRefCache.ts < FRESH) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ items: global._itsRefCache.items, cached: true }));
+          return;
+        }
+        const token = await getSheetsToken();
+        const bg = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchGet?ranges=${encodeURIComponent("'CODE PRODUITS'!A:G")}&ranges=${encodeURIComponent("'PRIX AVOIR'!A:F")}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        if (!bg.valueRanges) { res.writeHead(500); res.end(JSON.stringify({ error: 'Lecture des feuilles CODE PRODUITS / PRIX AVOIR impossible', detail: bg.error?.message })); return; }
+        const nrmJ = v => String(v || '').toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^A-Z0-9]/g, '');
+        const prixByCode = {}, prixByName = {};
+        (bg.valueRanges[1].values || []).slice(2).forEach(r => {
+          const code = (r[0] || '').toString().trim(), lib = (r[1] || '').toString().trim();
+          let v = r[4] !== undefined ? String(r[4]).trim() : '';
+          if (!v) return;
+          const num = parseFloat(v.replace(',', '.'));
+          if (!isNaN(num)) v = String(Math.round(num * 100) / 100);
+          if (code) prixByCode[nrmJ(code)] = v;
+          if (lib) prixByName[nrmJ(lib)] = v;
+        });
+        const items = [];
+        (bg.valueRanges[0].values || []).slice(2).forEach(r => {
+          const ref = (r[0] || '').toString().trim();
+          if (!ref) return;
+          const art = (r[3] || '').toString().trim();
+          items.push({
+            ref,
+            ean: (r[1] || '').toString().trim(),
+            action: (r[4] || '').toString().trim(),
+            famille: (r[6] || '').toString().trim(),
+            prix: prixByCode[nrmJ(art)] || prixByName[nrmJ(ref)] || ''
+          });
+        });
+        global._itsRefCache = { ts: Date.now(), items };
+        console.log('Référentiel ITS rechargé depuis le Sheet:', items.length, 'produits');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ items }));
+        return;
+      }
+
+      // ── INTERSPORT 1/2 : extraction mail + bon de retour ──────
+      if (req.url === '/its-extract') {
+        const content = [];
+        const files = Array.isArray(payload.files) ? payload.files
+          : (payload.file_b64 ? [{ b64: payload.file_b64, media: payload.media_type || 'application/pdf' }] : []);
+        for (const f of files.slice(0, 3)) {
+          content.push(f.media === 'application/pdf'
+            ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: f.b64 } }
+            : { type: 'image', source: { type: 'base64', media_type: f.media || 'image/png', data: f.b64 } });
+        }
+        const _now = new Date();
+        const _jours = ['dimanche','lundi','mardi','mercredi','jeudi','vendredi','samedi'];
+        const _aujourdhui = _jours[_now.getDay()] + ' ' + String(_now.getDate()).padStart(2,'0') + '/' + String(_now.getMonth()+1).padStart(2,'0') + '/' + _now.getFullYear();
+        content.push({ type: 'text', text: `NOUS SOMMES LE ${_aujourdhui}.
+
+Voici un dossier SAV Intersport : le texte du mail reçu, et si joints, des documents (bon de retour PDF, photos du produit, ticket de caisse).
+
+TEXTE DU MAIL :
+${(payload.mail_text || '(non fourni)').slice(0, 6000)}
+
+Extrais les informations suivantes. Règles :
+- date_mail : la date d'ENVOI DU MAIL, convertie en JJ/MM/AA. Le webmail l'affiche souvent en RELATIF — c'est NORMAL et ce n'est PAS une incertitude, convertis-la avec la date du jour donnée ci-dessus. CAS LE PLUS COURANT sur ce webmail : "jeu. 23/07, 13:59" → la date est ÉCRITE (23/07), prends-la telle quelle et complète avec l'année en cours (si elle tombait dans le futur, c'est l'année précédente) → 23/07/26. Autres formats : "13:59" seul = aujourd'hui ; "hier" = la veille ; "jeu. 13:59" sans jour/mois = le jeudi le plus récent ; une date complète type "Envoyé : mardi 14 avril 2026" se prend telle quelle. La date du bon de retour ne sert JAMAIS de date_mail (elle peut au mieux confirmer ta conversion). Ne mets date_mail en incertitude que si le mail n'affiche vraiment AUCUNE indication de date ou d'heure — et dans ce cas mets null : n'invente JAMAIS une date.
+- ville et cp : RÈGLE DE PRIORITÉ STRICTE. 1) Si un bon de retour est joint : le magasin est celui écrit dans le bloc en haut à gauche du bon — c'est LUI qui fait foi, ignore la signature du mail. 2) Sans bon de retour : lis attentivement le mail — l'expéditeur peut être la centrale Intersport France écrivant POUR un magasin ; le magasin concerné est alors celui NOMMÉ dans le texte du mail, pas l'expéditeur. N'utilise la signature que si l'expéditeur est manifestement le magasin lui-même. 3) Jamais l'adresse du siège (Intersport France, Longjumeau, 91). 4) INTERDICTION ABSOLUE d'inventer : si le magasin n'est LISIBLE ni sur le bon ni dans le mail, mets null et signale-le en incertitude — ne fournis JAMAIS un magasin de mémoire, par habitude ou par ressemblance avec un autre dossier. Recopie le nom depuis le document, ne le reconstruis pas.
+- magasin_nom : le nom du magasin (ex JAUDE SPORT, INTERSPORT JAUDE).
+- produits : la liste de TOUS les produits du bon de retour (il peut y en avoir plusieurs, une ligne de tableau chacun). Pour chaque produit : son NOM/désignation (ex E SWIM 10) et marque si visible — PAS la référence chiffrée qui est propre au magasin — sa quantité, et son motif propre s'il est indiqué sur sa ligne.
+- motif_global : la panne/le motif général s'il est écrit hors tableau (mail, haut du bon).
+Réponds UNIQUEMENT avec ce JSON, sans texte autour :
+{"date_mail":"JJ/MM/AA","cp":"63000","ville":"CLERMONT FERRAND","magasin_nom":"...","motif_global":"...","produits":[{"produit_nom":"...","marque":"...","quantite":1,"motif":"..."}],"incertitudes":["champ : explication courte"]}` });
+
+        let aiData = await callAnthropic({
+          model: process.env.MODEL_EXTRACT || MODEL_MAIN,
+          messages: [{ role: 'user', content }],
+          max_tokens: 2500
+        });
+        let raw = (aiData.content || []).map(b => b.text || '').join('');
+        let parsed = parseJsonModel(raw);
+        // Réponse coupée en plein JSON (gros bon multi-produits) → relance élargie
+        if (!parsed && aiData.stop_reason === 'max_tokens') {
+          aiData = await callAnthropic({
+            model: process.env.MODEL_EXTRACT || MODEL_MAIN,
+            messages: [{ role: 'user', content }],
+            max_tokens: 6000
+          });
+          raw = (aiData.content || []).map(b => b.text || '').join('');
+          parsed = parseJsonModel(raw);
+        }
+        if (!parsed) console.warn('Extraction ITS illisible — stop:', aiData.stop_reason, '— raw:', raw.slice(0, 600));
+        // Filtre dur : une incertitude n'est recevable QUE sur les champs utiles
+        // (magasin/ville/cp, produit, quantité, motif/panne, date). Tout le reste
+        // (marque, numéros de retour, références internes…) est écarté d'office.
+        if (parsed && Array.isArray(parsed.incertitudes)) {
+          const champsUtiles = /^(magasin|ville|cp|produit|quantit|motif|panne|date)/i;
+          parsed.incertitudes = parsed.incertitudes
+            .map(x => String(x || '').trim())
+            .filter(x => champsUtiles.test(x));
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(parsed || { error: 'Extraction illisible', raw: raw.slice(0, 300) }));
+        return;
+      }
+
+      // ── INTERSPORT 2/2 : export INTERSPORT + bascule REMBOURSEMENT ITS ──
+      if (req.url === '/its-export') {
+        if (!GOOGLE_SHEET_ID) { res.writeHead(500); res.end(JSON.stringify({ error: 'GOOGLE_SHEET_ID manquant' })); return; }
+        const d = payload;
+        const produits = Array.isArray(d.produits) ? d.produits : [];
+        if (!d.date || !d.magasin || !produits.length) { res.writeHead(400); res.end(JSON.stringify({ error: 'date, magasin et produits requis' })); return; }
+        d.magasin = normMagasinIts(d.magasin);
+        const token = await getSheetsToken();
+
+        const now = new Date();
+        const jj = String(now.getDate()).padStart(2, '0');
+        const mm = String(now.getMonth() + 1).padStart(2, '0');
+        const aa = String(now.getFullYear()).slice(2);
+        const todayFR = jj + '/' + mm + '/' + aa;
+
+        // Anti-doublon (date + référence + magasin)
+        const existing = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'INTERSPORT'!A:E")}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const nrmD = v => String(v || '').toUpperCase().trim();
+        const exRows = existing.values || [];
+        const isDup = (ref) => exRows.some(row =>
+          nrmD(row[0]) === nrmD(d.date) && nrmD(row[1]) === nrmD(ref) &&
+          nrmD(row[4]).includes(nrmD(d.magasin).slice(0, 12)));
+
+        const values = [], applied = [], skipped = [], avoirProds = [];
+        for (const p of produits) {
+          const ref = (p.reference || '').trim();
+          if (!ref) { skipped.push({ reference: '?', reason: 'référence vide' }); continue; }
+          if (isDup(ref)) { skipped.push({ reference: ref, reason: 'déjà dans la feuille (même date/magasin)' }); continue; }
+          const etat = (p.decision || '').trim();
+          const isAvoir = etat.toUpperCase() === 'AVOIR';
+          const commentaires = [p.quantite && parseInt(p.quantite) > 1 ? 'Qté ' + p.quantite : '',
+                                d.commentaires || ''].filter(Boolean).join(' — ');
+          // A DATE | B REF | C LOT | D PANNES | E MAGASIN | F COMM | G DATE RECEP | H DATE EXPE | I ETAT | J TRACKING
+          values.push([d.date, ref, p.lot || '', p.pannes || '', d.magasin, commentaires, '', isAvoir ? todayFR : '', etat, '']);
+          applied.push({ reference: ref, etat });
+          if (isAvoir) avoirProds.push(p);
+        }
+
+        // Écriture INTERSPORT (append = ajout pur) + couleurs selon décision
+        let firstRow = null;
+        if (values.length) {
+          const ap = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'INTERSPORT'!A:J")}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`, {
+            method: 'POST',
+            headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ values })
+          }).then(r => r.json());
+          const ur = ap.updates && ap.updates.updatedRange;
+          const mrow = ur && ur.match(/![A-Z]+(\d+)/);
+          if (mrow) firstRow = parseInt(mrow[1]);
+
+          if (firstRow) {
+            const gid = await getSheetGid(token, 'INTERSPORT');
+            if (gid !== null) {
+              const requests = [];
+              values.forEach((row, i) => {
+                const etat = (row[8] || '').toUpperCase();
+                // Blanc EXPLICITE par défaut : l'append hérite parfois du fond
+                // de la ligne précédente (ex : verte) — on force la couleur voulue.
+                let color = { red: 1, green: 1, blue: 1 };
+                if (etat === 'AVOIR') color = { red: 146/255, green: 208/255, blue: 80/255 };          // #92d050
+                else if (etat === 'DEMANDE RENVOI') color = { red: 1, green: 153/255, blue: 1 };        // #ff99ff
+                if (color) requests.push({
+                  repeatCell: {
+                    range: { sheetId: gid, startRowIndex: firstRow - 1 + i, endRowIndex: firstRow + i, startColumnIndex: 0, endColumnIndex: 10 },
+                    cell: { userEnteredFormat: { backgroundColor: color } },
+                    fields: 'userEnteredFormat.backgroundColor'
+                  }
+                });
+              });
+              if (requests.length) {
+                await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}:batchUpdate`, {
+                  method: 'POST',
+                  headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ requests })
+                });
+              }
+            }
+          }
+        }
+
+        // ── Bascule des AVOIR vers REMBOURSEMENT ITS ─────────────
+        // Feuille dynamique : on n'écrit QUE B, D, G, H (et J si non-DDP).
+        // Les colonnes à formules (A, C, E, F, I, K) ne sont jamais touchées.
+        const remboursements = [];
+        if (avoirProds.length) {
+          const bg = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchGet?ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!B:B")}&ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!G:G")}&ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!J:J")}`,
+            { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+          const vr = bg.valueRanges || [];
+          const lens = vr.map(v => (v.values || []).length);
+          let row = Math.max(4, ...lens) + 1; // première ligne libre (données dès la ligne 5)
+
+          // Dernier numéro d'accord du mois courant (colonne J)
+          const jvals = ((vr[2] || {}).values || []).map(x => (x[0] || '').toString().trim());
+          const prefix = 'ITS' + aa + mm;
+          let maxSeq = 0;
+          const reNum = new RegExp('^' + prefix + '(\\d{3})$');
+          jvals.forEach(v => { const m = v.match(reNum); if (m) maxSeq = Math.max(maxSeq, parseInt(m[1])); });
+
+          // Date complète (JJ/MM/AAAA) + quantité numérique, écrites en
+          // USER_ENTERED : Sheets les enregistre en VRAIS date/nombre,
+          // alignés comme le reste de la feuille (pas d'apostrophe texte).
+          const dParts = (d.date || '').match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+          const dateFull = dParts ? dParts[1].padStart(2,'0') + '/' + dParts[2].padStart(2,'0') + '/' + (dParts[3].length === 4 ? dParts[3].slice(2) : dParts[3].padStart(2,'0')) : d.date;
+          const updates = [];
+          for (const p of avoirProds) {
+            const isDDP = String(p.prix || '').toUpperCase().includes('DDP');
+            let accord = '';
+            if (!isDDP) { maxSeq++; accord = prefix + String(maxSeq).padStart(3, '0'); }
+            updates.push({ range: "'REMBOURSEMENT ITS'!B" + row, values: [[dateFull]] });
+            updates.push({ range: "'REMBOURSEMENT ITS'!D" + row, values: [[parseInt(p.quantite) || 1]] });
+            updates.push({ range: "'REMBOURSEMENT ITS'!G" + row, values: [[p.reference]] });
+            updates.push({ range: "'REMBOURSEMENT ITS'!H" + row, values: [[d.magasin]] });
+            if (accord) updates.push({ range: "'REMBOURSEMENT ITS'!J" + row, values: [[accord]] });
+            remboursements.push({ reference: p.reference, ligne: row, accord: accord || '(DDP — sans numéro)' });
+            row++;
+          }
+          await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchUpdate`, {
+            method: 'POST',
+            headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ valueInputOption: 'USER_ENTERED', data: updates })
+          });
+        }
+
+        // Historique ITS en base (arrière-plan, non bloquant)
+        if (pool && applied.length) {
+          const accordByRef = {};
+          remboursements.forEach(r => { accordByRef[r.reference] = r.accord; });
+          for (const a of applied) {
+            const pr = produits.find(p => (p.reference || '').trim() === a.reference) || {};
+            pool.query(
+              'INSERT INTO its_dossiers (date_reception, reference, pannes, magasin, decision, accord, date_expe, quantite) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+              [d.date, a.reference, pr.pannes || '', d.magasin, a.etat || '', accordByRef[a.reference] || '',
+               (a.etat || '').toUpperCase() === 'AVOIR' ? todayFR : '',
+               (pr.quantite || a.quantite || '').toString().trim()]
+            ).catch(e => console.warn('Historique ITS:', e.message));
+          }
+        }
+        console.log('Export ITS:', applied.length, 'ligne(s) INTERSPORT,', remboursements.length, 'remboursement(s),', skipped.length, 'ignorée(s)');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ applied, skipped, remboursements }));
+        return;
+      }
+
+      // ── TRACKINGS : helpers ───────────────────────────────────
+      async function getSheetGid(token, sheetName) {
+        const meta = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}?fields=sheets.properties`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const sh = (meta.sheets || []).find(x => x.properties && x.properties.title === sheetName);
+        return sh ? sh.properties.sheetId : null;
+      }
+      async function getExpedieColor() {
+        // Vert EXPEDIE officiel du tableau : #92d050
+        return { red: 146/255, green: 208/255, blue: 80/255 };
+      }
+
+      // ── TRACKINGS 1/3 : lignes candidates (marquées d'un x) ───
+      if (req.url === '/trackings-candidates') {
+        if (!GOOGLE_SHEET_ID) { res.writeHead(500); res.end(JSON.stringify({ error: 'GOOGLE_SHEET_ID manquant' })); return; }
+        const token = await getSheetsToken();
+        const data = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'SYSTEME U'!A:I")}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const rows = data.values || [];
+        const candidates = [];
+        rows.forEach((r, i) => {
+          const dateExpe = (r[1] || '').toString().trim().toLowerCase();
+          if (dateExpe === 'x') {
+            candidates.push({
+              row: i + 1, // numéro de ligne Sheet (1-based)
+              date_recep: r[0] || '', ref: r[2] || '', piece: r[3] || '',
+              enseigne: r[4] || '', ville: r[5] || '', tracking: r[6] || '', cnb: r[7] || ''
+            });
+          }
+        });
+        // Candidats INTERSPORT : lignes marquées d'un x en colonne H
+        // (même convention que Système U — lève l'ambiguïté des villes en doublon)
+        let its_candidates = [];
+        try {
+          const itsData = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'INTERSPORT'!A:J")}`,
+            { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+          const itsRows = itsData.values || [];
+          itsRows.forEach((r, i) => {
+            const marque = (r[7] || '').toString().trim().toLowerCase() === 'x';
+            const mag = (r[4] || '').toString().trim();
+            if (marque && mag) {
+              its_candidates.push({ row: i + 1, date: r[0] || '', ref: r[1] || '',
+                pannes: r[3] || '', magasin: mag, etat: r[8] || '', tracking: r[9] || '' });
+            }
+          });
+        } catch(e) { console.warn('Candidats ITS:', e.message); }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ candidates, its_candidates }));
+        return;
+      }
+
+      // ── TRACKINGS 2/3 : extraction du bordereau par Claude ────
+      if (req.url === '/trackings-extract') {
+        const media = payload.media_type || 'image/png';
+        const isPdf = media === 'application/pdf';
+        const block = isPdf
+          ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: payload.file_b64 } }
+          : { type: 'image', source: { type: 'base64', media_type: media, data: payload.file_b64 } };
+        const prompt = `Voici un bordereau d'expédition transporteur (DPD : tableau avec colonnes Date/B.L./N° Colis/Client/C.P./Localité — ou DSV : liste de fret avec N° d'expédition et blocs DESTINATAIRE).
+Extrais TOUTES les expéditions du document.
+Règles :
+- DPD : tracking = N° Colis (13 chiffres). DSV : tracking = N° d'expédition (8 chiffres commençant par 0).
+- ville = nom de la localité SEULE (sans adresse, sans téléphone). cp = code postal 5 chiffres.
+- enseigne = SUPER U, HYPER U, U EXPRESS, INTERSPORT… telle qu'écrite.
+- date = la date d'expédition du bordereau au format JJ/MM/AAAA.
+Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
+{"transporteur":"DPD|DSV|AUTRE","date":"JJ/MM/AAAA","lignes":[{"tracking":"...","cp":"...","ville":"...","enseigne":"..."}]}`;
+        // Extraction bordereaux : les numéros ne sont PAS revérifiés par
+        // l'opérateur → modèle principal obligatoire (fiabilité des chiffres).
+        let aiData = await callAnthropic({
+          model: process.env.MODEL_EXTRACT || MODEL_MAIN,
+          messages: [{ role: 'user', content: [ block, { type: 'text', text: prompt } ] }],
+          max_tokens: 4000
+        });
+        let raw = (aiData.content || []).map(b => b.text || '').join('');
+        let parsed = parseJsonModel(raw);
+        if (!parsed && aiData.stop_reason === 'max_tokens') {
+          aiData = await callAnthropic({
+            model: process.env.MODEL_EXTRACT || MODEL_MAIN,
+            messages: [{ role: 'user', content: [ block, { type: 'text', text: prompt } ] }],
+            max_tokens: 8000
+          });
+          raw = (aiData.content || []).map(b => b.text || '').join('');
+          parsed = parseJsonModel(raw);
+        }
+        if (!parsed) console.warn('Extraction bordereau illisible — stop:', aiData.stop_reason, '— raw:', raw.slice(0, 600));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(parsed || { error: 'Extraction illisible', raw: raw.slice(0, 300) }));
+        return;
+      }
+
+      // ── TRACKINGS 3/3 : écriture sécurisée dans le Sheet ──────
+      if (req.url === '/trackings-apply') {
+        if (!GOOGLE_SHEET_ID) { res.writeHead(500); res.end(JSON.stringify({ error: 'GOOGLE_SHEET_ID manquant' })); return; }
+        const items = Array.isArray(payload.items) ? payload.items : [];
+        let dateExpe = (payload.date_expe || '').trim();
+        // Un envoi peut être 100 % Intersport (aucune ligne SU) : il faut la
+        // date et AU MOINS une ligne, tous univers confondus.
+        const itemsIts0 = Array.isArray(payload.its_items) ? payload.its_items : [];
+        if ((!items.length && !itemsIts0.length) || !dateExpe) { res.writeHead(400); res.end(JSON.stringify({ error: 'date d\u2019expédition et au moins une ligne (SU ou ITS) requis' })); return; }
+        // Format maison du tableau : JJ/MM/AA (ex 22/07/26)
+        const dm = dateExpe.match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})$/);
+        if (dm) {
+          const jj = dm[1].padStart(2, '0'), mm = dm[2].padStart(2, '0');
+          const aa = dm[3].length === 4 ? dm[3].slice(2) : dm[3].padStart(2, '0');
+          dateExpe = jj + '/' + mm + '/' + aa;
+        }
+        const token = await getSheetsToken();
+        const applied = [], skipped = [];
+        const valueUpdates = [];
+
+        for (const it of items) {
+          const row = parseInt(it.row);
+          const trk = (it.tracking || '').toString().trim();
+          if (!row || !trk) { skipped.push({ row: it.row, reason: 'données incomplètes' }); continue; }
+          // GARDE-FOU : relire la ligne juste avant d'écrire
+          const check = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'SYSTEME U'!A" + row + ":I" + row)}`,
+            { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+          const cur = (check.values && check.values[0]) || [];
+          const curX = (cur[1] || '').toString().trim().toLowerCase();
+          const curTrk = (cur[6] || '').toString().trim();
+          if (curX !== 'x') { skipped.push({ row, reason: "la ligne ne porte plus le marqueur x" }); continue; }
+          // x présent → la colonne G ne contient que des notes de préparation
+          // (emplacements entrepôt, rappels…) : l'écrasement par le tracking
+          // est LE comportement attendu. Le garde-fou anti-écrasement ne vaut
+          // que pour les lignes sans x (déjà traitées) — bloquées ci-dessus.
+          valueUpdates.push({ range: "'SYSTEME U'!B" + row, values: [[dateExpe]] });
+          valueUpdates.push({ range: "'SYSTEME U'!G" + row, values: [[trk]] });
+          applied.push({ row, tracking: trk,
+            date_recep: (cur[0] || '').toString().trim(),
+            cnb: (cur[7] || '').toString().trim(),
+            fla: (cur[8] || '').toString().trim(),
+            enseigne: (cur[4] || '').toString().trim(),
+            magasin: (cur[5] || '').toString().trim(),
+            ref: (cur[2] || '').toString().trim(),
+            piece: (cur[3] || '').toString().trim(),
+            date_envoi: dateExpe });
+        }
+
+        // Écriture par lots : UNIQUEMENT les cellules B et G des lignes validées
+        if (valueUpdates.length) {
+          await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchUpdate`, {
+            method: 'POST',
+            headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ valueInputOption: 'RAW', data: valueUpdates })
+          });
+        }
+
+        // Couleur EXPEDIE (copiée de la légende H2) sur les lignes écrites
+        if (applied.length) {
+          const gid = await getSheetGid(token, 'SYSTEME U');
+          if (gid !== null) {
+            const color = await getExpedieColor();
+            const requests = applied.map(a => ({
+              repeatCell: {
+                range: { sheetId: gid, startRowIndex: a.row - 1, endRowIndex: a.row, startColumnIndex: 0, endColumnIndex: 9 },
+                cell: { userEnteredFormat: { backgroundColor: color } },
+                fields: 'userEnteredFormat.backgroundColor'
+              }
+            }));
+            await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}:batchUpdate`, {
+              method: 'POST',
+              headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ requests })
+            });
+          }
+        }
+
+        // ── Trackings INTERSPORT : colonne J + vert A→J ──────────
+        const itsItems = Array.isArray(payload.its_items) ? payload.its_items : [];
+        const itsApplied = [], itsSkipped = [];
+        if (itsItems.length) {
+          const itsUpdates = [];
+          for (const it of itsItems) {
+            const row = parseInt(it.row);
+            const trk = (it.tracking || '').toString().trim();
+            if (!row || !trk) { itsSkipped.push({ row: it.row, reason: 'données incomplètes' }); continue; }
+            // GARDE-FOU : relire la ligne avant d'écrire
+            const check = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'INTERSPORT'!A" + row + ":J" + row)}`,
+              { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+            const cur = (check.values && check.values[0]) || [];
+            const curX = (cur[7] || '').toString().trim().toLowerCase();
+            const curTrk = (cur[9] || '').toString().trim();
+            if (curX !== 'x') { itsSkipped.push({ row, reason: "la ligne ne porte plus le marqueur x" }); continue; }
+            if (curTrk && curTrk !== trk) { itsSkipped.push({ row, reason: 'un tracking différent est déjà présent (' + curTrk + ')' }); continue; }
+            itsUpdates.push({ range: "'INTERSPORT'!H" + row, values: [[dateExpe]] });
+            itsUpdates.push({ range: "'INTERSPORT'!J" + row, values: [[trk]] });
+            itsApplied.push({ row, tracking: trk, date: (cur[0] || '').toString().trim(),
+                              ref: (cur[1] || '').toString().trim(), magasin: (cur[4] || '').toString().trim() });
+          }
+          if (itsUpdates.length) {
+            await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchUpdate`, {
+              method: 'POST',
+              headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ valueInputOption: 'RAW', data: itsUpdates })
+            });
+            const itsGid = await getSheetGid(token, 'INTERSPORT');
+            if (itsGid !== null) {
+              const requests = itsApplied.map(a => ({
+                repeatCell: {
+                  range: { sheetId: itsGid, startRowIndex: a.row - 1, endRowIndex: a.row, startColumnIndex: 0, endColumnIndex: 10 },
+                  cell: { userEnteredFormat: { backgroundColor: gesteCo
+                    ? { red: 1, green: 192/255, blue: 0 }          // orange #ffc000 : proposition en attente
+                    : { red: 146/255, green: 208/255, blue: 80/255 } } },
+                  fields: 'userEnteredFormat.backgroundColor'
+                }
+              }));
+              await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}:batchUpdate`, {
+                method: 'POST',
+                headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ requests })
+              });
+            }
+            // Sync base its_dossiers (clé date+ref+magasin)
+            if (pool) {
+              for (const a of itsApplied) {
+                pool.query('UPDATE its_dossiers SET tracking = $1, date_expe = $2 WHERE date_reception = $3 AND reference = $4 AND magasin = $5',
+                  [a.tracking, dateExpe, a.date, a.ref, a.magasin]).catch(() => {});
+              }
+            }
+          }
+        }
+
+        // URL Revers.io de chaque dossier (pour les boutons du tableau livraison)
+        if (pool && applied.length) {
+          try {
+            const cles = [...new Set(applied.flatMap(a => [a.cnb, a.fla].filter(Boolean)))];
+            if (cles.length) {
+              const qUrl = await pool.query('SELECT numero_dossier, revers_url FROM dossiers WHERE numero_dossier = ANY($1) AND revers_url IS NOT NULL', [cles]);
+              const parCle = {};
+              qUrl.rows.forEach(r => { parCle[r.numero_dossier] = r.revers_url; });
+              applied.forEach(a => { a.revers_url = parCle[a.cnb] || parCle[a.fla] || null; });
+            }
+          } catch(e) {}
+        }
+
+        // Synchro PostgreSQL (tracking + date d'envoi sur le dossier CNB)
+        let dbSync = 0;
+        if (pool) {
+          const parts = dateExpe.split('/');
+          const an4 = parts.length === 3 ? (parts[2].length === 2 ? '20' + parts[2] : parts[2]) : '';
+          const iso = parts.length === 3 ? an4 + '-' + parts[1].padStart(2, '0') + '-' + parts[0].padStart(2, '0') : dateExpe;
+          for (const a of applied) {
+            const cle = a.cnb || a.fla || cleDirecte(a.date_recep || '', a.ref, a.magasin, a.piece);
+            if (!cle) continue;
+            try {
+              // UPSERT : un dossier jamais analysé entre AUSSI en base — sa
+              // journée d'expédition apparaît immédiatement dans l'historique
+              const r = await pool.query(`
+                INSERT INTO dossiers (numero_dossier, enseigne, departement_ville, ref_produit, piece, decision, date_reception, tracking, date_envoi, notes, fla)
+                VALUES ($1,$2,$3,$4,$5,'envoi_piece',$6,$7,$8,$9,$10)
+                ON CONFLICT (numero_dossier) DO UPDATE SET
+                  tracking = EXCLUDED.tracking,
+                  date_envoi = EXCLUDED.date_envoi,
+                  fla = CASE WHEN EXCLUDED.fla <> '' THEN EXCLUDED.fla ELSE dossiers.fla END
+              `, [cle, a.enseigne || '', a.magasin || '', a.ref || '', a.piece || '',
+                  null, a.tracking, iso, a.fla ? 'FLA:' + a.fla : '', a.fla || '']);
+              dbSync += r.rowCount || 0;
+            } catch(e) { console.warn('Sync DB tracking:', e.message); }
+          }
+        }
+        console.log('Trackings appliqués:', applied.length, '| ignorés:', skipped.length, '| sync DB:', dbSync);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ applied, skipped, db_sync: dbSync, its_applied: itsApplied, its_skipped: itsSkipped }));
+        return;
+      }
+
+      // ── CERVEAU : état de la mémoire d'une référence ──────────
+      if (req.url === '/kb-status') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ kb: null })); return; }
+        const kref = (payload.ref || '').trim();
+        const kq = await pool.query(
+          'SELECT ref, notice_file, updated_at, LENGTH(transcription) AS taille, transcription FROM produits_kb WHERE ref = $1', [kref]);
+        const row = kq.rows[0] || null;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ kb: row ? {
+          ref: row.ref, notice_file: row.notice_file, updated_at: row.updated_at,
+          taille: row.taille, extrait: (row.transcription || '').slice(0, 600)
+        } : null }));
+        return;
+      }
+      // Liste complète des refs mémorisées
+      if (req.url === '/kb-list') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ items: [] })); return; }
+        const kl = await pool.query(
+          'SELECT ref, notice_file, updated_at, LENGTH(transcription) AS taille FROM produits_kb ORDER BY updated_at DESC LIMIT 200');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ items: kl.rows }));
+        return;
+      }
+
+      // ── CERVEAU : associations manuelles ref → notice ─────────
+      if (req.url === '/notices-overrides') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ overrides: [] })); return; }
+        const q = await pool.query('SELECT ref, notice_file, updated_at FROM notices_override ORDER BY ref');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ overrides: q.rows }));
+        return;
+      }
+      if (req.url === '/notices-override-set') {
+        if (!pool) { res.writeHead(500); res.end(JSON.stringify({ error: 'no db' })); return; }
+        const oref = (payload.ref || '').trim();
+        const ofile = (payload.notice_file || '').trim();
+        if (!oref || !ofile) { res.writeHead(400); res.end(JSON.stringify({ error: 'ref et notice_file requis' })); return; }
+        await pool.query(`
+          INSERT INTO notices_override (ref, notice_file, updated_at) VALUES ($1, $2, NOW())
+          ON CONFLICT (ref) DO UPDATE SET notice_file = $2, updated_at = NOW()`, [oref, ofile]);
+        // L'association change la notice → purger la transcription mémorisée de cette ref
+        await pool.query('DELETE FROM produits_kb WHERE ref = $1', [oref]).catch(() => {});
+        console.log('Association manuelle:', oref, '→', ofile);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      if (req.url === '/notices-override-delete') {
+        if (!pool) { res.writeHead(500); res.end(JSON.stringify({ error: 'no db' })); return; }
+        const dref = (payload.ref || '').trim();
+        await pool.query('DELETE FROM notices_override WHERE ref = $1', [dref]);
+        await pool.query('DELETE FROM produits_kb WHERE ref = $1', [dref]).catch(() => {});
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      // Liste des fichiers notices du repo (pour l'onglet Cerveau)
+      if (req.url === '/notices-files') {
+        const list = await fetchGithubJSON('https://api.github.com/repos/Drsly78/flaudis-notices/contents/notices');
+        const files = Array.isArray(list) ? list.filter(f => /\.pdf$/i.test(f.name)).map(f => f.name) : [];
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ files }));
+        return;
+      }
+
+      // ── BILAN PRODUIT (lecture seule) ────────────────────────
+      // Statistiques SAV d'une référence : volumes, décisions, pièces, tendance
+      if (req.url === '/bilan-produit') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ error: 'no db' })); return; }
+        const ref = (payload.ref || '').trim();
+        if (!ref) { res.writeHead(400); res.end(JSON.stringify({ error: 'ref requise' })); return; }
+        // Préfixe : couvre les variantes couleur (QD101-3/6 → QD101-3/6 VERT KAKI…)
+        const q = await pool.query(
+          `SELECT numero_dossier, piece, decision, date_reception, departement_ville, tracking
+           FROM dossiers
+           WHERE ref_produit ILIKE $1
+           ORDER BY date_reception DESC NULLS LAST
+           LIMIT 500`, [ref + '%']);
+        const rows = q.rows || [];
+
+        const stats = { ref, total: rows.length, envois: 0, remboursements: 0,
+                        top_pieces: [], par_mois: [], par_magasin: [], derniers: [] };
+        const pieces = {}, mois = {}, magasins = {};
+        rows.forEach(r => {
+          if (r.decision === 'remboursement') stats.remboursements++; else stats.envois++;
+          const p = (r.piece || '').trim();
+          if (p) pieces[p.toUpperCase()] = (pieces[p.toUpperCase()] || 0) + 1;
+          const m = (r.date_reception || '').slice(0, 7);
+          if (/^\d{4}-\d{2}$/.test(m)) mois[m] = (mois[m] || 0) + 1;
+          // Agrégation magasin sur l'INTÉGRALITÉ des dossiers (pas seulement l'échantillon détaillé)
+          const v = (r.departement_ville || '').trim().toUpperCase();
+          if (v) {
+            if (!magasins[v]) magasins[v] = { n: 0, envois: 0, remb: 0 };
+            magasins[v].n++;
+            if (r.decision === 'remboursement') magasins[v].remb++; else magasins[v].envois++;
+          }
+        });
+        stats.par_magasin = Object.entries(magasins)
+          .sort((a, b) => b[1].n - a[1].n)
+          .map(([ville, o]) => ({ ville, n: o.n, envois: o.envois, remboursements: o.remb }));
+        // Liste complète compacte : permet au cerveau de répondre aux questions
+        // par magasin, par mois, par pièce sur TOUS les dossiers de la référence
+        stats.tous = rows.map(r => [
+          (r.date_reception || '').slice(0, 10),
+          (r.departement_ville || '').trim(),
+          (r.piece || '').trim(),
+          r.decision === 'remboursement' ? 'R' : 'E'
+        ]);
+        stats.top_pieces = Object.entries(pieces).sort((a, b) => b[1] - a[1]).slice(0, 10)
+          .map(([piece, n]) => ({ piece, n }));
+        stats.par_mois = Object.entries(mois).sort((a, b) => a[0].localeCompare(b[0]))
+          .map(([m, n]) => ({ mois: m, n }));
+        stats.derniers = rows.slice(0, 30).map(r => ({
+          date: r.date_reception, ville: r.departement_ville, piece: r.piece, decision: r.decision
+        }));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(stats));
+        return;
+      }
+
+      // Notices actives par défaut. Pour les couper sans toucher au code :
+      // définir NOTICES_ENABLED=false dans les variables Railway.
+      const NOTICES_ENABLED = (process.env.NOTICES_ENABLED !== 'false');
+
+      let noticeInfo = null;
+      if (NOTICES_ENABLED && req.url === '/analyze-with-notice' && payload.ref_produit) {
+        const raw = payload.ref_produit.trim();
+        let pdfBuffer = null, foundRef = null;
+
+        // 0. Association manuelle prioritaire (onglet Cerveau)
+        let fileName = null;
+        if (pool) {
+          try {
+            const ov = await pool.query('SELECT notice_file FROM notices_override WHERE ref = $1', [raw]);
+            if (ov.rows.length) {
+              fileName = ov.rows[0].notice_file;
+              console.log('Association manuelle utilisée:', raw, '→', fileName);
+            }
+          } catch(e) {}
+        }
+        // 1. Sinon : matching flou contre l'index réel des fichiers du repo
+        if (!fileName) fileName = await findNoticeFile(raw);
+
+        // ── 🧠 CERVEAU PRODUIT : transcription mémorisée ──────────
+        // Si on a déjà lu cette notice (même fichier, < 45 jours), on injecte
+        // la transcription texte au lieu de reconvertir le PDF en images.
+        // payload.force_reread = true (bouton "Relire") court-circuite le cache.
+        let kbHit = null;
+        if (pool && fileName && !payload.force_reread) {
+          try {
+            const kb = await pool.query('SELECT notice_file, transcription, updated_at FROM produits_kb WHERE ref = $1', [raw]);
+            if (kb.rows.length) {
+              const row = kb.rows[0];
+              const ageJours = (Date.now() - new Date(row.updated_at).getTime()) / 86400000;
+              if (row.notice_file === fileName && ageJours < 45 &&
+                  row.transcription && row.transcription.length > 150 &&
+                  (row.transcription.match(/ILLISIBLE/g) || []).length < 5) {
+                kbHit = row;
+              }
+            }
+          } catch(e) { console.warn('KB lecture:', e.message); }
+        }
+
+        if (kbHit) {
+          const noticeContent = [{ type: 'text', text:
+            'NOTICE TECHNIQUE du produit ' + raw + ' — TRANSCRIPTION MÉMORISÉE (lue précédemment sur le fichier "' + kbHit.notice_file + '") :\n\n' +
+            kbHit.transcription +
+            '\n\nCette transcription remplace UNIQUEMENT les pages images de la notice OFFICIELLE de référence (repères, désignations, quantités — la section TRANSCRIPTION peut la reprendre telle quelle).\n' +
+            '⚠️ IMPORTANT : elle ne remplace JAMAIS les PIÈCES JOINTES DU DOSSIER. Les documents fournis par le client (notice annotée avec pièces entourées, cochées ou surlignées, photos du produit ou du défaut) doivent être EXAMINÉS VISUELLEMENT avec la plus grande attention : c\u2019est là que le client désigne la pièce défectueuse. Si une notice annotée figure dans les pièces jointes, croise l\u2019annotation avec la transcription ci-dessus pour identifier précisément le repère et la désignation de la pièce entourée.' }];
+          const lastMsg = payload.messages[payload.messages.length - 1];
+          const orig = Array.isArray(lastMsg.content) ? lastMsg.content : [{ type: 'text', text: lastMsg.content }];
+          lastMsg.content = [...noticeContent, ...orig];
+          noticeInfo = { attached: true, ref: kbHit.notice_file.replace(/\.pdf$/i, ''), pages: 0, cached: true };
+          console.log('🧠 Cerveau produit — transcription mémorisée injectée pour:', raw);
+        } else {
+
+        if (fileName) {
+          const buf = await downloadBuffer(GITHUB_NOTICES + encodeURIComponent(fileName));
+          if (buf) { pdfBuffer = buf; foundRef = fileName.replace(/\.pdf$/i, ''); }
+        }
+
+        // 2. Secours : anciens candidats par nom exact (si l'API GitHub est indisponible)
+        if (!pdfBuffer) {
+          const parts = raw.split(/\s+/);
+          const candidates = [raw];
+          if (parts.length > 1 && /^20\d{2}$/.test(parts[parts.length - 1]))
+            candidates.push(parts.slice(0, -1).join(' '));
+          if (parts.length > 1) candidates.push(parts[0]);
+          for (const cand of candidates) {
+            const buf = await downloadBuffer(GITHUB_NOTICES + encodeURIComponent(cand) + '.pdf');
+            if (buf) { pdfBuffer = buf; foundRef = cand; break; }
+          }
+        }
+        if (!pdfBuffer) {
+          noticeInfo = { attached: false, reason: 'notice introuvable sur GitHub', tried: [raw, fileName].filter(Boolean) };
+          console.log('Notice INTROUVABLE pour:', raw, '— meilleur candidat index:', fileName || 'aucun');
+        } else {
+          const images = await pdfToImages(pdfBuffer);
+          if (images.length > 0) {
+            const noticeContent = [{ type: 'text', text: 'Notice technique du produit ' + foundRef + ' (' + images.length + ' pages) :' }];
+            images.forEach((img, i) => {
+              noticeContent.push({ type: 'text', text: '[Page ' + (i+1) + ']' });
+              noticeContent.push({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: img } });
+            });
+            const lastMsg = payload.messages[payload.messages.length - 1];
+            const orig = Array.isArray(lastMsg.content) ? lastMsg.content : [{ type: 'text', text: lastMsg.content }];
+            lastMsg.content = [...noticeContent, ...orig];
+            noticeInfo = { attached: true, ref: foundRef, pages: images.length };
+            console.log('Notice attachée:', foundRef, '—', images.length, 'pages');
+          } else {
+            noticeInfo = { attached: false, reason: 'conversion PDF echouee', ref: foundRef };
+            console.log('Notice trouvée mais conversion ÉCHOUÉE:', foundRef);
+          }
+        }
+        } // fin else kbHit (chemin lecture complète)
+      }
+
+      // ── 🧠 ÉTAGE 2 : contexte pannes pour la déduction (interne) ──
+      if (pool && payload.ref_produit && req.url === '/analyze-with-notice') {
+        try {
+          const h = await pool.query(`
+            SELECT UPPER(TRIM(piece)) AS p, COUNT(*) AS n FROM dossiers
+            WHERE ref_produit ILIKE $1 || '%' AND piece IS NOT NULL AND TRIM(piece) <> ''
+            GROUP BY 1 ORDER BY n DESC LIMIT 6`, [payload.ref_produit.trim()]);
+          if (h.rows.length >= 2) {
+            const topPannes = h.rows.map(r => r.p + ' (' + r.n + 'x)').join(', ');
+            const lastMsg2 = payload.messages[payload.messages.length - 1];
+            const orig2 = Array.isArray(lastMsg2.content) ? lastMsg2.content : [{ type: 'text', text: lastMsg2.content }];
+            lastMsg2.content = [{ type: 'text', text:
+              'CONTEXTE INTERNE (aide à ta déduction de pièces, à ne JAMAIS réciter ni mentionner dans ta réponse) — pièces historiquement les plus demandées sur ce produit : ' + topPannes + '. Si la panne décrite est ambiguë, ce contexte peut orienter ton choix de repères, mais la notice et les photos priment toujours.' },
+              ...orig2];
+          }
+        } catch(e) {}
+      }
+
+      // ── ANALYSE STANDARD ──────────────────────────────────
+      if (payload.task === 'light') payload.model = MODEL_LIGHT;
+      delete payload.task;
+      const data = await callAnthropic(payload);
+
+      // ── 🧠 CERVEAU PRODUIT : mémoriser la transcription ───────
+      // Après une lecture COMPLÈTE (images) réussie, on extrait la section
+      // TRANSCRIPTION de la réponse et on la sauvegarde pour les prochains scans.
+      // En arrière-plan, sans bloquer ni faire échouer la réponse.
+      if (pool && noticeInfo && noticeInfo.attached && !noticeInfo.cached && payload.ref_produit) {
+        try {
+          const full = (data.content || []).map(b => b.text || '').join('');
+          const m = full.match(/TRANSCRIPTION\s*[—–:-]*\s*([\s\S]*?)(?=IDENTIFICATION|```|\{\s*")/);
+          const transcription = m ? m[1].trim().slice(0, 8000) : '';
+          const illisibles = (transcription.match(/ILLISIBLE/g) || []).length;
+          if (transcription.length > 150 && illisibles < 5) {
+            pool.query(`
+              INSERT INTO produits_kb (ref, notice_file, transcription, updated_at)
+              VALUES ($1, $2, $3, NOW())
+              ON CONFLICT (ref) DO UPDATE SET notice_file = $2, transcription = $3, updated_at = NOW()
+            `, [payload.ref_produit.trim(), noticeInfo.ref + '.pdf', transcription])
+              .then(() => console.log('🧠 Transcription mémorisée:', payload.ref_produit, '(' + transcription.length + ' car.)'))
+              .catch(e => console.warn('KB sauvegarde:', e.message));
+          } else {
+            console.log('🧠 Transcription non mémorisée (trop courte ou illisible):', payload.ref_produit);
+          }
+        } catch(e) { console.warn('KB extraction:', e.message); }
+      }
+
+      if (noticeInfo) data._notice = noticeInfo;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(data));
+
+    } catch(err) {
+      console.error('Error:', err.message);
+      res.writeHead(500); res.end(JSON.stringify({ error: err.message }));
     }
-    db.prepare("UPDATE produits SET dossier = ? || substr(dossier, ?) WHERE dossier = ? OR dossier LIKE ? || '/%'")
-      .run(nouveau, chemin.length + 1, chemin, chemin);
-    db.prepare("UPDATE fichiers SET dossier = ? || substr(dossier, ?) WHERE dossier = ? OR dossier LIKE ? || '/%'")
-      .run(nouveau, chemin.length + 1, chemin, chemin);
   });
-  tx();
-  res.json({ ok: true, chemin: nouveau });
 });
 
-app.get('/api/export/audit', (req, res) => {
-  const fichiers = db.prepare(`SELECT id, nom, hash, type, mode, statut, valide,
-    COALESCE(date_document, substr(depose_le,1,10)) AS date_document FROM fichiers ORDER BY id`).all();
-  const prods = db.prepare(`SELECT fichier_id, reference, prix, devise, pcb, moq, port, ean, dossier FROM produits ORDER BY fichier_id, id`).all();
-  const parFichier = {};
-  for (const p of prods) (parFichier[p.fichier_id] = parFichier[p.fichier_id] || []).push(p);
-  res.json({ exporte_le: new Date().toISOString(), version: 'v0.10.5',
-    fichiers: fichiers.map(f => ({ ...f, produits: parFichier[f.id] || [] })) });
+initDB().then(() => {
+  server.listen(PORT, () => console.log('SAV Server v4.0 on port ' + PORT));
 });
-
-app.get('/api/depot/rapports', (req, res) => {
-  const lignes = db.prepare(`SELECT id, nom, statut, mode, rapport, COALESCE(date_document, substr(depose_le,1,10)) AS date_document
-    FROM fichiers WHERE valide=0 ORDER BY id`).all();
-  res.json(lignes.map(l => {
-    let rap = null; try { rap = JSON.parse(l.rapport || 'null'); } catch {}
-    if (rap && !rap.fichier) rap = null; // ligne fraîche : seul {disque} est stocké
-    return { fichierId: l.id, fichier: l.nom, statut: l.statut, mode: l.mode, date_document: l.date_document, rapport: rap };
-  }));
-});
-
-app.get('/api/fichiers', (req, res) => {
-  res.json(db.prepare(`SELECT id, nom, type, mode, taille, depose_le, statut, valide, hash, COALESCE(date_document, substr(depose_le,1,10)) AS date_document,
-    (SELECT COUNT(*) FROM produits WHERE fichier_id=fichiers.id) AS produits
-    FROM fichiers ORDER BY id DESC LIMIT 200`).all());
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('[v' + VERSION + '] ' + `Flaudis Base Produits — http://127.0.0.1:${PORT}`));
