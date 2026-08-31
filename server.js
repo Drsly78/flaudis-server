@@ -85,6 +85,13 @@ L'application n'accède à aucun autre fichier du Drive de l'utilisateur.</p>
 });
 proteger(app, express);   // mot de passe si MOT_DE_PASSE est défini
 app.use(express.json());
+const VERSION = '0.45.1';
+app.get('/api/version', (req, res) => res.json({ version: VERSION }));
+// l'interface ne doit jamais être servie depuis un cache périmé
+app.get(['/', '/index.html'], (req, res) => {
+  res.set('Cache-Control', 'no-cache, must-revalidate');
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ---------- INGESTION ----------
@@ -2409,4 +2416,4 @@ app.get('/api/fichiers', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Flaudis Base Produits — http://127.0.0.1:${PORT}`));
+app.listen(PORT, () => console.log('[v' + VERSION + '] ' + `Flaudis Base Produits — http://127.0.0.1:${PORT}`));
