@@ -146,9 +146,25 @@ async function getSheetsToken() {
 }
 
 // ── Firebase REST ─────────────────────────────────────────
+// La base est verrouillée (règles auth) : le serveur se connecte avec le compte SAV
+let _fbTok = null, _fbTokExp = 0;
+async function getFbToken() {
+  if (FIREBASE_SECRET) return FIREBASE_SECRET;
+  if (_fbTok && Date.now() < _fbTokExp) return _fbTok;
+  try {
+    const r = await fetch('https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=' + (process.env.FIREBASE_API_KEY || 'AIzaSyDJETAsWIL3AAiQwb_hCys3OILqBPA_IcE'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: process.env.FIREBASE_EMAIL || 'sav@flaudis.fr', password: process.env.FIREBASE_PWD || 'Flaudis', returnSecureToken: true })
+    });
+    const d = await r.json();
+    if (d.idToken) { _fbTok = d.idToken; _fbTokExp = Date.now() + 50 * 60 * 1000; return _fbTok; }
+    console.log('Firebase auth refusée :', d.error && d.error.message);
+  } catch(e) { console.log('Firebase auth erreur :', e.message); }
+  return null;
+}
 async function firebaseGet(path) {
-  const url = FIREBASE_URL + '/' + path + '.json' +
-    (FIREBASE_SECRET ? '?auth=' + FIREBASE_SECRET : '');
+  const tok = await getFbToken();
+  const url = FIREBASE_URL + '/' + path + '.json' + (tok ? '?auth=' + tok : '');
   const r = await fetch(url);
   if (!r.ok) return null;
   return r.json();
@@ -1378,13 +1394,24 @@ out center tags;`;
 
         if (mode === 'sav') {
           // Anti-doublon CNB (H idx 7) / FLA (I idx 8) dans SYSTEME U
-          const key = (row[7] || '').trim() || (row[8] || '').trim();
+          let key = (row[7] || '').trim() || (row[8] || '').trim();
           if (key) {
             const existing = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'SYSTEME U'!H:I")}`,
               { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
-            const dup = (existing.values || []).some(r2 =>
-              ((r2[0] || '').trim() === key) || ((r2[1] || '').trim() === key));
-            if (dup) { res.writeHead(200); res.end(JSON.stringify({ ok: true, duplicate: true, key })); return; }
+            const vus = new Set();
+            (existing.values || []).forEach(r2 => { if (r2[0]) vus.add(String(r2[0]).trim().toUpperCase()); if (r2[1]) vus.add(String(r2[1]).trim().toUpperCase()); });
+            if (payload.bis) {
+              // Suffixe calculé sur l'état réel de la feuille : /bis, /bis2, /bis3…
+              const suf = n => n === 1 ? '/bis' : '/bis' + n;
+              const base = v => String(v || '').replace(/\/bis\d*$/i, '');
+              let n = 1;
+              while (vus.has((base(row[7]) + suf(n)).toUpperCase()) || vus.has((base(row[8]) + suf(n)).toUpperCase())) n++;
+              if (row[7]) row[7] = base(row[7]) + suf(n);
+              if (row[8]) row[8] = base(row[8]) + suf(n);
+              key = (row[7] || '').trim() || (row[8] || '').trim();
+            } else if (vus.has(key.toUpperCase())) {
+              res.writeHead(200); res.end(JSON.stringify({ ok: true, duplicate: true, key })); return;
+            }
           }
           const clean = row.slice(0, 9);
           clean[0] = shortDate(clean[0]); clean[1] = shortDate(clean[1]);
@@ -1401,13 +1428,23 @@ out center tags;`;
 
         if (mode === 'remb') {
           // Anti-doublon CNB (I idx 8) / FLA (M idx 12) dans REMBOURSEMENT SU
-          const key = (row[8] || '').trim() || (row[12] || '').trim();
+          let key = (row[8] || '').trim() || (row[12] || '').trim();
           if (key) {
             const existing = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'REMBOURSEMENT SU'!I:M")}`,
               { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
-            const dup = (existing.values || []).some(r2 =>
-              ((r2[0] || '').trim() === key) || ((r2[4] || '').trim() === key));
-            if (dup) { res.writeHead(200); res.end(JSON.stringify({ ok: true, duplicate: true, key })); return; }
+            const vus = new Set();
+            (existing.values || []).forEach(r2 => { if (r2[0]) vus.add(String(r2[0]).trim().toUpperCase()); if (r2[4]) vus.add(String(r2[4]).trim().toUpperCase()); });
+            if (payload.bis) {
+              const suf = n => n === 1 ? '/bis' : '/bis' + n;
+              const base = v => String(v || '').replace(/\/bis\d*$/i, '');
+              let n = 1;
+              while (vus.has((base(row[8]) + suf(n)).toUpperCase()) || vus.has((base(row[12]) + suf(n)).toUpperCase())) n++;
+              if (row[8]) row[8] = base(row[8]) + suf(n);
+              if (row[12]) row[12] = base(row[12]) + suf(n);
+              key = (row[8] || '').trim() || (row[12] || '').trim();
+            } else if (vus.has(key.toUpperCase())) {
+              res.writeHead(200); res.end(JSON.stringify({ ok: true, duplicate: true, key })); return;
+            }
           }
 
           // Première ligne libre (colonnes A, I, J les plus remplies)
