@@ -655,7 +655,8 @@ const server = http.createServer(async function(req, res) {
           if (!loc && i > 0) break;
           if (loc && loc.allee) {
             let label = '';
-            if (loc.allee === 'AREA') label = 'Zone AREA';
+            if (loc.allee === 'HAM') label = 'HAM · Conteneur ' + (loc.conteneur != null ? loc.conteneur : '?');
+            else if (loc.allee === 'AREA') label = 'Zone AREA';
             else if (loc.cote === 'SOL') label = 'Allée ' + loc.allee + ' SOL';
             else {
               label = 'Allée ' + loc.allee;
@@ -1261,7 +1262,8 @@ out center tags;`;
             if (!loc && i > 0) break;
             if (loc && loc.allee) {
               let label = '';
-              if (loc.allee === 'AREA') label = 'Zone AREA';
+              if (loc.allee === 'HAM') label = 'HAM · Conteneur ' + (loc.conteneur != null ? loc.conteneur : '?');
+              else if (loc.allee === 'AREA') label = 'Zone AREA';
               else if (loc.cote === 'SOL') label = 'Allée ' + loc.allee + ' SOL';
               else {
                 label = 'Allée ' + loc.allee;
