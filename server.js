@@ -1366,6 +1366,36 @@ out center tags;`;
         return;
       }
 
+      // ── 📌 ÉQUIPE : notes partagées + messages signés (Firebase postit/) ──
+      if (req.url === '/equipe-data') {
+        const [notes, messages] = await Promise.all([firebaseGet('postit/notes'), firebaseGet('postit/messages')]);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, notes: notes || {}, messages: messages || {} }));
+        return;
+      }
+      if (req.url === '/equipe-note-add' || req.url === '/equipe-msg-add') {
+        const texte = String(payload.texte || '').trim();
+        if (!texte) { res.writeHead(400); res.end(JSON.stringify({ error: 'texte requis' })); return; }
+        const id = Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7);
+        if (req.url === '/equipe-note-add') {
+          await firebaseSet('postit/notes/' + id, { t: texte, ts: Date.now() });
+        } else {
+          const auteur = payload.auteur === 'Xavier' ? 'Xavier' : 'Sylvain';
+          await firebaseSet('postit/messages/' + id, { t: texte, a: auteur, ts: Date.now() });
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, id }));
+        return;
+      }
+      if (req.url === '/equipe-note-del' || req.url === '/equipe-msg-del') {
+        const id = String(payload.id || '').replace(/[^a-z0-9_]/gi, '');
+        if (!id) { res.writeHead(400); res.end(JSON.stringify({ error: 'id requis' })); return; }
+        await firebaseDelete('postit/' + (req.url === '/equipe-note-del' ? 'notes/' : 'messages/') + id);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
       // ── GESTES COMMERCIAUX : propositions en attente ────────────────
       if (req.url === '/gestes-co-liste') {
         const token = await getSheetsToken();
