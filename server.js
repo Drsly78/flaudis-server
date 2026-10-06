@@ -162,6 +162,18 @@ async function getFbToken() {
   } catch(e) { console.log('Firebase auth erreur :', e.message); }
   return null;
 }
+async function firebaseSet(path, data) {
+  const tok = await getFbToken();
+  const url = FIREBASE_URL + '/' + path + '.json' + (tok ? '?auth=' + tok : '');
+  const r = await fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+  return r.ok;
+}
+async function firebaseDelete(path) {
+  const tok = await getFbToken();
+  const url = FIREBASE_URL + '/' + path + '.json' + (tok ? '?auth=' + tok : '');
+  const r = await fetch(url, { method: 'DELETE' });
+  return r.ok;
+}
 async function firebaseGet(path) {
   const tok = await getFbToken();
   const url = FIREBASE_URL + '/' + path + '.json' + (tok ? '?auth=' + tok : '');
@@ -427,7 +439,7 @@ const server = http.createServer(async function(req, res) {
   // Exception lecture navigateur : le diagnostic du référentiel ITS
   // accepte la clé en paramètre d'URL (?key=…)
   const urlKey = (req.url.match(/[?&]key=([^&]+)/) || [])[1];
-  if ((req.url.startsWith('/ref-its-structure') || req.url.startsWith('/magasins-u-crawl') || req.url.startsWith('/magasins-u-status') || req.url.startsWith('/magasins-u-test')) && urlKey === APP_SECRET) {
+  if ((req.url.startsWith('/ref-its-structure') || req.url.startsWith('/magasins-u-crawl') || req.url.startsWith('/magasins-u-status') || req.url.startsWith('/magasins-u-test') || req.url.startsWith('/notices-manuelles')) && urlKey === APP_SECRET) {
     // accès autorisé
   } else if (req.headers['x-app-secret'] !== APP_SECRET) {
     res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
@@ -811,6 +823,80 @@ out center tags;`;
         console.log('Purge OSM :', n, 'entrées retirées');
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, retires: n }));
+        return;
+      }
+
+      if (req.url.startsWith('/notices-manuelles')) {
+        // Réfs saisies à la main dans l'app notices (pour les suggestions de fusion)
+        const m = await firebaseGet('manuels') || {};
+        const manuelles = Object.entries(m).map(([k, v]) => ({ key: k, ref: (v && v.ref) || k }));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, manuelles }));
+        return;
+      }
+
+      if (req.url === '/notices-deposer') {
+        // Un PDF → repo GitHub flaudis-notices/notices/ + fusion éventuelle avec une réf manuelle
+        const GH_TOKEN = process.env.GITHUB_TOKEN || '';
+        const GH_REPO = process.env.GITHUB_REPO || 'Drsly78/flaudis-notices';
+        if (!GH_TOKEN) { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'GITHUB_TOKEN manquant dans les variables Railway' })); return; }
+        const ref = String(payload.ref || '').trim();
+        const contenu = String(payload.contenuBase64 || '');
+        const lierA = payload.lierA ? String(payload.lierA) : null;
+        if (!ref || !contenu) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'ref et contenu requis' })); return; }
+        const nomFichier = ref.replace(/[\/\\]/g, '-') + '.pdf';
+        const ghPath = 'notices/' + nomFichier;
+        const ghUrl = 'https://api.github.com/repos/' + GH_REPO + '/contents/' + encodeURIComponent(ghPath).replace(/%2F/g, '/');
+        const ghHeaders = { 'Authorization': 'Bearer ' + GH_TOKEN, 'User-Agent': 'flaudis-sav', 'Accept': 'application/vnd.github+json' };
+        // Fichier déjà présent ? (GitHub exige son sha pour le remplacer)
+        let sha = null;
+        try { const g = await fetch(ghUrl, { headers: ghHeaders }); if (g.ok) sha = (await g.json()).sha || null; } catch(e) {}
+        const put = await fetch(ghUrl, {
+          method: 'PUT', headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: (sha ? 'Remplacement' : 'Ajout') + ' notice ' + nomFichier + ' (dépôt extension)', content: contenu, ...(sha ? { sha } : {}) })
+        });
+        if (!put.ok) {
+          const t = await put.text();
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'GitHub ' + put.status + ' : ' + t.slice(0, 180) }));
+          return;
+        }
+        // Fusion des données de stock/emplacements
+        const cibleKey = getKey(ref);
+        let fusion = 'aucune';
+        const srcKey = lierA || null;
+        if (srcKey && srcKey !== cibleKey) {
+          const src = await firebaseGet('produits/' + srcKey);
+          if (src) {
+            const cible = await firebaseGet('produits/' + cibleKey);
+            if (!cible) {
+              await firebaseSet('produits/' + cibleKey, src);
+              fusion = 'données migrées vers ' + cibleKey;
+            } else {
+              // La fiche cible existe déjà : les emplacements de la source s'ajoutent en slots libres
+              const slots = ['loc']; let i = 2; while (cible['loc' + i] !== undefined) { slots.push('loc' + i); i++; }
+              let prochain = cible.loc === undefined ? 'loc' : 'loc' + i;
+              const srcSlots = ['loc']; let j = 2; while (src['loc' + j] !== undefined) { srcSlots.push('loc' + j); j++; }
+              for (const sl of srcSlots) {
+                if (!src[sl]) continue;
+                await firebaseSet('produits/' + cibleKey + '/' + prochain, src[sl]);
+                i++; prochain = 'loc' + i;
+              }
+              if (src.pieces && !cible.pieces) await firebaseSet('produits/' + cibleKey + '/pieces', src.pieces);
+              fusion = 'emplacements ajoutés à la fiche existante ' + cibleKey;
+            }
+            await firebaseDelete('produits/' + srcKey);
+          }
+          await firebaseDelete('manuels/' + srcKey);
+          if (fusion === 'aucune') fusion = 'réf manuelle ' + srcKey + ' retirée';
+        } else if (await firebaseGet('manuels/' + cibleKey)) {
+          // Même clé : la notice remplace le badge "sans notice", les données restent en place
+          await firebaseDelete('manuels/' + cibleKey);
+          fusion = 'badge "sans notice" retiré, données conservées';
+        }
+        console.log('Notice déposée :', nomFichier, '| fusion :', fusion);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, fichier: nomFichier, remplace: !!sha, fusion }));
         return;
       }
 
