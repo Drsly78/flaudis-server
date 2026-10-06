@@ -439,7 +439,7 @@ const server = http.createServer(async function(req, res) {
   // Exception lecture navigateur : le diagnostic du référentiel ITS
   // accepte la clé en paramètre d'URL (?key=…)
   const urlKey = (req.url.match(/[?&]key=([^&]+)/) || [])[1];
-  if ((req.url.startsWith('/ref-its-structure') || req.url.startsWith('/magasins-u-crawl') || req.url.startsWith('/magasins-u-status') || req.url.startsWith('/magasins-u-test') || req.url.startsWith('/notices-manuelles')) && urlKey === APP_SECRET) {
+  if ((req.url.startsWith('/ref-its-structure') || req.url.startsWith('/magasins-u-crawl') || req.url.startsWith('/magasins-u-status') || req.url.startsWith('/magasins-u-test') || req.url.startsWith('/notices-manuelles') || req.url.startsWith('/demande-info-liste') || req.url.startsWith('/demande-info-get')) && urlKey === APP_SECRET) {
     // accès autorisé
   } else if (req.headers['x-app-secret'] !== APP_SECRET) {
     res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
@@ -826,6 +826,83 @@ out center tags;`;
         return;
       }
 
+      if (req.url === '/demande-info-save') {
+        // Demande d'information envoyée au magasin (stockée serveur, pas de Sheet)
+        if (pool) await pool.query(`CREATE TABLE IF NOT EXISTS demandes_info (
+          id SERIAL PRIMARY KEY, cnb TEXT, ref TEXT, magasin TEXT, ville TEXT,
+          demande TEXT, revers_url TEXT, statut TEXT DEFAULT 'ouverte',
+          cree TIMESTAMPTZ DEFAULT now(), maj TIMESTAMPTZ DEFAULT now())`).catch(() => {});
+        if (pool) for (const col of ['ean', 'qte', 'fla']) await pool.query('ALTER TABLE demandes_info ADD COLUMN IF NOT EXISTS ' + col + ' TEXT').catch(() => {});
+        const cnb = String(payload.cnb || '').trim().toUpperCase();
+        const demande = String(payload.demande || '').trim();
+        if (!cnb || !demande) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'cnb et demande requis' })); return; }
+        let mode = 'cree';
+        if (pool) {
+          const ex = await pool.query("SELECT id FROM demandes_info WHERE cnb = $1 AND statut = 'ouverte' LIMIT 1", [cnb]);
+          if (ex.rows.length) {
+            await pool.query("UPDATE demandes_info SET demande = $1, ref = $2, magasin = $3, ville = $4, ean = $5, qte = $6, fla = $7, revers_url = COALESCE($8, revers_url), maj = now() WHERE id = $9",
+              [demande, payload.ref || '', payload.magasin || '', payload.ville || '', payload.ean || '', payload.qte || '', payload.fla || '', payload.revers_url || null, ex.rows[0].id]);
+            mode = 'mis à jour';
+          } else {
+            await pool.query("INSERT INTO demandes_info (cnb, ref, magasin, ville, ean, qte, fla, demande, revers_url) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+              [cnb, payload.ref || '', payload.magasin || '', payload.ville || '', payload.ean || '', payload.qte || '', payload.fla || '', demande, payload.revers_url || null]);
+          }
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, mode }));
+        return;
+      }
+
+      if (req.url.startsWith('/demande-info-liste')) {
+        let items = [];
+        if (pool) {
+          await pool.query(`CREATE TABLE IF NOT EXISTS demandes_info (
+            id SERIAL PRIMARY KEY, cnb TEXT, ref TEXT, magasin TEXT, ville TEXT,
+            demande TEXT, revers_url TEXT, statut TEXT DEFAULT 'ouverte',
+            cree TIMESTAMPTZ DEFAULT now(), maj TIMESTAMPTZ DEFAULT now())`).catch(() => {});
+          for (const col of ['ean', 'qte', 'fla']) await pool.query('ALTER TABLE demandes_info ADD COLUMN IF NOT EXISTS ' + col + ' TEXT').catch(() => {});
+          const r2 = await pool.query("SELECT id, cnb, ref, magasin, ville, ean, qte, fla, demande, revers_url, to_char(cree, 'DD/MM/YYYY') AS date FROM demandes_info WHERE statut = 'ouverte' ORDER BY cree DESC LIMIT 200").catch(() => null);
+          if (r2) items = r2.rows;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, items }));
+        return;
+      }
+
+      if (req.url.startsWith('/demande-info-get')) {
+        const u = new URL(req.url, 'http://x');
+        const cnb = String(u.searchParams.get('cnb') || '').trim().toUpperCase();
+        let item = null;
+        if (pool && cnb) {
+          const r2 = await pool.query("SELECT id, cnb, demande, revers_url, to_char(cree, 'DD/MM/YYYY') AS date FROM demandes_info WHERE cnb = $1 AND statut = 'ouverte' LIMIT 1", [cnb]).catch(() => null);
+          if (r2 && r2.rows.length) item = r2.rows[0];
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, item }));
+        return;
+      }
+
+      if (req.url === '/demande-info-close-cnb') {
+        // Clôture automatique : le dossier est parti en Envoyer pièce / Rembourser
+        const cnb = String(payload.cnb || '').trim().toUpperCase();
+        if (pool && cnb) {
+          const r2 = await pool.query("UPDATE demandes_info SET statut = 'traitee', maj = now() WHERE cnb = $1 AND statut = 'ouverte'", [cnb]).catch(() => null);
+          if (r2 && r2.rowCount) console.log('Demande info soldée par export :', cnb);
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      if (req.url === '/demande-info-close') {
+        const id = Number(payload.id);
+        if (pool && id) await pool.query("UPDATE demandes_info SET statut = 'traitee', maj = now() WHERE id = $1", [id]).catch(() => {});
+        console.log('Demande info clôturée :', id);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
       if (req.url.startsWith('/notices-manuelles')) {
         // Réfs saisies à la main dans l'app notices (pour les suggestions de fusion)
         const m = await firebaseGet('manuels') || {};
@@ -1128,6 +1205,164 @@ out center tags;`;
         console.log('En attente ITS — AVOIR ligne', rowN, '→ REMBOURSEMENT ITS ligne', ligne, accord || '(DDP)');
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, ligne, accord, ref: refProd, ddp: isDDP }));
+        return;
+      }
+
+      // ── EN ATTENTE ITS v2.39 : exclure une ligne de son lot ─────────
+      if (req.url === '/attente-its-exclure') {
+        const rowN = parseInt(payload.row);
+        if (!rowN || rowN < 2) { res.writeHead(400); res.end(JSON.stringify({ error: 'row requis' })); return; }
+        const token = await getSheetsToken();
+        const vr = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'INTERSPORT'!F" + rowN + ":I" + rowN)}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const lr = ((vr.values || [])[0] || []).map(c => (c || '').toString());
+        if (!/^DEMANDE\s+(DE\s+)?RENVOI$/i.test((lr[3] || '').trim())) {
+          res.writeHead(409); res.end(JSON.stringify({ error: 'Cette ligne n\u2019est plus en DEMANDE RENVOI — recharge la liste.' })); return;
+        }
+        let f = (lr[0] || '').trim();
+        if (!/\[HORS LOT\]/i.test(f)) f = (f ? f + ' ' : '') + '[HORS LOT]';
+        await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'INTERSPORT'!F" + rowN)}?valueInputOption=RAW`, {
+          method: 'PUT', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ values: [[f]] })
+        });
+        console.log('En attente ITS — ligne', rowN, 'exclue du lot [HORS LOT]');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      // ── EN ATTENTE ITS v2.39 : valider un BLOC (décisions par unité) ─
+      // payload.rows = [{row, decision:'AVOIR'|'RENVOI'}, ...]
+      if (req.url === '/attente-its-bloc-valider') {
+        const rowsIn = Array.isArray(payload.rows) ? payload.rows
+          .map(r => ({ row: parseInt(r.row), decision: String(r.decision || '').toUpperCase() }))
+          .filter(r => r.row >= 2 && (r.decision === 'AVOIR' || r.decision === 'RENVOI')) : [];
+        if (!rowsIn.length) { res.writeHead(400); res.end(JSON.stringify({ error: 'rows requis' })); return; }
+        const token = await getSheetsToken();
+        const now = new Date();
+        const jj = String(now.getDate()).padStart(2, '0'), mo = String(now.getMonth() + 1).padStart(2, '0');
+        const todayFR2 = jj + '/' + mo + '/' + String(now.getFullYear()).slice(2);
+        // Relecture de chaque ligne + contrôle d'état (409 global si une ligne a bougé)
+        const ranges = rowsIn.map(r => "ranges=" + encodeURIComponent("'INTERSPORT'!A" + r.row + ":J" + r.row)).join('&');
+        const bgl = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchGet?` + ranges,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const lignes = rowsIn.map((r, i) => {
+          const c = (((bgl.valueRanges || [])[i] || {}).values || [[]])[0].map(x => (x || '').toString());
+          return { row: r.row, decision: r.decision, cells: c };
+        });
+        const pasOk = lignes.filter(l => !/^DEMANDE\s+(DE\s+)?RENVOI$/i.test((l.cells[8] || '').trim()));
+        if (pasOk.length) {
+          res.writeHead(409);
+          res.end(JSON.stringify({ error: 'Lignes plus en DEMANDE RENVOI (tableau modifié ?) : ' + pasOk.map(l => (l.cells[1] || 'ligne ' + l.row)).join(', ') + ' — recharge la liste.' }));
+          return;
+        }
+        const gid = await getSheetGid(token, 'INTERSPORT');
+        const colReq = (rowN, color) => ({ repeatCell: {
+          range: { sheetId: gid, startRowIndex: rowN - 1, endRowIndex: rowN, startColumnIndex: 0, endColumnIndex: 10 },
+          cell: { userEnteredFormat: { backgroundColor: color } },
+          fields: 'userEnteredFormat.backgroundColor'
+        } });
+
+        // ── RENVOIS : RETOUR EN L'ETAT + F + blanc ──
+        const renvois = lignes.filter(l => l.decision === 'RENVOI');
+        const avoirs = lignes.filter(l => l.decision === 'AVOIR');
+        const ups = [], colors = [];
+        renvois.forEach(l => {
+          ups.push({ range: "'INTERSPORT'!I" + l.row, values: [["RETOUR EN L'ETAT"]] });
+          ups.push({ range: "'INTERSPORT'!F" + l.row, values: [['Produit testé et fonctionnel']] });
+          colors.push(colReq(l.row, { red: 1, green: 1, blue: 1 }));
+        });
+        avoirs.forEach(l => {
+          ups.push({ range: "'INTERSPORT'!I" + l.row, values: [['AVOIR']] });
+          ups.push({ range: "'INTERSPORT'!H" + l.row, values: [[todayFR2]] });
+          colors.push(colReq(l.row, { red: 146/255, green: 208/255, blue: 80/255 }));
+        });
+
+        // ── AVOIRS groupés PAR RÉF → REMBOURSEMENT ITS, qté = unités en avoir ──
+        const nrmB = v => String(v || '').toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^A-Z0-9]/g, '');
+        const grp = {};
+        avoirs.forEach(l => {
+          const k = nrmB(l.cells[1]);
+          if (!grp[k]) grp[k] = { ref: (l.cells[1] || '').trim(), magasin: (l.cells[4] || '').trim(), dateDossier: (l.cells[0] || '').trim() || todayFR2, pannes: (l.cells[3] || '').trim(), qte: 0 };
+          grp[k].qte++;
+        });
+        const groupes = Object.values(grp);
+        let rembRows = [], rembInfos = [];
+        if (groupes.length) {
+          // Référentiel DDP (cache 10 min — même mécanique que l'avoir unitaire)
+          let items = (global._itsRefCache && (Date.now() - global._itsRefCache.ts) < 10 * 60 * 1000) ? global._itsRefCache.items : null;
+          if (!items) {
+            try {
+              const bg0 = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchGet?ranges=${encodeURIComponent("'CODE PRODUITS'!A:G")}&ranges=${encodeURIComponent("'PRIX AVOIR'!A:F")}`,
+                { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+              const pByC = {}, pByN = {};
+              ((bg0.valueRanges || [])[1]?.values || []).slice(2).forEach(r2 => {
+                const code = (r2[0] || '').toString().trim(), lib = (r2[1] || '').toString().trim();
+                const v = r2[4] !== undefined ? String(r2[4]).trim() : '';
+                if (!v) return;
+                if (code) pByC[nrmB(code)] = v;
+                if (lib) pByN[nrmB(lib)] = v;
+              });
+              items = [];
+              ((bg0.valueRanges || [])[0]?.values || []).slice(2).forEach(r2 => {
+                const rf = (r2[0] || '').toString().trim();
+                if (!rf) return;
+                items.push({ ref: rf, prix: pByC[nrmB((r2[3] || '').toString().trim())] || pByN[nrmB(rf)] || '' });
+              });
+              global._itsRefCache = { ts: Date.now(), items };
+            } catch(e) { items = []; }
+          }
+          // Ligne libre + compteur d'accords, calculés UNE fois puis incrémentés
+          const bg = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchGet?ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!B:B")}&ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!G:G")}&ranges=${encodeURIComponent("'REMBOURSEMENT ITS'!J:J")}`,
+            { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+          const vr2 = bg.valueRanges || [];
+          let ligne = Math.max(4, ...vr2.map(v => (v.values || []).length)) + 1;
+          const aa2 = String(now.getFullYear()).slice(2);
+          const prefix = 'ITS' + aa2 + mo;
+          let maxSeq = 0;
+          const reNum = new RegExp('^' + prefix + '(\\d{3})$');
+          ((vr2[2] || {}).values || []).forEach(x => { const m = ((x[0] || '') + '').trim().match(reNum); if (m) maxSeq = Math.max(maxSeq, parseInt(m[1])); });
+          for (const g of groupes) {
+            const hit = items.find(it => nrmB(it.ref) === nrmB(g.ref));
+            const isDDP = !!(hit && String(hit.prix || '').toUpperCase().includes('DDP'));
+            let accord = '';
+            if (!isDDP) { maxSeq++; accord = prefix + String(maxSeq).padStart(3, '0'); }
+            const dp = g.dateDossier.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+            const dateFull = dp ? dp[1].padStart(2,'0') + '/' + dp[2].padStart(2,'0') + '/' + (dp[3].length === 4 ? dp[3].slice(2) : dp[3].padStart(2,'0')) : g.dateDossier;
+            ups.push({ range: "'REMBOURSEMENT ITS'!B" + ligne, values: [[dateFull]] });
+            ups.push({ range: "'REMBOURSEMENT ITS'!D" + ligne, values: [[g.qte]] });
+            ups.push({ range: "'REMBOURSEMENT ITS'!G" + ligne, values: [[g.ref]] });
+            ups.push({ range: "'REMBOURSEMENT ITS'!H" + ligne, values: [[g.magasin]] });
+            if (accord) ups.push({ range: "'REMBOURSEMENT ITS'!J" + ligne, values: [[accord]] });
+            rembRows.push(ligne);
+            rembInfos.push({ ref: g.ref, qte: g.qte, accord, ddp: isDDP });
+            if (pool) pool.query(
+              'INSERT INTO its_dossiers (date_reception, reference, pannes, magasin, decision, accord, date_expe, quantite) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+              [g.dateDossier, g.ref, g.pannes, g.magasin, 'AVOIR', accord || (isDDP ? '(DDP — sans numéro)' : ''), todayFR2, String(g.qte)]
+            ).catch(() => {});
+            ligne++;
+          }
+        }
+
+        // Écriture groupée des valeurs puis des couleurs
+        if (ups.length) await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchUpdate`, {
+          method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ valueInputOption: 'USER_ENTERED', data: ups })
+        });
+        if (gid !== null && colors.length) await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}:batchUpdate`, {
+          method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ requests: colors })
+        });
+        // Renvois regroupés par réf pour le message
+        const grpR = {};
+        renvois.forEach(l => {
+          const k = nrmB(l.cells[1]);
+          if (!grpR[k]) grpR[k] = { ref: (l.cells[1] || '').trim(), qte: 0 };
+          grpR[k].qte++;
+        });
+        console.log('En attente ITS — bloc validé :', avoirs.length, 'unité(s) avoir /', renvois.length, 'renvoi(s) → REMBOURSEMENT ITS lignes', rembRows.join(',') || '(aucune)');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, remb: rembRows, avoirs: rembInfos, renvois: Object.values(grpR) }));
         return;
       }
 
@@ -2689,11 +2924,12 @@ Réponds UNIQUEMENT avec ce JSON, sans texte autour :
           if (isDup(ref)) { skipped.push({ reference: ref, reason: 'déjà dans la feuille (même date/magasin)' }); continue; }
           const etat = (p.decision || '').trim();
           const isAvoir = etat.toUpperCase() === 'AVOIR';
-          const commentaires = [p.quantite && parseInt(p.quantite) > 1 ? 'Qté ' + p.quantite : '',
-                                d.commentaires || ''].filter(Boolean).join(' — ');
+          // v2.39 : une LIGNE PAR UNITÉ (quantité éclatée, plus de "Qté N" en F)
+          const commentaires = (d.commentaires || '').trim();
+          const nbU = Math.max(1, parseInt(p.quantite) || 1);
           // A DATE | B REF | C LOT | D PANNES | E MAGASIN | F COMM | G DATE RECEP | H DATE EXPE | I ETAT | J TRACKING
-          values.push([d.date, ref, p.lot || '', p.pannes || '', d.magasin, commentaires, '', isAvoir ? todayFR : '', etat, '']);
-          applied.push({ reference: ref, etat });
+          for (let u = 0; u < nbU; u++) values.push([d.date, ref, p.lot || '', p.pannes || '', d.magasin, commentaires, '', isAvoir ? todayFR : '', etat, '']);
+          applied.push({ reference: ref, etat, unites: nbU });
           if (isAvoir) avoirProds.push(p);
         }
 
