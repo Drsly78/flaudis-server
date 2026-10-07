@@ -1387,6 +1387,14 @@ out center tags;`;
         res.end(JSON.stringify({ ok: true, id }));
         return;
       }
+      if (req.url === '/equipe-msg-lu') {
+        const id = String(payload.id || '').replace(/[^a-z0-9_]/gi, '');
+        if (!id) { res.writeHead(400); res.end(JSON.stringify({ error: 'id requis' })); return; }
+        await firebaseSet('postit/messages/' + id + '/lu', true);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
       if (req.url === '/equipe-note-del' || req.url === '/equipe-msg-del') {
         const id = String(payload.id || '').replace(/[^a-z0-9_]/gi, '');
         if (!id) { res.writeHead(400); res.end(JSON.stringify({ error: 'id requis' })); return; }
