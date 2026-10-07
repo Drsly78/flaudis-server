@@ -832,20 +832,21 @@ out center tags;`;
           id SERIAL PRIMARY KEY, cnb TEXT, ref TEXT, magasin TEXT, ville TEXT,
           demande TEXT, revers_url TEXT, statut TEXT DEFAULT 'ouverte',
           cree TIMESTAMPTZ DEFAULT now(), maj TIMESTAMPTZ DEFAULT now())`).catch(() => {});
-        if (pool) for (const col of ['ean', 'qte', 'fla']) await pool.query('ALTER TABLE demandes_info ADD COLUMN IF NOT EXISTS ' + col + ' TEXT').catch(() => {});
+        if (pool) for (const col of ['ean', 'qte', 'fla', 'dossier']) await pool.query('ALTER TABLE demandes_info ADD COLUMN IF NOT EXISTS ' + col + ' TEXT').catch(() => {});
         const cnb = String(payload.cnb || '').trim().toUpperCase();
         const demande = String(payload.demande || '').trim();
         if (!cnb || !demande) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'cnb et demande requis' })); return; }
         let mode = 'cree';
+        const dossierJson = (() => { try { const s2 = JSON.stringify(payload.dossier || null); return s2 && s2 !== 'null' && s2.length <= 80000 ? s2 : null; } catch(e) { return null; } })();
         if (pool) {
           const ex = await pool.query("SELECT id FROM demandes_info WHERE cnb = $1 AND statut = 'ouverte' LIMIT 1", [cnb]);
           if (ex.rows.length) {
-            await pool.query("UPDATE demandes_info SET demande = $1, ref = $2, magasin = $3, ville = $4, ean = $5, qte = $6, fla = $7, revers_url = COALESCE($8, revers_url), maj = now() WHERE id = $9",
-              [demande, payload.ref || '', payload.magasin || '', payload.ville || '', payload.ean || '', payload.qte || '', payload.fla || '', payload.revers_url || null, ex.rows[0].id]);
+            await pool.query("UPDATE demandes_info SET demande = $1, ref = $2, magasin = $3, ville = $4, ean = $5, qte = $6, fla = $7, dossier = COALESCE($8, dossier), revers_url = COALESCE($9, revers_url), maj = now() WHERE id = $10",
+              [demande, payload.ref || '', payload.magasin || '', payload.ville || '', payload.ean || '', payload.qte || '', payload.fla || '', dossierJson, payload.revers_url || null, ex.rows[0].id]);
             mode = 'mis à jour';
           } else {
-            await pool.query("INSERT INTO demandes_info (cnb, ref, magasin, ville, ean, qte, fla, demande, revers_url) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
-              [cnb, payload.ref || '', payload.magasin || '', payload.ville || '', payload.ean || '', payload.qte || '', payload.fla || '', demande, payload.revers_url || null]);
+            await pool.query("INSERT INTO demandes_info (cnb, ref, magasin, ville, ean, qte, fla, demande, revers_url, dossier) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+              [cnb, payload.ref || '', payload.magasin || '', payload.ville || '', payload.ean || '', payload.qte || '', payload.fla || '', demande, payload.revers_url || null, dossierJson]);
           }
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -860,8 +861,8 @@ out center tags;`;
             id SERIAL PRIMARY KEY, cnb TEXT, ref TEXT, magasin TEXT, ville TEXT,
             demande TEXT, revers_url TEXT, statut TEXT DEFAULT 'ouverte',
             cree TIMESTAMPTZ DEFAULT now(), maj TIMESTAMPTZ DEFAULT now())`).catch(() => {});
-          for (const col of ['ean', 'qte', 'fla']) await pool.query('ALTER TABLE demandes_info ADD COLUMN IF NOT EXISTS ' + col + ' TEXT').catch(() => {});
-          const r2 = await pool.query("SELECT id, cnb, ref, magasin, ville, ean, qte, fla, demande, revers_url, to_char(cree, 'DD/MM/YYYY') AS date FROM demandes_info WHERE statut = 'ouverte' ORDER BY cree DESC LIMIT 200").catch(() => null);
+          for (const col of ['ean', 'qte', 'fla', 'dossier']) await pool.query('ALTER TABLE demandes_info ADD COLUMN IF NOT EXISTS ' + col + ' TEXT').catch(() => {});
+          const r2 = await pool.query("SELECT id, cnb, ref, magasin, ville, ean, qte, fla, demande, revers_url, dossier, to_char(cree, 'DD/MM/YYYY') AS date FROM demandes_info WHERE statut = 'ouverte' ORDER BY cree DESC LIMIT 200").catch(() => null);
           if (r2) items = r2.rows;
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
