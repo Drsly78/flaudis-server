@@ -213,13 +213,23 @@ let noticeIndex = { files: null, ts: 0 };
 
 function fetchGithubJSON(url) {
   return new Promise((resolve) => {
-    https.get(url, { headers: { 'User-Agent': 'flaudis-server', 'Accept': 'application/vnd.github+json' } }, res => {
+    const headers = { 'User-Agent': 'flaudis-server', 'Accept': 'application/vnd.github+json' };
+    if (process.env.GITHUB_TOKEN) headers['Authorization'] = 'Bearer ' + process.env.GITHUB_TOKEN;
+    https.get(url, { headers }, res => {
       if (res.statusCode !== 200) { resolve(null); return; }
       const chunks = [];
       res.on('data', c => chunks.push(c));
       res.on('end', () => { try { resolve(JSON.parse(Buffer.concat(chunks).toString())); } catch(e) { resolve(null); } });
     }).on('error', () => resolve(null));
   });
+}
+
+// Listing du dossier notices/ — caché 10 min, garde la dernière version en cas de rate-limit
+async function listNoticesGithub() {
+  if (global._ghNoticesCache && (Date.now() - global._ghNoticesCache.ts) < 10 * 60 * 1000) return global._ghNoticesCache.list;
+  const list = await fetchGithubJSON('https://api.github.com/repos/Drsly78/flaudis-notices/contents/notices');
+  if (Array.isArray(list)) { global._ghNoticesCache = { ts: Date.now(), list }; return list; }
+  return global._ghNoticesCache ? global._ghNoticesCache.list : null;
 }
 
 // Normalisation : majuscules, suppression de .pdf et de tout caractère non alphanumérique
@@ -280,7 +290,7 @@ function findBestMatch(names, ref) {
 async function findNoticeFile(ref) {
   // Index rafraîchi toutes les 10 minutes
   if (!noticeIndex.files || Date.now() - noticeIndex.ts > 10 * 60 * 1000) {
-    const list = await fetchGithubJSON('https://api.github.com/repos/Drsly78/flaudis-notices/contents/notices');
+    const list = await listNoticesGithub();
     if (Array.isArray(list)) {
       noticeIndex = { files: list.filter(f => /\.pdf$/i.test(f.name)).map(f => f.name), ts: Date.now() };
       console.log('Index notices rafraîchi:', noticeIndex.files.length, 'fichiers');
@@ -439,7 +449,7 @@ const server = http.createServer(async function(req, res) {
   // Exception lecture navigateur : le diagnostic du référentiel ITS
   // accepte la clé en paramètre d'URL (?key=…)
   const urlKey = (req.url.match(/[?&]key=([^&]+)/) || [])[1];
-  if ((req.url.startsWith('/ref-its-structure') || req.url.startsWith('/magasins-u-crawl') || req.url.startsWith('/magasins-u-status') || req.url.startsWith('/magasins-u-test') || req.url.startsWith('/notices-manuelles') || req.url.startsWith('/demande-info-liste') || req.url.startsWith('/demande-info-get')) && urlKey === APP_SECRET) {
+  if ((req.url.startsWith('/ref-its-structure') || req.url.startsWith('/magasins-u-crawl') || req.url.startsWith('/magasins-u-status') || req.url.startsWith('/magasins-u-test') || req.url.startsWith('/notices-manuelles') || req.url.startsWith('/demande-info-liste') || req.url.startsWith('/demande-info-get') || req.url.startsWith('/notices-fichiers')) && urlKey === APP_SECRET) {
     // accès autorisé
   } else if (req.headers['x-app-secret'] !== APP_SECRET) {
     res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
@@ -851,6 +861,13 @@ out center tags;`;
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, mode }));
+        return;
+      }
+
+      if (req.url.startsWith('/notices-fichiers')) {
+        const list = await listNoticesGithub();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, files: Array.isArray(list) ? list.filter(f => /\.pdf$/i.test(f.name || '')).map(f => f.name) : [] }));
         return;
       }
 
@@ -3412,7 +3429,7 @@ Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
       }
       // Liste des fichiers notices du repo (pour l'onglet Cerveau)
       if (req.url === '/notices-files') {
-        const list = await fetchGithubJSON('https://api.github.com/repos/Drsly78/flaudis-notices/contents/notices');
+        const list = await listNoticesGithub();
         const files = Array.isArray(list) ? list.filter(f => /\.pdf$/i.test(f.name)).map(f => f.name) : [];
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ files }));
