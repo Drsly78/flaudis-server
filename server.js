@@ -895,6 +895,16 @@ out center tags;`;
         return;
       }
 
+      if (req.url === '/demande-info-delete') {
+        const idD = parseInt(payload.id);
+        if (!idD) { res.writeHead(400); res.end(JSON.stringify({ ok: false, error: 'id requis' })); return; }
+        if (pool) await pool.query('DELETE FROM demandes_info WHERE id = $1', [idD]).catch(() => {});
+        console.log('Demande info supprimée définitivement — id', idD);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
       if (req.url === '/demande-info-close') {
         const id = Number(payload.id);
         if (pool && id) await pool.query("UPDATE demandes_info SET statut = 'traitee', maj = now() WHERE id = $1", [id]).catch(() => {});
