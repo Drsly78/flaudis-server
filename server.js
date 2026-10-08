@@ -1394,6 +1394,21 @@ out center tags;`;
         return;
       }
 
+      // ── Liens USV : retrouve l'URL Revers.io des dossiers scannés ──
+      if (req.url === '/usv-liens') {
+        const cnbs = Array.isArray(payload.cnbs) ? payload.cnbs.map(c => String(c || '').trim().toUpperCase()).filter(Boolean).slice(0, 100) : [];
+        const liens = {};
+        if (pool && cnbs.length) {
+          try {
+            const q = await pool.query('SELECT numero_dossier, revers_url FROM dossiers WHERE UPPER(numero_dossier) = ANY($1) AND revers_url IS NOT NULL', [cnbs]);
+            q.rows.forEach(r2 => { liens[String(r2.numero_dossier).toUpperCase()] = r2.revers_url; });
+          } catch(e) {}
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, liens }));
+        return;
+      }
+
       // ── 📌 ÉQUIPE : notes partagées + fils de discussion (Firebase postit/) ──
       if (req.url === '/equipe-data') {
         let [notes, threads, legacy] = await Promise.all([
