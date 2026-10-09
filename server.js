@@ -1427,14 +1427,24 @@ out center tags;`;
           console.log('Équipe — migration de', Object.keys(legacy).length, 'message(s) en fils');
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, notes: notes || {}, threads: threads || {} }));
+        const legende = await firebaseGet('postit/legende');
+        res.end(JSON.stringify({ ok: true, notes: notes || {}, threads: threads || {}, legende: legende || {} }));
+        return;
+      }
+      if (req.url === '/equipe-legende-set') {
+        const c = String(payload.couleur || '').replace(/[^a-z]/g, '');
+        if (!c) { res.writeHead(400); res.end(JSON.stringify({ error: 'couleur requise' })); return; }
+        await firebaseSet('postit/legende/' + c, String(payload.texte || '').slice(0, 120));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
         return;
       }
       if (req.url === '/equipe-note-add') {
         const texte = String(payload.texte || '').trim();
         if (!texte) { res.writeHead(400); res.end(JSON.stringify({ error: 'texte requis' })); return; }
         const id = Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7);
-        await firebaseSet('postit/notes/' + id, { t: texte, ts: Date.now() });
+        const coul = ['jaune', 'vert', 'bleu', 'rose', 'violet'].includes(payload.couleur) ? payload.couleur : 'jaune';
+        await firebaseSet('postit/notes/' + id, { t: texte, ts: Date.now(), c: coul });
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, id }));
         return;
@@ -1442,7 +1452,7 @@ out center tags;`;
       if (req.url === '/equipe-thread-new' || req.url === '/equipe-thread-reply') {
         const texte = String(payload.texte || '').trim();
         if (!texte) { res.writeHead(400); res.end(JSON.stringify({ error: 'texte requis' })); return; }
-        const auteur = payload.auteur === 'Xavier' ? 'Xavier' : 'Sylvain';
+        const auteur = ['Sylvain', 'Xavier', 'Popo', 'Juju'].includes(payload.auteur) ? payload.auteur : 'Sylvain';
         const mid = Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7);
         let tid;
         if (req.url === '/equipe-thread-new') {
