@@ -2651,6 +2651,15 @@ out center tags;`;
           if (m) return m[1] + '-' + m[2] + '-' + m[3];
           m = t.match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})$/);
           if (m) return (m[3].length === 2 ? '20' + m[3] : m[3]) + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0');
+          // Date sans année ("07/10") : année courante, ou précédente si le
+          // mois serait dans le futur (les envois sont dans le passé proche)
+          m = t.match(/^(\d{1,2})[\/.\-](\d{1,2})$/);
+          if (m) {
+            const now = new Date();
+            let an = now.getFullYear();
+            if (parseInt(m[2]) > now.getMonth() + 1) an--;
+            return an + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0');
+          }
           return null;
         };
         const parJour = {};
@@ -2675,8 +2684,8 @@ out center tags;`;
         const q = await pool.query(`
           SELECT numero_dossier, enseigne, departement_ville, ref_produit, piece, tracking, date_envoi, notes, fla, revers_url
           FROM dossiers
-          WHERE COALESCE(tracking,'') <> '' AND (date_envoi = $1 OR date_envoi = $2)
-          ORDER BY departement_ville`, [iso, fr]);
+          WHERE COALESCE(tracking,'') <> '' AND (date_envoi = $1 OR date_envoi = $2 OR date_envoi = $3)
+          ORDER BY departement_ville`, [iso, fr, fr.slice(0, 5)]);
         const lignes = q.rows.map(r => ({
           tracking: r.tracking,
           usv: r.numero_dossier,
@@ -2692,8 +2701,8 @@ out center tags;`;
         try {
           const qi = await pool.query(`
             SELECT reference, magasin, tracking, pannes, accord FROM its_dossiers
-            WHERE COALESCE(tracking,'') <> '' AND (date_expe = $1 OR date_expe = $2)
-            ORDER BY magasin`, [iso, fr]);
+            WHERE COALESCE(tracking,'') <> '' AND (date_expe = $1 OR date_expe = $2 OR date_expe = $3)
+            ORDER BY magasin`, [iso, fr, fr.slice(0, 5)]);
           qi.rows.forEach(r => lignes.push({
             tracking: r.tracking, usv: '', fla: '', date_envoi: fr,
             magasin: r.magasin || '', enseigne: 'INTERSPORT',
@@ -3409,8 +3418,17 @@ Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
             // Sync base its_dossiers (clé date+ref+magasin)
             if (pool) {
               for (const a of itsApplied) {
-                pool.query('UPDATE its_dossiers SET tracking = $1, date_expe = $2 WHERE date_reception = $3 AND reference = $4 AND magasin = $5',
-                  [a.tracking, dateExpe, a.date, a.ref, a.magasin]).catch(() => {});
+                try {
+                  const u = await pool.query('UPDATE its_dossiers SET tracking = $1, date_expe = $2 WHERE date_reception = $3 AND reference = $4 AND magasin = $5',
+                    [a.tracking, dateExpe, a.date, a.ref, a.magasin]);
+                  if (!u.rowCount) {
+                    // Dossier jamais synchronisé en base : on le crée pour que
+                    // sa journée d'expédition apparaisse dans l'historique
+                    await pool.query(
+                      'INSERT INTO its_dossiers (date_reception, reference, pannes, magasin, decision, accord, tracking, date_expe, quantite) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)',
+                      [a.date || '', a.ref || '', '', a.magasin || '', "RETOUR EN L'ETAT", '', a.tracking, dateExpe, '']);
+                  }
+                } catch(e) { console.warn('Sync DB tracking ITS:', e.message); }
               }
             }
           }
