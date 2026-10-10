@@ -449,7 +449,7 @@ const server = http.createServer(async function(req, res) {
   // Exception lecture navigateur : le diagnostic du référentiel ITS
   // accepte la clé en paramètre d'URL (?key=…)
   const urlKey = (req.url.match(/[?&]key=([^&]+)/) || [])[1];
-  if ((req.url.startsWith('/ref-its-structure') || req.url.startsWith('/magasins-u-crawl') || req.url.startsWith('/magasins-u-status') || req.url.startsWith('/magasins-u-test') || req.url.startsWith('/notices-manuelles') || req.url.startsWith('/demande-info-liste') || req.url.startsWith('/demande-info-get') || req.url.startsWith('/notices-fichiers')) && urlKey === APP_SECRET) {
+  if ((req.url.startsWith('/ref-its-structure') || req.url.startsWith('/magasins-u-crawl') || req.url.startsWith('/magasins-u-status') || req.url.startsWith('/magasins-u-test') || req.url.startsWith('/notices-manuelles') || req.url.startsWith('/demande-info-liste') || req.url.startsWith('/demande-info-get') || req.url.startsWith('/notices-fichiers') || req.url.startsWith('/livraisons-diag')) && urlKey === APP_SECRET) {
     // accès autorisé
   } else if (req.headers['x-app-secret'] !== APP_SECRET) {
     res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
@@ -2622,12 +2622,28 @@ out center tags;`;
       }
 
       // ── LIVRAISONS : jours d'expédition + détail d'un jour ────────
+      if (req.url.startsWith('/livraisons-diag')) {
+        // Diagnostic lisible navigateur (?key=…) : dates d'envoi brutes récentes
+        let su = [], its = [];
+        if (pool) {
+          su = (await pool.query(`SELECT date_envoi, COUNT(*) AS n FROM dossiers WHERE COALESCE(tracking,'') <> '' AND COALESCE(date_envoi,'') <> '' GROUP BY date_envoi ORDER BY MAX(COALESCE(date_envoi,'')) DESC LIMIT 20`).catch(() => ({ rows: [] }))).rows;
+          its = (await pool.query(`SELECT date_expe AS date_envoi, COUNT(*) AS n FROM its_dossiers WHERE COALESCE(tracking,'') <> '' AND COALESCE(date_expe,'') <> '' GROUP BY date_expe ORDER BY MAX(COALESCE(date_expe,'')) DESC LIMIT 20`).catch(() => ({ rows: [] }))).rows;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, dates_su_brutes: su, dates_its_brutes: its }));
+        return;
+      }
       if (req.url === '/livraisons-jours') {
         if (!pool) { res.writeHead(200); res.end(JSON.stringify({ jours: [] })); return; }
         const q = await pool.query(`
           SELECT date_envoi, COUNT(*) AS n FROM dossiers
           WHERE COALESCE(tracking,'') <> '' AND COALESCE(date_envoi,'') <> '' AND LOWER(date_envoi) <> 'x'
           GROUP BY date_envoi`);
+        // Journées Intersport (renvois expédiés) — même historique, autre table
+        const qIts = await pool.query(`
+          SELECT date_expe AS date_envoi, COUNT(*) AS n FROM its_dossiers
+          WHERE COALESCE(tracking,'') <> '' AND COALESCE(date_expe,'') <> ''
+          GROUP BY date_expe`).catch(() => ({ rows: [] }));
         // La base mélange ISO (sync) et JJ/MM/AA (app) → on regroupe par jour réel
         const toISO3 = v => {
           const t = String(v || '').trim();
@@ -2638,7 +2654,7 @@ out center tags;`;
           return null;
         };
         const parJour = {};
-        q.rows.forEach(r => {
+        [...q.rows, ...qIts.rows].forEach(r => {
           const iso = toISO3(r.date_envoi);
           if (!iso) return;
           parJour[iso] = (parJour[iso] || 0) + parseInt(r.n);
@@ -2672,6 +2688,18 @@ out center tags;`;
           piece: r.piece || '',
           revers_url: r.revers_url || null
         }));
+        // Lignes Intersport expédiées ce jour-là
+        try {
+          const qi = await pool.query(`
+            SELECT reference, magasin, tracking, pannes, accord FROM its_dossiers
+            WHERE COALESCE(tracking,'') <> '' AND (date_expe = $1 OR date_expe = $2)
+            ORDER BY magasin`, [iso, fr]);
+          qi.rows.forEach(r => lignes.push({
+            tracking: r.tracking, usv: '', fla: '', date_envoi: fr,
+            magasin: r.magasin || '', enseigne: 'INTERSPORT',
+            ref: r.reference || '', piece: '', revers_url: null
+          }));
+        } catch(e) {}
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ jour: fr, lignes }));
         return;
