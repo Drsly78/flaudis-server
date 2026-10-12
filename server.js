@@ -1422,18 +1422,19 @@ Voici un mail d'arrivage de conteneur chez TRM (société de stockage de FLAUDIS
 
 NOMS DES FICHIERS JOINTS : ${nomsFichiers.join(' ; ') || '(aucun)'}
 
-TEXTE DU MAIL (si c'est un échange, seul le message LE PLUS RÉCENT compte — en général le premier en haut) :
+TEXTE DU MAIL — ATTENTION : c'est souvent un FIL contenant plusieurs mails et parfois D'AUTRES dossiers sans aucun rapport. SEUL compte le message d'arrivage dont le SUJET donne le numéro de facture ci-dessous ; ignore totalement les autres messages, leurs dates et leurs dossiers :
 ${String(payload.texte_mail || '(non fourni)').slice(0, 8000)}
 ${excelTxt ? '\nCONTENU DES FICHIERS EXCEL JOINTS :\n' + excelTxt.slice(0, 12000) : ''}
 
 Règles d'extraction :
 - facture : le numéro de facture du conteneur, format WN-##### ou HL-##### (dans le nom du PDF principal, le sujet du mail, ou le champ REFERENCE NO du PDF). Sortie exacte type "HL-12542".
 - lot : l'identifiant du SAV chez TRM = "SAV " + facture (ex "SAV HL-12542"), sauf si le mail en donne un autre explicitement.
-- produits : SEULEMENT les quantités SAV, JAMAIS les quantités totales/magasin. Sources par priorité : 1) la colonne SAV du fichier Excel (avec REFERENCE et BARCODE) ; 2) à défaut, la facture SAV du PDF (celle dont REFERENCE NO contient "SAV" ou section "1% SAV - AFTER SALES SERVICES") ; en complément les lignes "FOR SAV" de la packing list. Si Excel ET PDF existent et divergent sur une quantité, prends l'Excel et signale l'écart en incertitudes.
+- produits : TOUS les produits ayant une quantité SAV — un conteneur contient souvent PLUSIEURS références (le sujet du mail les liste, ex "YS2657 + DZ25B0082-B01"), et CHACUNE doit figurer dans la liste. N'exclus JAMAIS un produit sous prétexte qu'il serait "hors sujet" ou d'une autre OP : s'il a du SAV dans cet arrivage, il est dans la liste. SEULEMENT les quantités SAV, JAMAIS les quantités totales/magasin. Sources par priorité : 1) la colonne SAV du fichier Excel (avec REFERENCE et BARCODE) ; 2) à défaut, la facture SAV du PDF (celle dont REFERENCE NO contient "SAV" ou section "1% SAV - AFTER SALES SERVICES") ; en complément les lignes "FOR SAV" de la packing list. Si Excel ET PDF existent et divergent sur une quantité, prends l'Excel et signale l'écart en incertitudes.
 - Pour chaque produit : ref (ex FHR25-020 — attention aux coquilles du PDF, l'Excel fait foi), ean (le BARCODE 13 chiffres de l'Excel, null si absent), qte (quantité SAV, entier), note (annotations utiles : "DONT 2 ABIMES", emballage abîmé, etc. — null sinon).
-- date_arrivee : la date d'ARRIVAGE chez TRM (sujet type "ARRIVAGE TRM DU 26/08" ou texte du mail) en JJ/MM/AA, année en cours si absente (année précédente si cela tombait dans le futur). null si introuvable.
-- op : l'opération commerciale si mentionnée (ex "OP MAISON 2"). gamme : la gamme produits si mentionnée (ex "FHR"). conteneurs : les numéros de conteneurs physiques (format 4 lettres + 7 chiffres, ex ECMU7160923) listés dans les documents. commentaire : toute info utile du mail sur l'arrivage (colis abîmés, wetransfer notices, etc.) en une phrase.
+- date_arrivee : PRIORITÉ ABSOLUE au SUJET du mail d'arrivage : "ARRIVAGE TRM DU 19/08" → 19/08 + année en cours (année précédente si futur) → 19/08/26. Ne déduis JAMAIS la date d'autres mails du fil ni des dates de la facture (SHIP ARRIVAL DATE n'est PAS la date d'arrivage TRM). null si vraiment introuvable.
+- op : l'opération commerciale (ex "OP MAISON 2"). Si plusieurs produits ont des OP différentes, mets-les toutes dans op séparées par " + " et précise l'OP propre à chaque produit dans sa note. gamme : la gamme produits si mentionnée (ex "FHR"). conteneurs : les numéros de conteneurs physiques (format 4 lettres + 7 chiffres, ex ECMU7160923) listés dans les documents. commentaire : toute info utile du mail sur l'arrivage (colis abîmés, wetransfer notices, etc.) en une phrase.
 - N'invente RIEN : un champ illisible = null + une ligne dans incertitudes.
+- incertitudes : des items ULTRA-COURTS, 12 mots max chacun, format "champ : doute". Aucun raisonnement, aucune justification.
 Réponds UNIQUEMENT avec ce JSON, sans texte autour :
 {"facture":"HL-12542","lot":"SAV HL-12542","op":"...","gamme":"...","date_arrivee":"JJ/MM/AA","conteneurs":["..."],"commentaire":"...","produits":[{"ref":"...","ean":"...","qte":1,"note":null}],"incertitudes":["champ : explication courte"]}` });
         let aiData = await callAnthropic({
