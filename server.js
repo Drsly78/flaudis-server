@@ -1394,6 +1394,144 @@ out center tags;`;
         return;
       }
 
+      // ── 🚢 CONTENEURS TRM : arrivages SAV (scan mail opératrice) ──
+      if (req.url === '/trm-analyser') {
+        const content = [];
+        const fichiers = Array.isArray(payload.fichiers) ? payload.fichiers : [];
+        for (const f of fichiers.slice(0, 3)) {
+          content.push(f.media === 'application/pdf'
+            ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: f.b64 } }
+            : { type: 'image', source: { type: 'base64', media_type: f.media || 'image/png', data: f.b64 } });
+        }
+        const nomsFichiers = fichiers.map(f => f.name || '').filter(Boolean);
+        const excels = Array.isArray(payload.excels) ? payload.excels.slice(0, 3) : [];
+        let excelTxt = '';
+        for (const ex of excels) {
+          excelTxt += '\n--- FICHIER EXCEL : ' + (ex.name || '?') + ' ---\n';
+          for (const fe of (ex.feuilles || []).slice(0, 5)) {
+            excelTxt += '[Feuille ' + (fe.nom || '?') + ']\n';
+            (fe.rows || []).slice(0, 200).forEach(r2 => {
+              excelTxt += (r2 || []).map(c => String(c === null || c === undefined ? '' : c).replace(/\s+/g, ' ').slice(0, 60)).join(' | ') + '\n';
+            });
+          }
+        }
+        const _now = new Date();
+        content.push({ type: 'text', text: `NOUS SOMMES LE ${String(_now.getDate()).padStart(2,'0')}/${String(_now.getMonth()+1).padStart(2,'0')}/${_now.getFullYear()}.
+
+Voici un mail d'arrivage de conteneur chez TRM (société de stockage de FLAUDIS) envoyé par notre opératrice, avec ses pièces jointes (facture/packing list PDF, récapitulatif Excel). Les conteneurs contiennent des produits pour les magasins ET une part SAV qui nous est destinée. Ta mission : extraire UNIQUEMENT la part SAV.
+
+NOMS DES FICHIERS JOINTS : ${nomsFichiers.join(' ; ') || '(aucun)'}
+
+TEXTE DU MAIL (si c'est un échange, seul le message LE PLUS RÉCENT compte — en général le premier en haut) :
+${String(payload.texte_mail || '(non fourni)').slice(0, 8000)}
+${excelTxt ? '\nCONTENU DES FICHIERS EXCEL JOINTS :\n' + excelTxt.slice(0, 12000) : ''}
+
+Règles d'extraction :
+- facture : le numéro de facture du conteneur, format WN-##### ou HL-##### (dans le nom du PDF principal, le sujet du mail, ou le champ REFERENCE NO du PDF). Sortie exacte type "HL-12542".
+- lot : l'identifiant du SAV chez TRM = "SAV " + facture (ex "SAV HL-12542"), sauf si le mail en donne un autre explicitement.
+- produits : SEULEMENT les quantités SAV, JAMAIS les quantités totales/magasin. Sources par priorité : 1) la colonne SAV du fichier Excel (avec REFERENCE et BARCODE) ; 2) à défaut, la facture SAV du PDF (celle dont REFERENCE NO contient "SAV" ou section "1% SAV - AFTER SALES SERVICES") ; en complément les lignes "FOR SAV" de la packing list. Si Excel ET PDF existent et divergent sur une quantité, prends l'Excel et signale l'écart en incertitudes.
+- Pour chaque produit : ref (ex FHR25-020 — attention aux coquilles du PDF, l'Excel fait foi), ean (le BARCODE 13 chiffres de l'Excel, null si absent), qte (quantité SAV, entier), note (annotations utiles : "DONT 2 ABIMES", emballage abîmé, etc. — null sinon).
+- date_arrivee : la date d'ARRIVAGE chez TRM (sujet type "ARRIVAGE TRM DU 26/08" ou texte du mail) en JJ/MM/AA, année en cours si absente (année précédente si cela tombait dans le futur). null si introuvable.
+- op : l'opération commerciale si mentionnée (ex "OP MAISON 2"). gamme : la gamme produits si mentionnée (ex "FHR"). conteneurs : les numéros de conteneurs physiques (format 4 lettres + 7 chiffres, ex ECMU7160923) listés dans les documents. commentaire : toute info utile du mail sur l'arrivage (colis abîmés, wetransfer notices, etc.) en une phrase.
+- N'invente RIEN : un champ illisible = null + une ligne dans incertitudes.
+Réponds UNIQUEMENT avec ce JSON, sans texte autour :
+{"facture":"HL-12542","lot":"SAV HL-12542","op":"...","gamme":"...","date_arrivee":"JJ/MM/AA","conteneurs":["..."],"commentaire":"...","produits":[{"ref":"...","ean":"...","qte":1,"note":null}],"incertitudes":["champ : explication courte"]}` });
+        let aiData = await callAnthropic({
+          model: process.env.MODEL_EXTRACT || MODEL_MAIN,
+          messages: [{ role: 'user', content }],
+          max_tokens: 3000
+        });
+        let raw = (aiData.content || []).map(b => b.text || '').join('');
+        let parsed = parseJsonModel(raw);
+        if (!parsed && aiData.stop_reason === 'max_tokens') {
+          aiData = await callAnthropic({
+            model: process.env.MODEL_EXTRACT || MODEL_MAIN,
+            messages: [{ role: 'user', content }],
+            max_tokens: 8000
+          });
+          raw = (aiData.content || []).map(b => b.text || '').join('');
+          parsed = parseJsonModel(raw);
+        }
+        if (!parsed) { res.writeHead(502); res.end(JSON.stringify({ error: 'Extraction illisible — réessaie (réponse modèle non JSON).' })); return; }
+        console.log('TRM analysé :', parsed.facture, '|', (parsed.produits || []).length, 'réf(s) SAV');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, data: parsed }));
+        return;
+      }
+
+      if (req.url === '/trm-save') {
+        if (!pool) { res.writeHead(500); res.end(JSON.stringify({ error: 'base indisponible' })); return; }
+        await pool.query(`CREATE TABLE IF NOT EXISTS conteneurs_trm (
+          facture TEXT PRIMARY KEY, lot TEXT, op TEXT, gamme TEXT, date_arrivee TEXT,
+          conteneurs TEXT, commentaire TEXT, maj TIMESTAMPTZ DEFAULT now())`).catch(() => {});
+        await pool.query(`CREATE TABLE IF NOT EXISTS conteneurs_trm_lignes (
+          id SERIAL PRIMARY KEY, facture TEXT, ref TEXT, ean TEXT, qte INTEGER, note TEXT)`).catch(() => {});
+        const facture = String(payload.facture || '').trim().toUpperCase();
+        if (!/^(WN|HL)-?\d{3,6}$/.test(facture)) { res.writeHead(400); res.end(JSON.stringify({ error: 'numéro de facture invalide (attendu WN-xxxxx ou HL-xxxxx)' })); return; }
+        const produits = (Array.isArray(payload.produits) ? payload.produits : [])
+          .map(p => ({ ref: String(p.ref || '').trim().toUpperCase(), ean: String(p.ean || '').replace(/\D/g, ''), qte: parseInt(p.qte) || 0, note: String(p.note || '').trim() }))
+          .filter(p => p.ref && p.qte > 0);
+        if (!produits.length) { res.writeHead(400); res.end(JSON.stringify({ error: 'aucune ligne SAV valide (réf + quantité > 0)' })); return; }
+        await pool.query(`INSERT INTO conteneurs_trm (facture, lot, op, gamme, date_arrivee, conteneurs, commentaire, maj)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,now())
+          ON CONFLICT (facture) DO UPDATE SET lot=$2, op=$3, gamme=$4, date_arrivee=$5, conteneurs=$6, commentaire=$7, maj=now()`,
+          [facture, String(payload.lot || ('SAV ' + facture)).trim(), String(payload.op || '').trim(), String(payload.gamme || '').trim(),
+           String(payload.date_arrivee || '').trim(), (Array.isArray(payload.conteneurs) ? payload.conteneurs : []).join(', '), String(payload.commentaire || '').trim()]);
+        await pool.query('DELETE FROM conteneurs_trm_lignes WHERE facture = $1', [facture]);
+        for (const p of produits) {
+          await pool.query('INSERT INTO conteneurs_trm_lignes (facture, ref, ean, qte, note) VALUES ($1,$2,$3,$4,$5)',
+            [facture, p.ref, p.ean || null, p.qte, p.note || null]);
+        }
+        console.log('TRM enregistré :', facture, '—', produits.length, 'réf(s)');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, facture, lignes: produits.length }));
+        return;
+      }
+
+      if (req.url === '/trm-liste') {
+        let conteneurs = [];
+        if (pool) {
+          try {
+            const qc = await pool.query('SELECT facture, lot, op, gamme, date_arrivee, conteneurs, commentaire FROM conteneurs_trm ORDER BY maj DESC LIMIT 200');
+            const ql = await pool.query('SELECT facture, ref, ean, qte, note FROM conteneurs_trm_lignes ORDER BY ref');
+            const parFacture = {};
+            ql.rows.forEach(l => { (parFacture[l.facture] = parFacture[l.facture] || []).push(l); });
+            conteneurs = qc.rows.map(c => ({ ...c, produits: parFacture[c.facture] || [] }));
+          } catch(e) {}
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, conteneurs }));
+        return;
+      }
+
+      if (req.url === '/trm-delete') {
+        if (!pool) { res.writeHead(500); res.end(JSON.stringify({ error: 'base indisponible' })); return; }
+        const facture = String(payload.facture || '').trim().toUpperCase();
+        if (!facture) { res.writeHead(400); res.end(JSON.stringify({ error: 'facture requise' })); return; }
+        await pool.query('DELETE FROM conteneurs_trm WHERE facture = $1', [facture]).catch(() => {});
+        await pool.query('DELETE FROM conteneurs_trm_lignes WHERE facture = $1', [facture]).catch(() => {});
+        console.log('TRM supprimé :', facture);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      if (req.url === '/trm-lookup') {
+        const nrm = v => String(v || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+        const ref = nrm(payload.ref), ean = String(payload.ean || '').replace(/\D/g, '');
+        let hits = [];
+        if (pool && (ref || ean)) {
+          try {
+            const q = await pool.query(`SELECT l.facture, l.ref, l.ean, l.qte, l.note, c.lot, c.date_arrivee
+              FROM conteneurs_trm_lignes l JOIN conteneurs_trm c ON c.facture = l.facture`);
+            hits = q.rows.filter(r2 => (ref && nrm(r2.ref) === ref) || (ean && String(r2.ean || '') === ean));
+          } catch(e) {}
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, hits }));
+        return;
+      }
+
       // ── Liens USV : retrouve l'URL Revers.io des dossiers scannés ──
       if (req.url === '/usv-liens') {
         const cnbs = Array.isArray(payload.cnbs) ? payload.cnbs.map(c => String(c || '').trim().toUpperCase()).filter(Boolean).slice(0, 100) : [];
