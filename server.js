@@ -449,7 +449,7 @@ const server = http.createServer(async function(req, res) {
   // Exception lecture navigateur : le diagnostic du référentiel ITS
   // accepte la clé en paramètre d'URL (?key=…)
   const urlKey = (req.url.match(/[?&]key=([^&]+)/) || [])[1];
-  if ((req.url.startsWith('/ref-its-structure') || req.url.startsWith('/magasins-u-crawl') || req.url.startsWith('/magasins-u-status') || req.url.startsWith('/magasins-u-test') || req.url.startsWith('/notices-manuelles') || req.url.startsWith('/demande-info-liste') || req.url.startsWith('/demande-info-get') || req.url.startsWith('/notices-fichiers') || req.url.startsWith('/notices-doublons') || req.url.startsWith('/livraisons-diag')) && urlKey === APP_SECRET) {
+  if ((req.url.startsWith('/ref-its-structure') || req.url.startsWith('/magasins-u-crawl') || req.url.startsWith('/magasins-u-status') || req.url.startsWith('/magasins-u-test') || req.url.startsWith('/notices-manuelles') || req.url.startsWith('/demande-info-liste') || req.url.startsWith('/demande-info-get') || req.url.startsWith('/notices-fichiers') || req.url.startsWith('/notices-doublons') || req.url.startsWith('/notice-pdf') || req.url.startsWith('/livraisons-diag')) && urlKey === APP_SECRET) {
     // accès autorisé
   } else if (req.headers['x-app-secret'] !== APP_SECRET) {
     res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
@@ -986,11 +986,34 @@ out center tags;`;
         return;
       }
 
+      // ── 📄 Servir un PDF de notice en AFFICHAGE navigateur (pas en téléchargement) ──
+      //    raw.githubusercontent force le téléchargement des PDF ; ici on les sert
+      //    avec le bon Content-Type pour qu'ils s'ouvrent dans l'onglet.
+      if (req.url.startsWith('/notice-pdf')) {
+        const q = (req.url.match(/[?&]f=([^&]+)/) || [])[1];
+        let nom = '';
+        try { nom = decodeURIComponent(q || ''); } catch(e) {}
+        nom = nom.trim();
+        if (!nom || /[\/\\]/.test(nom)) { res.writeHead(400); res.end('Nom de fichier invalide'); return; }
+        if (!/\.pdf$/i.test(nom)) nom += '.pdf';
+        try {
+          const buf = await downloadBuffer(GITHUB_NOTICES + encodeURIComponent(nom));
+          if (!buf) { res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end('Notice introuvable : ' + nom); return; }
+          res.writeHead(200, {
+            'Content-Type': 'application/pdf',
+            'Content-Disposition': 'inline; filename="' + nom.replace(/["\r\n]/g, '') + '"',
+            'Cache-Control': 'public, max-age=600'
+          });
+          res.end(buf);
+        } catch(e) { res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end('Erreur de lecture GitHub : ' + e.message); }
+        return;
+      }
+
       // ── 🔍 Détection des notices en doublon ──
       //    1. contenu strictement identique (même empreinte git des PDF)
       //    2. noms quasi identiques une fois normalisés ("(1)", "copie", tirets/espaces…)
       //    Pour chaque fichier on indique s'il a des données entrepôt dans Firebase.
-      if (req.url.startsWith('/notices-doublons')) {
+      if (req.url.startsWith('/notices-doublons') || req.url.startsWith('/notice-pdf')) {
         const list = await listNoticesGithub();
         if (!Array.isArray(list)) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
