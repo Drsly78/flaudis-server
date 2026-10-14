@@ -945,8 +945,9 @@ out center tags;`;
         const GH_TOKEN = process.env.GITHUB_TOKEN || '';
         const GH_REPO = process.env.GITHUB_REPO || 'Drsly78/flaudis-notices';
         if (!GH_TOKEN) { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'GITHUB_TOKEN manquant dans les variables Railway' })); return; }
+        const champ = v => String(v || '').trim().replace(/;/g, ' ').replace(/[\r\n]+/g, ' ');
         const lignes = (Array.isArray(payload.lignes) ? payload.lignes : [])
-          .map(l => ({ ean: String(l.ean || '').replace(/\D/g, ''), ref: String(l.ref || '').trim().toUpperCase().replace(/;/g, ' ') }))
+          .map(l => ({ ean: String(l.ean || '').replace(/\D/g, ''), ref: champ(l.ref).toUpperCase(), statut: champ(l.statut), prix: champ(l.prix) }))
           .filter(l => /^\d{8,14}$/.test(l.ean) && l.ref);
         if (!lignes.length) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'aucune ligne valide (EAN numérique + réf requis)' })); return; }
         const ghUrl = 'https://api.github.com/repos/' + GH_REPO + '/contents/ean-ref.csv';
@@ -965,7 +966,7 @@ out center tags;`;
           return;
         }
         if (!/\n$/.test(csv)) csv += '\n';
-        csv += ajouts.map(l => l.ean + ';' + l.ref).join('\n') + '\n';
+        csv += ajouts.map(l => l.ean + ';' + l.ref + ';' + l.statut + ';' + l.prix).join('\n') + '\n';
         const put = await fetch(ghUrl, {
           method: 'PUT', headers: { ...ghHeaders, 'Content-Type': 'application/json' },
           body: JSON.stringify({
