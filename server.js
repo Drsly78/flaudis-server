@@ -449,7 +449,7 @@ const server = http.createServer(async function(req, res) {
   // Exception lecture navigateur : le diagnostic du référentiel ITS
   // accepte la clé en paramètre d'URL (?key=…)
   const urlKey = (req.url.match(/[?&]key=([^&]+)/) || [])[1];
-  if ((req.url.startsWith('/ref-its-structure') || req.url.startsWith('/magasins-u-crawl') || req.url.startsWith('/magasins-u-status') || req.url.startsWith('/magasins-u-test') || req.url.startsWith('/notices-manuelles') || req.url.startsWith('/demande-info-liste') || req.url.startsWith('/demande-info-get') || req.url.startsWith('/notices-fichiers') || req.url.startsWith('/livraisons-diag')) && urlKey === APP_SECRET) {
+  if ((req.url.startsWith('/ref-its-structure') || req.url.startsWith('/magasins-u-crawl') || req.url.startsWith('/magasins-u-status') || req.url.startsWith('/magasins-u-test') || req.url.startsWith('/notices-manuelles') || req.url.startsWith('/demande-info-liste') || req.url.startsWith('/demande-info-get') || req.url.startsWith('/notices-fichiers') || req.url.startsWith('/notices-doublons') || req.url.startsWith('/livraisons-diag')) && urlKey === APP_SECRET) {
     // accès autorisé
   } else if (req.headers['x-app-secret'] !== APP_SECRET) {
     res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
@@ -983,6 +983,151 @@ out center tags;`;
         console.log('Référentiel EAN —', ajouts.length, 'ligne(s) ajoutée(s)', doublons.length ? '| doublons écartés : ' + doublons.join(',') : '');
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, ajoutes: ajouts.length, doublons }));
+        return;
+      }
+
+      // ── 🔍 Détection des notices en doublon ──
+      //    1. contenu strictement identique (même empreinte git des PDF)
+      //    2. noms quasi identiques une fois normalisés ("(1)", "copie", tirets/espaces…)
+      //    Pour chaque fichier on indique s'il a des données entrepôt dans Firebase.
+      if (req.url.startsWith('/notices-doublons')) {
+        const list = await listNoticesGithub();
+        if (!Array.isArray(list)) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Listing GitHub indisponible (GITHUB_TOKEN manquant ou rate-limit)' }));
+          return;
+        }
+        const pdfs = list.filter(f => /\.pdf$/i.test(f.name || ''));
+        // Clés produits Firebase (lecture "shallow" = les clés seules, pas les fiches)
+        let prodKeys = new Set();
+        try {
+          const tok = await getFbToken();
+          const r0 = await fetch(FIREBASE_URL + '/produits.json?shallow=true' + (tok ? '&auth=' + tok : ''));
+          const o = r0.ok ? await r0.json() : null;
+          if (o && typeof o === 'object') prodKeys = new Set(Object.keys(o));
+        } catch(e) {}
+        const stem = n => String(n).replace(/\.pdf$/i, '');
+        const aData = n => prodKeys.has(getKey(stem(n)));
+        const normDbl = n => stem(n).toUpperCase()
+          .replace(/\(\s*\d+\s*\)/g, '')
+          .replace(/\b(COPIE|COPY|BIS|DOUBLON)\b/g, '')
+          .replace(/[^A-Z0-9]/g, '');
+        const groupes = [];
+        const dejaGroupes = new Set();
+        // 1. Même contenu
+        const parSha = {};
+        for (const f of pdfs) { if (f.sha) (parSha[f.sha] = parSha[f.sha] || []).push(f); }
+        for (const sha in parSha) if (parSha[sha].length > 1) {
+          groupes.push({ type: 'identique', files: parSha[sha] });
+          parSha[sha].forEach(f => dejaGroupes.add(f.name));
+        }
+        // 2. Noms quasi identiques (hors fichiers déjà groupés par contenu)
+        const parNom = {};
+        for (const f of pdfs) {
+          if (dejaGroupes.has(f.name)) continue;
+          const k = normDbl(f.name);
+          if (k.length >= 3) (parNom[k] = parNom[k] || []).push(f);
+        }
+        for (const k in parNom) if (parNom[k].length > 1) groupes.push({ type: 'nom', files: parNom[k] });
+        // Signature stable par groupe + filtrage des groupes déjà ignorés
+        const cryptoD = require('crypto');
+        const ignores = await firebaseGet('fusion/ignores') || {};
+        const out = [];
+        for (const g of groupes) {
+          const noms = g.files.map(f => f.name).sort();
+          const sig = cryptoD.createHash('md5').update(noms.join('|')).digest('hex');
+          if (ignores[sig]) continue;
+          out.push({ sig, type: g.type, files: noms.map(n => {
+            const f0 = g.files.find(x => x.name === n);
+            return { name: n, size: (f0 && f0.size) || 0, data: aData(n) };
+          }) });
+        }
+        out.sort((a, b) => (a.type === b.type ? 0 : a.type === 'identique' ? -1 : 1));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, total_pdf: pdfs.length, groupes: out, ignores: Object.keys(ignores).length }));
+        return;
+      }
+
+      // Marquer un groupe comme "pas un vrai doublon" — il ne ressortira plus
+      if (req.url === '/doublons-ignorer') {
+        const sig = String(payload.sig || '').replace(/[^a-f0-9]/g, '');
+        if (!sig) { res.writeHead(400); res.end(JSON.stringify({ ok: false, error: 'sig requise' })); return; }
+        await firebaseSet('fusion/ignores/' + sig, {
+          date: new Date().toISOString(),
+          files: Array.isArray(payload.files) ? payload.files.slice(0, 20) : []
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      // ── 🔀 Fusion de notices en doublon : on garde la cible, les sources
+      //    sont supprimées du repo, leurs données entrepôt migrent vers la cible ──
+      if (req.url === '/notices-fusionner') {
+        const GH_TOKEN = process.env.GITHUB_TOKEN || '';
+        const GH_REPO = process.env.GITHUB_REPO || 'Drsly78/flaudis-notices';
+        if (!GH_TOKEN) { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'GITHUB_TOKEN manquant dans les variables Railway' })); return; }
+        const nettoie = v => String(v || '').trim().replace(/\.pdf$/i, '');
+        const cible = nettoie(payload.cible);
+        const sources = (Array.isArray(payload.sources) ? payload.sources : []).map(nettoie).filter(x => x && x !== cible);
+        if (!cible || !sources.length) { res.writeHead(400); res.end(JSON.stringify({ ok: false, error: 'cible et au moins une source (différente) requises' })); return; }
+        const ghHeaders = { 'Authorization': 'Bearer ' + GH_TOKEN, 'User-Agent': 'flaudis-sav', 'Accept': 'application/vnd.github+json' };
+        const cibleKey = getKey(cible);
+        const resume = { pdf_supprimes: [], pdf_introuvables: [], migrations: [], assoc_remappees: 0 };
+        for (const src of sources) {
+          // 1. Suppression du PDF doublon dans le repo
+          const ghPath = 'notices/' + src.replace(/[\/\\]/g, '-') + '.pdf';
+          const ghUrl = 'https://api.github.com/repos/' + GH_REPO + '/contents/' + encodeURIComponent(ghPath).replace(/%2F/g, '/');
+          try {
+            const g = await fetch(ghUrl, { headers: ghHeaders });
+            if (g.ok) {
+              const sha = (await g.json()).sha;
+              const del = await fetch(ghUrl, {
+                method: 'DELETE', headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ message: 'Fusion doublon : ' + src + '.pdf → ' + cible + '.pdf (extension)', sha })
+              });
+              if (del.ok) resume.pdf_supprimes.push(src); else resume.pdf_introuvables.push(src + ' (suppression refusée GitHub ' + del.status + ')');
+            } else resume.pdf_introuvables.push(src);
+          } catch(e) { resume.pdf_introuvables.push(src + ' (' + e.message + ')'); }
+          // 2. Migration des données entrepôt (même mécanique que le dépôt)
+          const srcKey = getKey(src);
+          if (srcKey && srcKey !== cibleKey) {
+            const srcData = await firebaseGet('produits/' + srcKey);
+            if (srcData) {
+              const cibleData = await firebaseGet('produits/' + cibleKey);
+              if (!cibleData) {
+                await firebaseSet('produits/' + cibleKey, srcData);
+                resume.migrations.push(srcKey + ' → ' + cibleKey + ' (fiche entière)');
+              } else {
+                const slots = ['loc']; let i = 2; while (cibleData['loc' + i] !== undefined) { slots.push('loc' + i); i++; }
+                let prochain = cibleData.loc === undefined ? 'loc' : 'loc' + i;
+                const srcSlots = ['loc']; let j = 2; while (srcData['loc' + j] !== undefined) { srcSlots.push('loc' + j); j++; }
+                for (const sl of srcSlots) {
+                  if (!srcData[sl]) continue;
+                  await firebaseSet('produits/' + cibleKey + '/' + prochain, srcData[sl]);
+                  i++; prochain = 'loc' + i;
+                }
+                if (srcData.pieces && !cibleData.pieces) await firebaseSet('produits/' + cibleKey + '/pieces', srcData.pieces);
+                resume.migrations.push(srcKey + ' → ' + cibleKey + ' (emplacements ajoutés)');
+              }
+              await firebaseDelete('produits/' + srcKey);
+            }
+            await firebaseDelete('manuels/' + srcKey).catch?.(() => {});
+            await firebaseDelete('masques/' + srcKey);
+          }
+          // 3. Les associations réf→notice qui visaient la source suivent la cible
+          if (pool) {
+            try {
+              const u = await pool.query('UPDATE notices_override SET notice_file = $1 WHERE notice_file = $2 OR notice_file = $3',
+                [cible + '.pdf', src + '.pdf', src]);
+              resume.assoc_remappees += u.rowCount || 0;
+            } catch(e) {}
+          }
+        }
+        global._ghNoticesCache = null; noticeIndex = { files: null, ts: 0 };
+        console.log('Fusion notices →', cible, '| sources:', sources.join(', '), '| PDF supprimés:', resume.pdf_supprimes.length, '| migrations:', resume.migrations.length);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, ...resume }));
         return;
       }
 
