@@ -940,6 +940,51 @@ out center tags;`;
         return;
       }
 
+      // ── 🧾 Référentiel EAN : ajout de lignes au ean-ref.csv du repo ──
+      if (req.url === '/ean-ajouter') {
+        const GH_TOKEN = process.env.GITHUB_TOKEN || '';
+        const GH_REPO = process.env.GITHUB_REPO || 'Drsly78/flaudis-notices';
+        if (!GH_TOKEN) { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'GITHUB_TOKEN manquant dans les variables Railway' })); return; }
+        const lignes = (Array.isArray(payload.lignes) ? payload.lignes : [])
+          .map(l => ({ ean: String(l.ean || '').replace(/\D/g, ''), ref: String(l.ref || '').trim().toUpperCase().replace(/;/g, ' ') }))
+          .filter(l => /^\d{8,14}$/.test(l.ean) && l.ref);
+        if (!lignes.length) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'aucune ligne valide (EAN numérique + réf requis)' })); return; }
+        const ghUrl = 'https://api.github.com/repos/' + GH_REPO + '/contents/ean-ref.csv';
+        const ghHeaders = { 'Authorization': 'Bearer ' + GH_TOKEN, 'User-Agent': 'flaudis-sav', 'Accept': 'application/vnd.github+json' };
+        const g = await fetch(ghUrl, { headers: ghHeaders });
+        if (!g.ok) { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'GitHub ' + g.status + ' en lecture du CSV' })); return; }
+        const gj = await g.json();
+        let csv = Buffer.from(gj.content || '', 'base64').toString('utf8');
+        // EAN déjà présents → écartés (on ne modifie jamais une ligne existante ici)
+        const existants = new Set(csv.split(/\r?\n/).map(l => (l.split(';')[0] || '').trim()).filter(x => /^\d+$/.test(x)));
+        const ajouts = lignes.filter(l => !existants.has(l.ean));
+        const doublons = lignes.filter(l => existants.has(l.ean)).map(l => l.ean);
+        if (!ajouts.length) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, ajoutes: 0, doublons }));
+          return;
+        }
+        if (!/\n$/.test(csv)) csv += '\n';
+        csv += ajouts.map(l => l.ean + ';' + l.ref).join('\n') + '\n';
+        const put = await fetch(ghUrl, {
+          method: 'PUT', headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message: 'Ajout ' + ajouts.length + ' EAN au référentiel (extension)',
+            content: Buffer.from(csv, 'utf8').toString('base64'), sha: gj.sha
+          })
+        });
+        if (!put.ok) {
+          const t = await put.text();
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'GitHub ' + put.status + ' : ' + t.slice(0, 180) }));
+          return;
+        }
+        console.log('Référentiel EAN —', ajouts.length, 'ligne(s) ajoutée(s)', doublons.length ? '| doublons écartés : ' + doublons.join(',') : '');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, ajoutes: ajouts.length, doublons }));
+        return;
+      }
+
       if (req.url === '/notices-deposer') {
         // Un PDF → repo GitHub flaudis-notices/notices/ + fusion éventuelle avec une réf manuelle
         const GH_TOKEN = process.env.GITHUB_TOKEN || '';
