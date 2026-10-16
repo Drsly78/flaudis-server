@@ -3760,9 +3760,7 @@ Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
               const requests = itsApplied.map(a => ({
                 repeatCell: {
                   range: { sheetId: itsGid, startRowIndex: a.row - 1, endRowIndex: a.row, startColumnIndex: 0, endColumnIndex: 10 },
-                  cell: { userEnteredFormat: { backgroundColor: gesteCo
-                    ? { red: 1, green: 192/255, blue: 0 }          // orange #ffc000 : proposition en attente
-                    : { red: 146/255, green: 208/255, blue: 80/255 } } },
+                  cell: { userEnteredFormat: { backgroundColor: { red: 146/255, green: 208/255, blue: 80/255 } } }, // vert expédié #92d050
                   fields: 'userEnteredFormat.backgroundColor'
                 }
               }));
