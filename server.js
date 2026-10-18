@@ -145,6 +145,95 @@ async function getSheetsToken() {
   return _sheetsToken;
 }
 
+// ── Token Google Drive (sauvegardes) — même compte de service ──
+let _driveToken = null, _driveTokenExpiry = 0;
+async function getDriveToken() {
+  if (_driveToken && Date.now() < _driveTokenExpiry - 60000) return _driveToken;
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT;
+  if (!raw) throw new Error('GOOGLE_SERVICE_ACCOUNT manquant');
+  const sa = JSON.parse(raw);
+  const now = Math.floor(Date.now() / 1000);
+  const header = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString('base64url');
+  const claim = Buffer.from(JSON.stringify({
+    iss: sa.client_email,
+    scope: 'https://www.googleapis.com/auth/drive.file',
+    aud: 'https://oauth2.googleapis.com/token',
+    exp: now + 3600, iat: now
+  })).toString('base64url');
+  const { createSign } = require('crypto');
+  const sign = createSign('RSA-SHA256');
+  sign.update(header + '.' + claim);
+  const jwt = header + '.' + claim + '.' + sign.sign(sa.private_key, 'base64url');
+  const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`
+  });
+  const td = await tokenRes.json();
+  if (!td.access_token) throw new Error('token Drive refusé : ' + JSON.stringify(td).slice(0, 150));
+  _driveToken = td.access_token;
+  _driveTokenExpiry = Date.now() + 3500000;
+  return _driveToken;
+}
+
+// ── 💾 Sauvegarde complète : toutes les tables Postgres + les racines Firebase ──
+async function construireSauvegarde() {
+  const out = { date: new Date().toISOString(), version: '4.0', postgres: {}, firebase: {} };
+  if (pool) {
+    const tl = await pool.query("SELECT tablename FROM pg_tables WHERE schemaname = 'public'");
+    for (const r2 of tl.rows) {
+      try { out.postgres[r2.tablename] = (await pool.query('SELECT * FROM "' + r2.tablename + '"')).rows; }
+      catch(e) { out.postgres[r2.tablename] = { erreur: e.message }; }
+    }
+  }
+  for (const racine of ['produits', 'manuels', 'postit', 'fusion']) {
+    try { out.firebase[racine] = await firebaseGet(racine); } catch(e) { out.firebase[racine] = { erreur: e.message }; }
+  }
+  return out;
+}
+
+// ── Sauvegarde hebdo automatique vers Google Drive (si BACKUP_DRIVE_FOLDER posé) ──
+global._backupEtat = { derniere: null, erreur: null };
+async function sauvegardeAuto() {
+  const dossier = process.env.BACKUP_DRIVE_FOLDER;
+  if (!dossier || !pool) return;
+  try {
+    await pool.query("CREATE TABLE IF NOT EXISTS app_meta (cle TEXT PRIMARY KEY, valeur TEXT)");
+    const r2 = await pool.query("SELECT valeur FROM app_meta WHERE cle = 'backup_dernier'");
+    const dernier = r2.rows.length ? new Date(r2.rows[0].valeur).getTime() : 0;
+    if (Date.now() - dernier < 7 * 24 * 3600 * 1000) { global._backupEtat.derniere = r2.rows[0] && r2.rows[0].valeur; return; }
+    const dump = JSON.stringify(await construireSauvegarde());
+    const token = await getDriveToken();
+    const nom = 'sauvegarde-flaudis-' + new Date().toISOString().slice(0, 10) + '.json';
+    const frontiere = 'frontiere' + Date.now();
+    const corps = '--' + frontiere + '\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n' +
+      JSON.stringify({ name: nom, parents: [dossier] }) +
+      '\r\n--' + frontiere + '\r\nContent-Type: application/json\r\n\r\n' + dump + '\r\n--' + frontiere + '--';
+    const up = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true', {
+      method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'multipart/related; boundary=' + frontiere },
+      body: corps
+    });
+    if (!up.ok) throw new Error('Drive répond ' + up.status + ' : ' + (await up.text()).slice(0, 200));
+    await pool.query("INSERT INTO app_meta (cle, valeur) VALUES ('backup_dernier', $1) ON CONFLICT (cle) DO UPDATE SET valeur = $1", [new Date().toISOString()]);
+    global._backupEtat = { derniere: new Date().toISOString(), erreur: null };
+    console.log('💾 Sauvegarde hebdo déposée sur le Drive :', nom, '(' + Math.round(dump.length / 1024) + ' ko)');
+    // Rotation : on garde les 8 plus récentes
+    try {
+      const q = encodeURIComponent("'" + dossier + "' in parents and name contains 'sauvegarde-flaudis-' and trashed = false");
+      const li = await fetch('https://www.googleapis.com/drive/v3/files?q=' + q + '&orderBy=createdTime desc&fields=files(id,name)&pageSize=50&supportsAllDrives=true&includeItemsFromAllDrives=true',
+        { headers: { Authorization: 'Bearer ' + token } }).then(r3 => r3.json());
+      for (const f of (li.files || []).slice(8)) {
+        await fetch('https://www.googleapis.com/drive/v3/files/' + f.id + '?supportsAllDrives=true', { method: 'DELETE', headers: { Authorization: 'Bearer ' + token } });
+        console.log('💾 Ancienne sauvegarde supprimée :', f.name);
+      }
+    } catch(e) { console.warn('Rotation sauvegardes :', e.message); }
+  } catch(e) {
+    global._backupEtat.erreur = e.message;
+    console.error('💾 Sauvegarde auto en échec :', e.message);
+  }
+}
+setInterval(sauvegardeAuto, 3600 * 1000);
+setTimeout(sauvegardeAuto, 90 * 1000); // premier essai 90 s après le démarrage
+
 // ── Firebase REST ─────────────────────────────────────────
 // La base est verrouillée (règles auth) : le serveur se connecte avec le compte SAV
 let _fbTok = null, _fbTokExp = 0;
@@ -450,7 +539,7 @@ const server = http.createServer(async function(req, res) {
   // Exception lecture navigateur : le diagnostic du référentiel ITS
   // accepte la clé en paramètre d'URL (?key=…)
   const urlKey = (req.url.match(/[?&]key=([^&]+)/) || [])[1];
-  if ((req.url.startsWith('/ref-its-structure') || req.url.startsWith('/magasins-u-crawl') || req.url.startsWith('/magasins-u-status') || req.url.startsWith('/magasins-u-test') || req.url.startsWith('/notices-manuelles') || req.url.startsWith('/demande-info-liste') || req.url.startsWith('/demande-info-get') || req.url.startsWith('/notices-fichiers') || req.url.startsWith('/notices-doublons') || req.url.startsWith('/notice-pdf') || req.url.startsWith('/livraisons-diag')) && urlKey === APP_SECRET) {
+  if ((req.url.startsWith('/ref-its-structure') || req.url.startsWith('/magasins-u-crawl') || req.url.startsWith('/magasins-u-status') || req.url.startsWith('/magasins-u-test') || req.url.startsWith('/notices-manuelles') || req.url.startsWith('/demande-info-liste') || req.url.startsWith('/demande-info-get') || req.url.startsWith('/notices-fichiers') || req.url.startsWith('/notices-doublons') || req.url.startsWith('/notice-pdf') || req.url.startsWith('/backup') || req.url.startsWith('/livraisons-diag')) && urlKey === APP_SECRET) {
     // accès autorisé
   } else if (req.headers['x-app-secret'] !== APP_SECRET) {
     res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
@@ -632,6 +721,37 @@ const server = http.createServer(async function(req, res) {
 
       // ── INFOS PRODUIT ENTREPÔT (Firebase) ────────────────
       // ── 🧰 La réf est-elle rangée dans un BOX de l'app notices ? ──
+      // ── 💾 Sauvegardes : infos de config, et téléchargement complet en un JSON ──
+      if (req.url.startsWith('/backup-info')) {
+        let email = null;
+        try { email = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT || '{}').client_email || null; } catch(e) {}
+        let dernier = null;
+        if (pool) {
+          try {
+            await pool.query("CREATE TABLE IF NOT EXISTS app_meta (cle TEXT PRIMARY KEY, valeur TEXT)");
+            const r2 = await pool.query("SELECT valeur FROM app_meta WHERE cle = 'backup_dernier'");
+            if (r2.rows.length) dernier = r2.rows[0].valeur;
+          } catch(e) {}
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true,
+          email_compte_service: email,
+          dossier_drive_configure: !!process.env.BACKUP_DRIVE_FOLDER,
+          derniere_sauvegarde_auto: dernier,
+          derniere_erreur: (global._backupEtat || {}).erreur || null,
+          mode_demploi: 'Partage un dossier Drive en Éditeur avec email_compte_service, puis mets son ID dans la variable Railway BACKUP_DRIVE_FOLDER.' }));
+        return;
+      }
+      if (req.url.startsWith('/backup')) {
+        const dump = JSON.stringify(await construireSauvegarde(), null, 1);
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Content-Disposition': 'attachment; filename="sauvegarde-flaudis-' + new Date().toISOString().slice(0, 10) + '.json"'
+        });
+        res.end(dump);
+        return;
+      }
+
       // ── ⬆️ Version de l'extension : chaque poste s'annonce, le serveur retient la plus haute ──
       if (req.url === '/version-ping') {
         const v = String(payload.version || '').trim();
