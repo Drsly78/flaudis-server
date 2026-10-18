@@ -632,6 +632,29 @@ const server = http.createServer(async function(req, res) {
 
       // ── INFOS PRODUIT ENTREPÔT (Firebase) ────────────────
       // ── 🧰 La réf est-elle rangée dans un BOX de l'app notices ? ──
+      // ── ⬆️ Version de l'extension : chaque poste s'annonce, le serveur retient la plus haute ──
+      if (req.url === '/version-ping') {
+        const v = String(payload.version || '').trim();
+        const valide = /^\d+\.\d+\.\d+$/.test(v);
+        const num = x => String(x || '0').split('.').map(n2 => parseInt(n2) || 0);
+        const plusRecent = (a, b) => { const A = num(a), B = num(b); for (let i2 = 0; i2 < 3; i2++) { if ((A[i2] || 0) > (B[i2] || 0)) return true; if ((A[i2] || 0) < (B[i2] || 0)) return false; } return false; };
+        let derniere = valide ? v : '0.0.0';
+        if (pool) {
+          try {
+            await pool.query("CREATE TABLE IF NOT EXISTS app_meta (cle TEXT PRIMARY KEY, valeur TEXT)");
+            const r2 = await pool.query("SELECT valeur FROM app_meta WHERE cle = 'ext_version'");
+            const cur = r2.rows.length ? r2.rows[0].valeur : null;
+            if (valide && (!cur || plusRecent(v, cur))) {
+              await pool.query("INSERT INTO app_meta (cle, valeur) VALUES ('ext_version', $1) ON CONFLICT (cle) DO UPDATE SET valeur = $1", [v]);
+              derniere = v;
+            } else derniere = cur || derniere;
+          } catch(e) {}
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, derniere }));
+        return;
+      }
+
       if (req.url === '/box-lookup') {
         const nrmBx = v => String(v || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
         const refN = nrmBx(payload.ref);
