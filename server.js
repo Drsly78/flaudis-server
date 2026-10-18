@@ -4054,9 +4054,21 @@ Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
             lastMsg.content = [...noticeContent, ...orig];
             noticeInfo = { attached: true, ref: foundRef, pages: images.length };
             console.log('Notice attachée:', foundRef, '—', images.length, 'pages');
+          } else if (pdfBuffer.length <= 9 * 1024 * 1024) {
+            // Secours : conversion en images échouée → le PDF part TEL QUEL,
+            // l'API sait lire les PDF nativement (même mécanique que le module TRM).
+            const noticeContent = [
+              { type: 'text', text: 'Notice technique du produit ' + foundRef + ' (document PDF joint ci-après) :' },
+              { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdfBuffer.toString('base64') } }
+            ];
+            const lastMsg = payload.messages[payload.messages.length - 1];
+            const orig = Array.isArray(lastMsg.content) ? lastMsg.content : [{ type: 'text', text: lastMsg.content }];
+            lastMsg.content = [...noticeContent, ...orig];
+            noticeInfo = { attached: true, ref: foundRef, pages: 0, pdf_direct: true };
+            console.log('Notice attachée en PDF direct (conversion image échouée):', foundRef);
           } else {
-            noticeInfo = { attached: false, reason: 'conversion PDF echouee', ref: foundRef };
-            console.log('Notice trouvée mais conversion ÉCHOUÉE:', foundRef);
+            noticeInfo = { attached: false, reason: 'conversion PDF echouee et PDF trop lourd pour l\u2019envoi direct (' + Math.round(pdfBuffer.length / 1024 / 1024) + ' Mo)', ref: foundRef };
+            console.log('Notice trouvée mais conversion ÉCHOUÉE et PDF trop lourd:', foundRef);
           }
         }
         } // fin else kbHit (chemin lecture complète)
