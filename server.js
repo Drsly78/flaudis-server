@@ -216,6 +216,7 @@ function fetchGithubJSON(url) {
     const headers = { 'User-Agent': 'flaudis-server', 'Accept': 'application/vnd.github+json' };
     if (process.env.GITHUB_TOKEN) headers['Authorization'] = 'Bearer ' + process.env.GITHUB_TOKEN;
     https.get(url, { headers }, res => {
+      global._ghStatus = res.statusCode;
       if (res.statusCode !== 200) { resolve(null); return; }
       const chunks = [];
       res.on('data', c => chunks.push(c));
@@ -867,8 +868,10 @@ out center tags;`;
 
       if (req.url.startsWith('/notices-fichiers')) {
         const list = await listNoticesGithub();
+        const okL = Array.isArray(list);
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, files: Array.isArray(list) ? list.filter(f => /\.pdf$/i.test(f.name || '')).map(f => f.name) : [] }));
+        res.end(JSON.stringify({ ok: true, files: okL ? list.filter(f => /\.pdf$/i.test(f.name || '')).map(f => f.name) : [],
+          gh_error: okL ? null : (!process.env.GITHUB_TOKEN ? 'GITHUB_TOKEN absent sur Railway' : 'GitHub repond ' + (global._ghStatus || '?') + ' (token expire/invalide ?)') }));
         return;
       }
 
@@ -1018,8 +1021,15 @@ out center tags;`;
       if (req.url.startsWith('/notices-doublons') || req.url.startsWith('/notice-pdf')) {
         const list = await listNoticesGithub();
         if (!Array.isArray(list)) {
+          const tok = !!process.env.GITHUB_TOKEN;
+          const st = global._ghStatus;
+          const diag = !tok ? "la variable GITHUB_TOKEN est ABSENTE sur Railway : cree un token fine-grained (repo flaudis-notices, Contents en lecture/ecriture) et ajoute-le dans Variables"
+            : st === 401 ? "GitHub repond 401 : le GITHUB_TOKEN de Railway est invalide ou EXPIRE, regenere-le et remplace la variable"
+            : st === 403 ? "GitHub repond 403 : token sans acces au repo flaudis-notices (ou rate-limit), verifie ses permissions"
+            : st === 404 ? "GitHub repond 404 : le token ne voit pas le repo flaudis-notices, verifie qu'il est bien rattache a ce repo"
+            : "GitHub repond " + (st || '?') + ", reessaie dans une minute";
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: 'Listing GitHub indisponible (GITHUB_TOKEN manquant ou rate-limit)' }));
+          res.end(JSON.stringify({ ok: false, error: 'Listing GitHub indisponible : ' + diag }));
           return;
         }
         const pdfs = list.filter(f => /\.pdf$/i.test(f.name || ''));
