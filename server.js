@@ -214,7 +214,7 @@ let noticeIndex = { files: null, ts: 0 };
 function fetchGithubJSON(url) {
   return new Promise((resolve) => {
     const headers = { 'User-Agent': 'flaudis-server', 'Accept': 'application/vnd.github+json' };
-    if (process.env.GITHUB_TOKEN) headers['Authorization'] = 'Bearer ' + process.env.GITHUB_TOKEN;
+    if ((process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.GITHUB_PAT)) headers['Authorization'] = 'Bearer ' + (process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.GITHUB_PAT);
     https.get(url, { headers }, res => {
       global._ghStatus = res.statusCode;
       if (res.statusCode !== 200) { resolve(null); return; }
@@ -871,7 +871,7 @@ out center tags;`;
         const okL = Array.isArray(list);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, files: okL ? list.filter(f => /\.pdf$/i.test(f.name || '')).map(f => f.name) : [],
-          gh_error: okL ? null : (!process.env.GITHUB_TOKEN ? 'GITHUB_TOKEN absent sur Railway' : 'GitHub repond ' + (global._ghStatus || '?') + ' (token expire/invalide ?)') }));
+          gh_error: okL ? null : (!(process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.GITHUB_PAT) ? 'GITHUB_TOKEN absent sur Railway — variables approchantes vues par le serveur : [' + Object.keys(process.env).filter(k => /git|token|_pat$/i.test(k)).join(', ') + ']' : 'GitHub repond ' + (global._ghStatus || '?') + ' (token expire/invalide ?)') }));
         return;
       }
 
@@ -947,7 +947,7 @@ out center tags;`;
 
       // ── 🧾 Référentiel EAN : ajout de lignes au ean-ref.csv du repo ──
       if (req.url === '/ean-ajouter') {
-        const GH_TOKEN = process.env.GITHUB_TOKEN || '';
+        const GH_TOKEN = (process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.GITHUB_PAT) || '';
         const GH_REPO = process.env.GITHUB_REPO || 'Drsly78/flaudis-notices';
         if (!GH_TOKEN) { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'GITHUB_TOKEN manquant dans les variables Railway' })); return; }
         const champ = v => String(v || '').trim().replace(/;/g, ' ').replace(/[\r\n]+/g, ' ');
@@ -1021,9 +1021,9 @@ out center tags;`;
       if (req.url.startsWith('/notices-doublons') || req.url.startsWith('/notice-pdf')) {
         const list = await listNoticesGithub();
         if (!Array.isArray(list)) {
-          const tok = !!process.env.GITHUB_TOKEN;
+          const tok = !!(process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.GITHUB_PAT);
           const st = global._ghStatus;
-          const diag = !tok ? "la variable GITHUB_TOKEN est ABSENTE sur Railway : cree un token fine-grained (repo flaudis-notices, Contents en lecture/ecriture) et ajoute-le dans Variables"
+          const diag = !tok ? "la variable GITHUB_TOKEN est ABSENTE sur Railway (noms acceptes : GITHUB_TOKEN, GH_TOKEN, GITHUB_PAT) — variables approchantes vues : [" + Object.keys(process.env).filter(k => /git|token|_pat$/i.test(k)).join(', ') + "]"
             : st === 401 ? "GitHub repond 401 : le GITHUB_TOKEN de Railway est invalide ou EXPIRE, regenere-le et remplace la variable"
             : st === 403 ? "GitHub repond 403 : token sans acces au repo flaudis-notices (ou rate-limit), verifie ses permissions"
             : st === 404 ? "GitHub repond 404 : le token ne voit pas le repo flaudis-notices, verifie qu'il est bien rattache a ce repo"
@@ -1099,7 +1099,7 @@ out center tags;`;
       // ── 🔀 Fusion de notices en doublon : on garde la cible, les sources
       //    sont supprimées du repo, leurs données entrepôt migrent vers la cible ──
       if (req.url === '/notices-fusionner') {
-        const GH_TOKEN = process.env.GITHUB_TOKEN || '';
+        const GH_TOKEN = (process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.GITHUB_PAT) || '';
         const GH_REPO = process.env.GITHUB_REPO || 'Drsly78/flaudis-notices';
         if (!GH_TOKEN) { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'GITHUB_TOKEN manquant dans les variables Railway' })); return; }
         const nettoie = v => String(v || '').trim().replace(/\.pdf$/i, '');
@@ -1168,7 +1168,7 @@ out center tags;`;
 
       if (req.url === '/notices-deposer') {
         // Un PDF → repo GitHub flaudis-notices/notices/ + fusion éventuelle avec une réf manuelle
-        const GH_TOKEN = process.env.GITHUB_TOKEN || '';
+        const GH_TOKEN = (process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.GITHUB_PAT) || '';
         const GH_REPO = process.env.GITHUB_REPO || 'Drsly78/flaudis-notices';
         if (!GH_TOKEN) { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'GITHUB_TOKEN manquant dans les variables Railway' })); return; }
         const ref = String(payload.ref || '').trim();
