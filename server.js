@@ -842,21 +842,22 @@ out center tags;`;
           id SERIAL PRIMARY KEY, cnb TEXT, ref TEXT, magasin TEXT, ville TEXT,
           demande TEXT, revers_url TEXT, statut TEXT DEFAULT 'ouverte',
           cree TIMESTAMPTZ DEFAULT now(), maj TIMESTAMPTZ DEFAULT now())`).catch(() => {});
-        if (pool) for (const col of ['ean', 'qte', 'fla', 'dossier']) await pool.query('ALTER TABLE demandes_info ADD COLUMN IF NOT EXISTS ' + col + ' TEXT').catch(() => {});
+        if (pool) for (const col of ['ean', 'qte', 'fla', 'dossier', 'type']) await pool.query('ALTER TABLE demandes_info ADD COLUMN IF NOT EXISTS ' + col + ' TEXT').catch(() => {});
         const cnb = String(payload.cnb || '').trim().toUpperCase();
         const demande = String(payload.demande || '').trim();
+        const typeD = payload.type === 'refus' ? 'refus' : 'info';
         if (!cnb || !demande) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'cnb et demande requis' })); return; }
         let mode = 'cree';
         const dossierJson = (() => { try { const s2 = JSON.stringify(payload.dossier || null); return s2 && s2 !== 'null' && s2.length <= 80000 ? s2 : null; } catch(e) { return null; } })();
         if (pool) {
-          const ex = await pool.query("SELECT id FROM demandes_info WHERE cnb = $1 AND statut = 'ouverte' LIMIT 1", [cnb]);
+          const ex = await pool.query("SELECT id FROM demandes_info WHERE cnb = $1 AND statut = 'ouverte' AND COALESCE(type, 'info') = $2 LIMIT 1", [cnb, typeD]);
           if (ex.rows.length) {
             await pool.query("UPDATE demandes_info SET demande = $1, ref = $2, magasin = $3, ville = $4, ean = $5, qte = $6, fla = $7, dossier = COALESCE($8, dossier), revers_url = COALESCE($9, revers_url), maj = now() WHERE id = $10",
               [demande, payload.ref || '', payload.magasin || '', payload.ville || '', payload.ean || '', payload.qte || '', payload.fla || '', dossierJson, payload.revers_url || null, ex.rows[0].id]);
             mode = 'mis à jour';
           } else {
-            await pool.query("INSERT INTO demandes_info (cnb, ref, magasin, ville, ean, qte, fla, demande, revers_url, dossier) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
-              [cnb, payload.ref || '', payload.magasin || '', payload.ville || '', payload.ean || '', payload.qte || '', payload.fla || '', demande, payload.revers_url || null, dossierJson]);
+            await pool.query("INSERT INTO demandes_info (cnb, ref, magasin, ville, ean, qte, fla, demande, revers_url, dossier, type) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+              [cnb, payload.ref || '', payload.magasin || '', payload.ville || '', payload.ean || '', payload.qte || '', payload.fla || '', demande, payload.revers_url || null, dossierJson, typeD]);
           }
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -878,8 +879,9 @@ out center tags;`;
             id SERIAL PRIMARY KEY, cnb TEXT, ref TEXT, magasin TEXT, ville TEXT,
             demande TEXT, revers_url TEXT, statut TEXT DEFAULT 'ouverte',
             cree TIMESTAMPTZ DEFAULT now(), maj TIMESTAMPTZ DEFAULT now())`).catch(() => {});
-          for (const col of ['ean', 'qte', 'fla', 'dossier']) await pool.query('ALTER TABLE demandes_info ADD COLUMN IF NOT EXISTS ' + col + ' TEXT').catch(() => {});
-          const r2 = await pool.query("SELECT id, cnb, ref, magasin, ville, ean, qte, fla, demande, revers_url, dossier, to_char(cree, 'DD/MM/YYYY') AS date FROM demandes_info WHERE statut = 'ouverte' ORDER BY cree DESC LIMIT 200").catch(() => null);
+          for (const col of ['ean', 'qte', 'fla', 'dossier', 'type']) await pool.query('ALTER TABLE demandes_info ADD COLUMN IF NOT EXISTS ' + col + ' TEXT').catch(() => {});
+          const typeL = /[?&]type=refus/.test(req.url) ? 'refus' : 'info';
+          const r2 = await pool.query("SELECT id, cnb, ref, magasin, ville, ean, qte, fla, demande, revers_url, dossier, to_char(cree, 'DD/MM/YYYY') AS date FROM demandes_info WHERE statut = 'ouverte' AND COALESCE(type, 'info') = $1 ORDER BY cree DESC LIMIT 200", [typeL]).catch(() => null);
           if (r2) items = r2.rows;
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -892,7 +894,7 @@ out center tags;`;
         const cnb = String(u.searchParams.get('cnb') || '').trim().toUpperCase();
         let item = null;
         if (pool && cnb) {
-          const r2 = await pool.query("SELECT id, cnb, demande, revers_url, to_char(cree, 'DD/MM/YYYY') AS date FROM demandes_info WHERE cnb = $1 AND statut = 'ouverte' LIMIT 1", [cnb]).catch(() => null);
+          const r2 = await pool.query("SELECT id, cnb, demande, revers_url, to_char(cree, 'DD/MM/YYYY') AS date FROM demandes_info WHERE cnb = $1 AND statut = 'ouverte' AND COALESCE(type, 'info') = 'info' LIMIT 1", [cnb]).catch(() => null);
           if (r2 && r2.rows.length) item = r2.rows[0];
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -904,7 +906,7 @@ out center tags;`;
         // Clôture automatique : le dossier est parti en Envoyer pièce / Rembourser
         const cnb = String(payload.cnb || '').trim().toUpperCase();
         if (pool && cnb) {
-          const r2 = await pool.query("UPDATE demandes_info SET statut = 'traitee', maj = now() WHERE cnb = $1 AND statut = 'ouverte'", [cnb]).catch(() => null);
+          const r2 = await pool.query("UPDATE demandes_info SET statut = 'traitee', maj = now() WHERE cnb = $1 AND statut = 'ouverte' AND COALESCE(type, 'info') = 'info'", [cnb]).catch(() => null);
           if (r2 && r2.rowCount) console.log('Demande info soldée par export :', cnb);
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
