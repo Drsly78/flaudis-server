@@ -631,6 +631,72 @@ const server = http.createServer(async function(req, res) {
       }
 
       // ── INFOS PRODUIT ENTREPÔT (Firebase) ────────────────
+      // ── 🧰 La réf est-elle rangée dans un BOX de l'app notices ? ──
+      if (req.url === '/box-lookup') {
+        const nrmBx = v => String(v || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+        const refN = nrmBx(payload.ref);
+        let hits = [];
+        if (refN) {
+          const [allProduits, legacy] = await Promise.all([firebaseGet('produits'), firebaseGet('manuels')]);
+          const boxes = {};
+          Object.keys(legacy || {}).forEach(k => { const v = legacy[k]; if (v && v.box) boxes[k] = { ...v, _fiche: (allProduits || {})[k] }; });
+          Object.keys(allProduits || {}).forEach(k => {
+            const m = allProduits[k] && allProduits[k].manuel;
+            if (m && m.box) boxes[k] = { ...(boxes[k] || {}), ...m, items: { ...((boxes[k] || {}).items || {}), ...(m.items || {}) }, _fiche: allProduits[k] };
+          });
+          const locsDe = data2 => {
+            const out = []; let i2 = 0;
+            while (true) {
+              const lk = i2 === 0 ? 'loc' : 'loc' + (i2 + 1);
+              const loc = (data2 || {})[lk];
+              if (!loc && i2 > 0) break;
+              if (loc && loc.allee) {
+                let lab = '';
+                if (loc.allee === 'HAM') lab = 'HAM · Conteneur ' + (loc.conteneur != null ? loc.conteneur : '?');
+                else if (loc.allee === 'AREA') lab = 'Zone AREA';
+                else if (loc.cote === 'SOL') lab = 'Allée ' + loc.allee + ' SOL';
+                else { lab = 'Allée ' + loc.allee; if (loc.cote) lab += ' ' + loc.cote; if (loc.rack != null) lab += ' R' + loc.rack; if (loc.hauteur != null) lab += ' H' + loc.hauteur; }
+                out.push(lab);
+              }
+              i2++; if (i2 > 10) break;
+            }
+            return out;
+          };
+          Object.keys(boxes).forEach(k => {
+            const b = boxes[k];
+            Object.values(b.items || {}).forEach(it => {
+              if (nrmBx(it.ref) === refN) hits.push({
+                box: b.ref || k, qte: parseInt(it.qte) || 0, note: it.note || '',
+                emplacement: locsDe(b._fiche).join(' / ')
+              });
+            });
+          });
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, hits }));
+        return;
+      }
+
+      // ── 🩺 Santé du système : chaque dépendance testée pour de vrai ──
+      if (req.url === '/sante') {
+        const out = { version: '4.0', db: false, firebase: false, sheet: false, github: false, anthropic_cle: !!process.env.ANTHROPIC_API_KEY, details: {} };
+        if (pool) { try { await pool.query('SELECT 1'); out.db = true; } catch(e) { out.details.db = e.message; } }
+        else out.details.db = 'pool non initialisé (DATABASE_URL ?)';
+        try { const t = await firebaseGet('postit/legende'); out.firebase = true; } catch(e) { out.details.firebase = e.message; }
+        try {
+          const token = await getSheetsToken();
+          const q = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'SYSTEME U'!A1")}`,
+            { headers: { Authorization: 'Bearer ' + token } });
+          if (q.ok) out.sheet = true; else out.details.sheet = 'Sheets répond ' + q.status;
+        } catch(e) { out.details.sheet = e.message; }
+        const list = await listNoticesGithub();
+        if (Array.isArray(list)) { out.github = true; out.details.github = list.length + ' fichiers'; }
+        else out.details.github = !(process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.GITHUB_PAT) ? 'GITHUB_TOKEN absent' : 'GitHub répond ' + (global._ghStatus || '?');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(out));
+        return;
+      }
+
       if (req.url === '/get-produit-info') {
         const { ref } = payload;
         if (!ref) { res.writeHead(200); res.end(JSON.stringify({ found: false })); return; }
