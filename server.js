@@ -881,7 +881,7 @@ out center tags;`;
             cree TIMESTAMPTZ DEFAULT now(), maj TIMESTAMPTZ DEFAULT now())`).catch(() => {});
           for (const col of ['ean', 'qte', 'fla', 'dossier', 'type']) await pool.query('ALTER TABLE demandes_info ADD COLUMN IF NOT EXISTS ' + col + ' TEXT').catch(() => {});
           const typeL = /[?&]type=refus/.test(req.url) ? 'refus' : 'info';
-          const r2 = await pool.query("SELECT id, cnb, ref, magasin, ville, ean, qte, fla, demande, revers_url, dossier, to_char(cree, 'DD/MM/YYYY') AS date FROM demandes_info WHERE statut = 'ouverte' AND COALESCE(type, 'info') = $1 ORDER BY cree DESC LIMIT 200", [typeL]).catch(() => null);
+          const r2 = await pool.query("SELECT id, cnb, ref, magasin, ville, ean, qte, fla, demande, revers_url, dossier, COALESCE(type, 'info') AS type, to_char(cree, 'DD/MM/YYYY') AS date FROM demandes_info WHERE statut = 'ouverte' AND COALESCE(type, 'info') = $1 ORDER BY cree DESC LIMIT 200", [typeL]).catch(() => null);
           if (r2) items = r2.rows;
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
