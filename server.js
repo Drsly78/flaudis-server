@@ -156,7 +156,7 @@ async function getDriveToken() {
   const header = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString('base64url');
   const claim = Buffer.from(JSON.stringify({
     iss: sa.client_email,
-    scope: 'https://www.googleapis.com/auth/drive.file',
+    scope: 'https://www.googleapis.com/auth/drive',
     aud: 'https://oauth2.googleapis.com/token',
     exp: now + 3600, iat: now
   })).toString('base64url');
@@ -203,29 +203,22 @@ async function sauvegardeAuto() {
     if (Date.now() - dernier < 7 * 24 * 3600 * 1000) { global._backupEtat.derniere = r2.rows[0] && r2.rows[0].valeur; return; }
     const dump = JSON.stringify(await construireSauvegarde());
     const token = await getDriveToken();
-    const nom = 'sauvegarde-flaudis-' + new Date().toISOString().slice(0, 10) + '.json';
-    const frontiere = 'frontiere' + Date.now();
-    const corps = '--' + frontiere + '\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n' +
-      JSON.stringify({ name: nom, parents: [dossier] }) +
-      '\r\n--' + frontiere + '\r\nContent-Type: application/json\r\n\r\n' + dump + '\r\n--' + frontiere + '--';
-    const up = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true', {
-      method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'multipart/related; boundary=' + frontiere },
-      body: corps
+    // Les comptes de service n'ont plus de quota : on met à jour le fichier
+    // sauvegarde-flaudis.json déposé par Sylvain dans le dossier (les anciennes
+    // versions restent dans l'historique de versions Drive du fichier).
+    const q = encodeURIComponent("'" + dossier + "' in parents and name = 'sauvegarde-flaudis.json' and trashed = false");
+    const li = await fetch('https://www.googleapis.com/drive/v3/files?q=' + q + '&fields=files(id,name)&pageSize=5&supportsAllDrives=true&includeItemsFromAllDrives=true',
+      { headers: { Authorization: 'Bearer ' + token } }).then(r3 => r3.json());
+    const cible = (li.files || [])[0];
+    if (!cible) throw new Error("fichier sauvegarde-flaudis.json introuvable dans le dossier Drive — dépose-le une fois (fichier vide), le serveur écrit dedans ensuite");
+    const up = await fetch('https://www.googleapis.com/upload/drive/v3/files/' + cible.id + '?uploadType=media&keepRevisionForever=true&supportsAllDrives=true', {
+      method: 'PATCH', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: dump
     });
     if (!up.ok) throw new Error('Drive répond ' + up.status + ' : ' + (await up.text()).slice(0, 200));
     await pool.query("INSERT INTO app_meta (cle, valeur) VALUES ('backup_dernier', $1) ON CONFLICT (cle) DO UPDATE SET valeur = $1", [new Date().toISOString()]);
     global._backupEtat = { derniere: new Date().toISOString(), erreur: null };
-    console.log('💾 Sauvegarde hebdo déposée sur le Drive :', nom, '(' + Math.round(dump.length / 1024) + ' ko)');
-    // Rotation : on garde les 8 plus récentes
-    try {
-      const q = encodeURIComponent("'" + dossier + "' in parents and name contains 'sauvegarde-flaudis-' and trashed = false");
-      const li = await fetch('https://www.googleapis.com/drive/v3/files?q=' + q + '&orderBy=createdTime desc&fields=files(id,name)&pageSize=50&supportsAllDrives=true&includeItemsFromAllDrives=true',
-        { headers: { Authorization: 'Bearer ' + token } }).then(r3 => r3.json());
-      for (const f of (li.files || []).slice(8)) {
-        await fetch('https://www.googleapis.com/drive/v3/files/' + f.id + '?supportsAllDrives=true', { method: 'DELETE', headers: { Authorization: 'Bearer ' + token } });
-        console.log('💾 Ancienne sauvegarde supprimée :', f.name);
-      }
-    } catch(e) { console.warn('Rotation sauvegardes :', e.message); }
+    console.log('💾 Sauvegarde hebdo écrite dans le Drive (' + Math.round(dump.length / 1024) + ' ko) — historique dans les versions du fichier');
   } catch(e) {
     global._backupEtat.erreur = e.message;
     console.error('💾 Sauvegarde auto en échec :', e.message);
@@ -739,7 +732,7 @@ const server = http.createServer(async function(req, res) {
           dossier_drive_configure: !!process.env.BACKUP_DRIVE_FOLDER,
           derniere_sauvegarde_auto: dernier,
           derniere_erreur: (global._backupEtat || {}).erreur || null,
-          mode_demploi: 'Partage un dossier Drive en Éditeur avec email_compte_service, puis mets son ID dans la variable Railway BACKUP_DRIVE_FOLDER.' }));
+          mode_demploi: 'Dossier Drive partagé en Éditeur avec email_compte_service + variable BACKUP_DRIVE_FOLDER + un fichier sauvegarde-flaudis.json déposé dans le dossier (le serveur écrit dedans, les versions précédentes restent dans l\u2019historique de versions Drive).' }));
         return;
       }
       if (req.url.startsWith('/backup')) {
