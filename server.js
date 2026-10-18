@@ -219,6 +219,17 @@ async function sauvegardeAuto() {
     await pool.query("INSERT INTO app_meta (cle, valeur) VALUES ('backup_dernier', $1) ON CONFLICT (cle) DO UPDATE SET valeur = $1", [new Date().toISOString()]);
     global._backupEtat = { derniere: new Date().toISOString(), erreur: null };
     console.log('💾 Sauvegarde hebdo écrite dans le Drive (' + Math.round(dump.length / 1024) + ' ko) — historique dans les versions du fichier');
+    // Purge automatique : on garde les 12 dernières versions (~3 mois), le reste saute
+    try {
+      const rv = await fetch('https://www.googleapis.com/drive/v3/files/' + cible.id + '/revisions?fields=revisions(id,modifiedTime)&pageSize=200',
+        { headers: { Authorization: 'Bearer ' + token } }).then(r3 => r3.json());
+      const revs = (rv.revisions || []).sort((a, b) => String(b.modifiedTime).localeCompare(String(a.modifiedTime)));
+      for (const r4 of revs.slice(12)) {
+        await fetch('https://www.googleapis.com/drive/v3/files/' + cible.id + '/revisions/' + r4.id, {
+          method: 'DELETE', headers: { Authorization: 'Bearer ' + token } });
+      }
+      if (revs.length > 12) console.log('💾 Purge versions :', revs.length - 12, 'ancienne(s) supprimée(s), 12 conservées');
+    } catch(e) { console.warn('Purge versions sauvegarde :', e.message); }
   } catch(e) {
     global._backupEtat.erreur = e.message;
     console.error('💾 Sauvegarde auto en échec :', e.message);
