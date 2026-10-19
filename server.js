@@ -1207,6 +1207,49 @@ out center tags;`;
         return;
       }
 
+      // ── 💬 Tchat des GESTES CO : état stocké par dossier (CNB/FLA), le Sheet n'est pas touché ──
+      if (req.url === '/geste-tchat' || req.url === '/geste-tchat-get' || req.url === '/geste-tchat-liste') {
+        if (!pool) { res.writeHead(500); res.end(JSON.stringify({ error: 'pas de base de données' })); return; }
+        await pool.query("CREATE TABLE IF NOT EXISTS gestes_tchat (cle TEXT PRIMARY KEY, cnb TEXT, fla TEXT, tchat TEXT, maj TIMESTAMPTZ DEFAULT now())").catch(() => {});
+        const cnbG = String(payload.cnb || '').trim().toUpperCase();
+        const flaG2 = String(payload.fla || '').trim();
+        if (req.url === '/geste-tchat') {
+          const cleG = cnbG || (flaG2 ? 'FLA:' + flaG2 : '');
+          if (!cleG) { res.writeHead(400); res.end(JSON.stringify({ error: 'cnb ou fla requis' })); return; }
+          const vG = String(payload.tchat) === '2' ? '2' : (payload.tchat ? '1' : '');
+          await pool.query("INSERT INTO gestes_tchat (cle, cnb, fla, tchat) VALUES ($1,$2,$3,$4) ON CONFLICT (cle) DO UPDATE SET tchat = $4, fla = CASE WHEN $3 <> '' THEN $3 ELSE gestes_tchat.fla END, maj = now()", [cleG, cnbG, flaG2, vG]);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+          return;
+        }
+        if (req.url === '/geste-tchat-get') {
+          let itemG = null;
+          try {
+            const r2 = await pool.query("SELECT cnb, fla, tchat FROM gestes_tchat WHERE ($1 <> '' AND cnb = $1) OR ($2 <> '' AND fla = $2) LIMIT 1", [cnbG, flaG2]);
+            if (r2.rows.length) itemG = r2.rows[0];
+          } catch(e) {}
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, tchat: itemG ? itemG.tchat : '' }));
+          return;
+        }
+        // liste : tous les gestes co à pastille, avec l'URL Revers.io connue des dossiers scannés
+        let itemsG = [];
+        try {
+          const r2 = await pool.query("SELECT cnb, fla, tchat FROM gestes_tchat WHERE tchat IN ('1','2')");
+          itemsG = r2.rows;
+          const cnbsG = itemsG.map(x => x.cnb).filter(Boolean);
+          if (cnbsG.length) {
+            const uq = await pool.query('SELECT numero_dossier, revers_url FROM dossiers WHERE numero_dossier = ANY($1) AND revers_url IS NOT NULL', [cnbsG]);
+            const uMapG = {};
+            uq.rows.forEach(r3 => { uMapG[r3.numero_dossier] = r3.revers_url; });
+            itemsG.forEach(x => { x.revers_url = uMapG[x.cnb] || null; });
+          }
+        } catch(e) {}
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, items: itemsG }));
+        return;
+      }
+
       // ── 💬 Bascule « échange en cours avec le magasin » depuis la liste En attente ──
       if (req.url === '/demande-info-tchat') {
         const idT = parseInt(payload.id);
