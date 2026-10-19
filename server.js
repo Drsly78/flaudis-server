@@ -1158,38 +1158,66 @@ out center tags;`;
         return;
       }
 
-      // ── 🧾 Référentiel EAN : ajout de lignes au ean-ref.csv du repo ──
+      // ── 🧾 Référentiel EAN : ajout ET enrichissement du ean-ref.csv (clé = EAN) ──
+      //    Format fichier : EAN;REF;STATUT;PRIX;QTE_VENDUE — un champ entrant vide
+      //    ne touche jamais la valeur existante ; un champ rempli la remplace.
       if (req.url === '/ean-ajouter') {
         const GH_TOKEN = (process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.GITHUB_PAT) || '';
         const GH_REPO = process.env.GITHUB_REPO || 'Drsly78/flaudis-notices';
         if (!GH_TOKEN) { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'GITHUB_TOKEN manquant dans les variables Railway' })); return; }
         const champ = v => String(v || '').trim().replace(/;/g, ' ').replace(/[\r\n]+/g, ' ');
         const lignes = (Array.isArray(payload.lignes) ? payload.lignes : [])
-          .map(l => ({ ean: String(l.ean || '').replace(/\D/g, ''), ref: champ(l.ref).toUpperCase(), statut: champ(l.statut), prix: champ(l.prix) }))
-          .filter(l => /^\d{8,14}$/.test(l.ean) && l.ref);
-        if (!lignes.length) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'aucune ligne valide (EAN numérique + réf requis)' })); return; }
+          .map(l => ({ ean: String(l.ean || '').replace(/\D/g, ''), ref: champ(l.ref).toUpperCase(), statut: champ(l.statut), prix: champ(l.prix), qte: champ(l.qte) }))
+          .filter(l => /^\d{8,14}$/.test(l.ean));
+        if (!lignes.length) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'aucune ligne valide (EAN numérique requis)' })); return; }
         const ghUrl = 'https://api.github.com/repos/' + GH_REPO + '/contents/ean-ref.csv';
         const ghHeaders = { 'Authorization': 'Bearer ' + GH_TOKEN, 'User-Agent': 'flaudis-sav', 'Accept': 'application/vnd.github+json' };
         const g = await fetch(ghUrl, { headers: ghHeaders });
         if (!g.ok) { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'GitHub ' + g.status + ' en lecture du CSV' })); return; }
         const gj = await g.json();
-        let csv = Buffer.from(gj.content || '', 'base64').toString('utf8');
-        // EAN déjà présents → écartés (on ne modifie jamais une ligne existante ici)
-        const existants = new Set(csv.split(/\r?\n/).map(l => (l.split(';')[0] || '').trim()).filter(x => /^\d+$/.test(x)));
-        const ajouts = lignes.filter(l => !existants.has(l.ean));
-        const doublons = lignes.filter(l => existants.has(l.ean)).map(l => l.ean);
-        if (!ajouts.length) {
+        const csv = Buffer.from(gj.content || '', 'base64').toString('utf8');
+        // Parse en conservant l'ordre des lignes du fichier
+        const rows = csv.split(/\r?\n/).filter(l2 => l2.trim() !== '');
+        const sortie = [];           // [{brut} ou {ean, c:[ref,statut,prix,qte]}]
+        const parEan = {};           // ean → index dans sortie
+        rows.forEach(l2 => {
+          const c = l2.split(';').map(x => x.trim());
+          if (/^\d{8,14}$/.test(c[0] || '')) {
+            parEan[c[0]] = sortie.length;
+            sortie.push({ ean: c[0], c: [c[1] || '', c[2] || '', c[3] || '', c[4] || ''] });
+          } else sortie.push({ brut: l2 });
+        });
+        // En-tête mis au format 5 colonnes
+        if (sortie.length && sortie[0].brut !== undefined && /^EAN/i.test(sortie[0].brut)) sortie[0] = { brut: 'EAN;REF;STATUT;PRIX;QTE_VENDUE' };
+        let ajoutes = 0, enrichis = 0, inchanges = 0; const rejets = [];
+        for (const l of lignes) {
+          const idx = parEan[l.ean];
+          if (idx === undefined) {
+            if (!l.ref) { rejets.push(l.ean + ' (nouvel EAN sans réf)'); continue; }
+            parEan[l.ean] = sortie.length;
+            sortie.push({ ean: l.ean, c: [l.ref, l.statut, l.prix, l.qte] });
+            ajoutes++;
+          } else {
+            const c = sortie[idx].c;
+            const avant = c.join(';');
+            if (l.ref) c[0] = l.ref;
+            if (l.statut) c[1] = l.statut;
+            if (l.prix) c[2] = l.prix;
+            if (l.qte) c[3] = l.qte;
+            if (c.join(';') !== avant) enrichis++; else inchanges++;
+          }
+        }
+        if (!ajoutes && !enrichis) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true, ajoutes: 0, doublons }));
+          res.end(JSON.stringify({ ok: true, ajoutes: 0, enrichis: 0, inchanges, rejets }));
           return;
         }
-        if (!/\n$/.test(csv)) csv += '\n';
-        csv += ajouts.map(l => l.ean + ';' + l.ref + ';' + l.statut + ';' + l.prix).join('\n') + '\n';
+        const nouveauCsv = sortie.map(e => e.brut !== undefined ? e.brut : e.ean + ';' + e.c.join(';')).join('\n') + '\n';
         const put = await fetch(ghUrl, {
           method: 'PUT', headers: { ...ghHeaders, 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            message: 'Ajout ' + ajouts.length + ' EAN au référentiel (extension)',
-            content: Buffer.from(csv, 'utf8').toString('base64'), sha: gj.sha
+            message: 'Référentiel EAN : ' + ajoutes + ' ajout(s), ' + enrichis + ' enrichi(s) (extension)',
+            content: Buffer.from(nouveauCsv, 'utf8').toString('base64'), sha: gj.sha
           })
         });
         if (!put.ok) {
@@ -1198,9 +1226,9 @@ out center tags;`;
           res.end(JSON.stringify({ ok: false, error: 'GitHub ' + put.status + ' : ' + t.slice(0, 180) }));
           return;
         }
-        console.log('Référentiel EAN —', ajouts.length, 'ligne(s) ajoutée(s)', doublons.length ? '| doublons écartés : ' + doublons.join(',') : '');
+        console.log('Référentiel EAN —', ajoutes, 'ajout(s),', enrichis, 'enrichi(s),', inchanges, 'inchangé(s)');
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, ajoutes: ajouts.length, doublons }));
+        res.end(JSON.stringify({ ok: true, ajoutes, enrichis, inchanges, rejets }));
         return;
       }
 
@@ -4127,19 +4155,43 @@ Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
       // Statistiques SAV d'une référence : volumes, décisions, pièces, tendance
       if (req.url === '/bilan-produit') {
         if (!pool) { res.writeHead(200); res.end(JSON.stringify({ error: 'no db' })); return; }
-        const ref = (payload.ref || '').trim();
-        if (!ref) { res.writeHead(400); res.end(JSON.stringify({ error: 'ref requise' })); return; }
+        // Une ou PLUSIEURS réfs cumulées (ex : même produit sous plusieurs codes couleur)
+        const refs = (Array.isArray(payload.refs) && payload.refs.length ? payload.refs : [payload.ref])
+          .map(r2 => String(r2 || '').trim()).filter(Boolean).slice(0, 10);
+        if (!refs.length) { res.writeHead(400); res.end(JSON.stringify({ error: 'ref requise' })); return; }
+        const ref = refs.join(' + ');
+        // Plage de temps optionnelle (dates ISO AAAA-MM-JJ, comparaison texte)
+        const estDate = v => /^\d{4}-\d{2}-\d{2}$/.test(String(v || ''));
+        const du = estDate(payload.du) ? payload.du : null;
+        const au = estDate(payload.au) ? payload.au : null;
         // Préfixe : couvre les variantes couleur (QD101-3/6 → QD101-3/6 VERT KAKI…)
+        const params = refs.map(r2 => r2 + '%');
+        const conds = refs.map((_, i2) => 'ref_produit ILIKE $' + (i2 + 1)).join(' OR ');
+        let condDates = '';
+        if (du) { params.push(du); condDates += ' AND date_reception >= $' + params.length; }
+        if (au) { params.push(au); condDates += ' AND date_reception <= $' + params.length; }
         const q = await pool.query(
-          `SELECT numero_dossier, piece, decision, date_reception, departement_ville, tracking
+          `SELECT numero_dossier, ref_produit, piece, decision, date_reception, departement_ville, tracking
            FROM dossiers
-           WHERE ref_produit ILIKE $1
+           WHERE (${conds})${condDates}
            ORDER BY date_reception DESC NULLS LAST
-           LIMIT 500`, [ref + '%']);
+           LIMIT 800`, params);
         const rows = q.rows || [];
 
-        const stats = { ref, total: rows.length, envois: 0, remboursements: 0,
-                        top_pieces: [], par_mois: [], par_magasin: [], derniers: [] };
+        const stats = { ref, refs, du, au, total: rows.length, envois: 0, remboursements: 0,
+                        top_pieces: [], par_mois: [], par_magasin: [], par_ref: [], derniers: [] };
+        // Chaque dossier est rattaché à la réf saisie dont le préfixe matche (la plus longue d'abord)
+        const refsTriees = [...refs].sort((a, b) => b.length - a.length);
+        const parRef = {};
+        refs.forEach(r2 => { parRef[r2] = { n: 0, envois: 0, remb: 0 }; });
+        rows.forEach(r => {
+          const rp = String(r.ref_produit || '').toUpperCase();
+          const grp = refsTriees.find(r2 => rp.startsWith(r2.toUpperCase())) || refs[0];
+          parRef[grp].n++;
+          if (r.decision === 'remboursement') parRef[grp].remb++; else parRef[grp].envois++;
+        });
+        stats.par_ref = refs.map(r2 => ({ ref: r2, n: parRef[r2].n, envois: parRef[r2].envois, remboursements: parRef[r2].remb }))
+          .sort((a, b) => b.n - a.n);
         const pieces = {}, mois = {}, magasins = {};
         rows.forEach(r => {
           if (r.decision === 'remboursement') stats.remboursements++; else stats.envois++;
