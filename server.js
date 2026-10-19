@@ -1201,7 +1201,8 @@ out center tags;`;
             const c = sortie[idx].c;
             const avant = c.join(';');
             if (l.ref) c[0] = l.ref;
-            if (l.statut) c[1] = l.statut;
+            // "DDP"/"FOB" nu ne remplace jamais un statut plus riche du même type ("FOB WN-13228")
+            if (l.statut && !(/^(DDP|FOB)$/i.test(l.statut) && new RegExp('^' + l.statut, 'i').test(c[1] || '') && (c[1] || '').length > l.statut.length)) c[1] = l.statut;
             if (l.prix) c[2] = l.prix;
             if (l.qte) c[3] = l.qte;
             if (c.join(';') !== avant) enrichis++; else inchanges++;
