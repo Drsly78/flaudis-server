@@ -1211,7 +1211,8 @@ out center tags;`;
       if (req.url === '/demande-info-tchat') {
         const idT = parseInt(payload.id);
         if (!idT) { res.writeHead(400); res.end(JSON.stringify({ ok: false, error: 'id requis' })); return; }
-        if (pool) await pool.query("UPDATE demandes_info SET tchat = $1, maj = now() WHERE id = $2", [payload.tchat ? '1' : '', idT]).catch(() => {});
+        const vT = String(payload.tchat) === '2' ? '2' : (payload.tchat ? '1' : ''); // '2' = le magasin a répondu
+        if (pool) await pool.query("UPDATE demandes_info SET tchat = $1, maj = now() WHERE id = $2", [vT, idT]).catch(() => {});
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
         return;
