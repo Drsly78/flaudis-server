@@ -543,7 +543,7 @@ const server = http.createServer(async function(req, res) {
   // Exception lecture navigateur : le diagnostic du référentiel ITS
   // accepte la clé en paramètre d'URL (?key=…)
   const urlKey = (req.url.match(/[?&]key=([^&]+)/) || [])[1];
-  if ((req.url.startsWith('/ref-its-structure') || req.url.startsWith('/magasins-u-crawl') || req.url.startsWith('/magasins-u-status') || req.url.startsWith('/magasins-u-test') || req.url.startsWith('/notices-manuelles') || req.url.startsWith('/demande-info-liste') || req.url.startsWith('/demande-info-get') || req.url.startsWith('/notices-fichiers') || req.url.startsWith('/notices-doublons') || req.url.startsWith('/notice-pdf') || req.url.startsWith('/backup') || req.url.startsWith('/livraisons-diag')) && urlKey === APP_SECRET) {
+  if ((req.url.startsWith('/ref-its-structure') || req.url.startsWith('/magasins-u-crawl') || req.url.startsWith('/magasins-u-status') || req.url.startsWith('/magasins-u-test') || req.url.startsWith('/notices-manuelles') || req.url.startsWith('/demande-info-liste') || req.url.startsWith('/demande-info-get') || req.url.startsWith('/notices-fichiers') || req.url.startsWith('/notices-doublons') || req.url.startsWith('/notice-pdf') || req.url.startsWith('/backup') || req.url.startsWith('/ext-latest') || req.url.startsWith('/livraisons-diag')) && urlKey === APP_SECRET) {
     // accès autorisé
   } else if (req.headers['x-app-secret'] !== APP_SECRET) {
     res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
@@ -776,6 +776,45 @@ const server = http.createServer(async function(req, res) {
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, derniere }));
+        return;
+      }
+
+      // ── 📦 Mise à jour de l'extension : Sylvain publie le zip, les postes le téléchargent ──
+      if (req.url === '/ext-publier') {
+        if (!pool) { res.writeHead(500); res.end(JSON.stringify({ error: 'pas de base de données' })); return; }
+        const vPub = String(payload.version || '').trim();
+        if (!/^\d+\.\d+\.\d+$/.test(vPub)) { res.writeHead(400); res.end(JSON.stringify({ error: 'version invalide (attendu : X.Y.Z)' })); return; }
+        const b64 = String(payload.zip_b64 || '');
+        if (b64.length < 1000) { res.writeHead(400); res.end(JSON.stringify({ error: 'zip manquant ou vide' })); return; }
+        let bufZip;
+        try { bufZip = Buffer.from(b64, 'base64'); } catch(e) { res.writeHead(400); res.end(JSON.stringify({ error: 'base64 invalide' })); return; }
+        if (bufZip.length < 4 || bufZip[0] !== 0x50 || bufZip[1] !== 0x4b) { res.writeHead(400); res.end(JSON.stringify({ error: 'ce fichier n\u2019est pas un zip' })); return; }
+        await pool.query("CREATE TABLE IF NOT EXISTS ext_release (id INT PRIMARY KEY, version TEXT, data BYTEA, taille INT, date_pub TIMESTAMPTZ)");
+        await pool.query("INSERT INTO ext_release (id, version, data, taille, date_pub) VALUES (1,$1,$2,$3,NOW()) ON CONFLICT (id) DO UPDATE SET version=$1, data=$2, taille=$3, date_pub=NOW()", [vPub, bufZip, bufZip.length]);
+        // la version publiée devient LA référence du bandeau (même si un poste a pingé plus haut par erreur)
+        try {
+          await pool.query("CREATE TABLE IF NOT EXISTS app_meta (cle TEXT PRIMARY KEY, valeur TEXT)");
+          await pool.query("INSERT INTO app_meta (cle, valeur) VALUES ('ext_version', $1) ON CONFLICT (cle) DO UPDATE SET valeur = $1", [vPub]);
+        } catch(e) {}
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, version: vPub, taille: bufZip.length }));
+        return;
+      }
+
+      if (req.url.startsWith('/ext-latest-info')) {
+        let infoPub = null;
+        if (pool) { try { const r2 = await pool.query("SELECT version, taille, date_pub FROM ext_release WHERE id = 1"); if (r2.rows.length) infoPub = r2.rows[0]; } catch(e) {} }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, publie: infoPub }));
+        return;
+      }
+
+      if (req.url.startsWith('/ext-latest')) {
+        let rowZip = null;
+        if (pool) { try { const r2 = await pool.query("SELECT version, data FROM ext_release WHERE id = 1"); if (r2.rows.length) rowZip = r2.rows[0]; } catch(e) {} }
+        if (!rowZip || !rowZip.data) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'aucune version publi\u00e9e \u2014 utilise \u00ab\u202fPublier la mise \u00e0 jour\u202f\u00bb dans le \u2699\ufe0f de l\u2019extension' })); return; }
+        res.writeHead(200, { 'Content-Type': 'application/zip', 'Content-Disposition': 'attachment; filename="flaudis-sav.zip"', 'X-Version': rowZip.version });
+        res.end(rowZip.data);
         return;
       }
 
