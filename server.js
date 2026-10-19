@@ -1125,10 +1125,14 @@ out center tags;`;
         let mode = 'cree';
         const dossierJson = (() => { try { const s2 = JSON.stringify(payload.dossier || null); return s2 && s2 !== 'null' && s2.length <= 80000 ? s2 : null; } catch(e) { return null; } })();
         if (pool) {
-          const ex = await pool.query("SELECT id FROM demandes_info WHERE cnb = $1 AND statut = 'ouverte' AND COALESCE(type, 'info') = $2 LIMIT 1", [cnb, typeD]);
+          const flaN = String(payload.fla || '').trim();
+          // Même dossier = même CNB **ou** même FLA : le re-scan met à jour, jamais de doublon
+          const ex = await pool.query("SELECT id, cnb FROM demandes_info WHERE statut = 'ouverte' AND COALESCE(type, 'info') = $2 AND (cnb = $1 OR ($3 <> '' AND fla = $3)) LIMIT 1", [cnb, typeD, flaN]);
           if (ex.rows.length) {
-            await pool.query("UPDATE demandes_info SET demande = $1, ref = $2, magasin = $3, ville = $4, ean = $5, qte = $6, fla = $7, dossier = COALESCE($8, dossier), revers_url = COALESCE($9, revers_url), tchat = $10, maj = now() WHERE id = $11",
-              [demande, payload.ref || '', payload.magasin || '', payload.ville || '', payload.ean || '', payload.qte || '', payload.fla || '', dossierJson, payload.revers_url || null, payload.tchat ? '1' : '', ex.rows[0].id]);
+            // Si l'extraction a confondu les numéros (un FLA dans le champ USV), on garde le vrai USV déjà en base
+            const cnbFinal = (/^FLA/i.test(cnb) && ex.rows[0].cnb && !/^FLA/i.test(ex.rows[0].cnb)) ? ex.rows[0].cnb : cnb;
+            await pool.query("UPDATE demandes_info SET cnb = $1, demande = $2, ref = $3, magasin = $4, ville = $5, ean = $6, qte = $7, fla = $8, dossier = COALESCE($9, dossier), revers_url = COALESCE($10, revers_url), tchat = $11, maj = now() WHERE id = $12",
+              [cnbFinal, demande, payload.ref || '', payload.magasin || '', payload.ville || '', payload.ean || '', payload.qte || '', payload.fla || '', dossierJson, payload.revers_url || null, payload.tchat ? '1' : '', ex.rows[0].id]);
             mode = 'mis à jour';
           } else {
             await pool.query("INSERT INTO demandes_info (cnb, ref, magasin, ville, ean, qte, fla, demande, revers_url, dossier, type, tchat) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
@@ -1169,9 +1173,10 @@ out center tags;`;
       if (req.url.startsWith('/demande-info-get')) {
         const u = new URL(req.url, 'http://x');
         const cnb = String(u.searchParams.get('cnb') || '').trim().toUpperCase();
+        const flaG = String(u.searchParams.get('fla') || '').trim();
         let item = null;
-        if (pool && cnb) {
-          const r2 = await pool.query("SELECT id, cnb, demande, revers_url, COALESCE(tchat, '') AS tchat, to_char(cree, 'DD/MM/YYYY') AS date FROM demandes_info WHERE cnb = $1 AND statut = 'ouverte' AND COALESCE(type, 'info') = 'info' LIMIT 1", [cnb]).catch(() => null);
+        if (pool && (cnb || flaG)) {
+          const r2 = await pool.query("SELECT id, cnb, demande, revers_url, COALESCE(tchat, '') AS tchat, to_char(cree, 'DD/MM/YYYY') AS date FROM demandes_info WHERE statut = 'ouverte' AND COALESCE(type, 'info') = 'info' AND (($1 <> '' AND cnb = $1) OR ($2 <> '' AND fla = $2)) LIMIT 1", [cnb, flaG]).catch(() => null);
           if (r2 && r2.rows.length) item = r2.rows[0];
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1182,8 +1187,9 @@ out center tags;`;
       if (req.url === '/demande-info-close-cnb') {
         // Clôture automatique : le dossier est parti en Envoyer pièce / Rembourser
         const cnb = String(payload.cnb || '').trim().toUpperCase();
-        if (pool && cnb) {
-          const r2 = await pool.query("UPDATE demandes_info SET statut = 'traitee', maj = now() WHERE cnb = $1 AND statut = 'ouverte' AND COALESCE(type, 'info') = 'info'", [cnb]).catch(() => null);
+        const flaC = String(payload.fla || '').trim();
+        if (pool && (cnb || flaC)) {
+          const r2 = await pool.query("UPDATE demandes_info SET statut = 'traitee', maj = now() WHERE statut = 'ouverte' AND COALESCE(type, 'info') = 'info' AND (($1 <> '' AND cnb = $1) OR ($2 <> '' AND fla = $2))", [cnb, flaC]).catch(() => null);
           if (r2 && r2.rowCount) console.log('Demande info soldée par export :', cnb);
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
