@@ -801,6 +801,28 @@ const server = http.createServer(async function(req, res) {
         return;
       }
 
+      // ── 💡 Génération de nouveaux faits « Le savais-tu ? » (bouton ⚙️ de l'extension) ──
+      if (req.url === '/faits-nouveaux') {
+        const themesOk = ['histoire','geo','science','espace','nature','corps','langue','art','bouffe','inventions'];
+        const eviter = (Array.isArray(payload.eviter) ? payload.eviter : []).slice(0, 80).map(x => String(x).slice(0, 90));
+        const promptFaits = 'G\u00e9n\u00e8re 40 faits de culture g\u00e9n\u00e9rale en fran\u00e7ais, pour un \u00e9cran d\u2019attente.\n'
+          + 'R\u00e8gles strictes :\n'
+          + '- Uniquement des faits VRAIS, bien \u00e9tablis et v\u00e9rifiables ; aucun fait douteux, approximatif ou invent\u00e9. Si un fait est une l\u00e9gende c\u00e9l\u00e8bre, dis-le explicitement dedans.\n'
+          + '- Chaque fait : une \u00e0 deux phrases, 170 caract\u00e8res maximum, ton l\u00e9ger mais pr\u00e9cis (chiffres, dates).\n'
+          + '- Th\u00e8mes autoris\u00e9s (cl\u00e9 exacte) : ' + themesOk.join(', ') + '. Varie les th\u00e8mes.\n'
+          + '- \u00c9vite tout fait proche de ceux-ci (d\u00e9j\u00e0 connus du lecteur) :\n' + eviter.map(x => '\u2022 ' + x).join('\n') + '\n'
+          + 'R\u00e9ponds UNIQUEMENT avec un tableau JSON strict, sans commentaire : [["theme","fait"], ...]';
+        const rep = await callAnthropic({ model: MODEL_LIGHT, max_tokens: 4000, messages: [{ role: 'user', content: promptFaits }] });
+        const texteFaits = (rep.content || []).map(b => b.text || '').join('');
+        const mFaits = texteFaits.match(/\[[\s\S]*\]/);
+        let faits = [];
+        try { faits = JSON.parse(mFaits ? mFaits[0] : '[]'); } catch(e) {}
+        faits = (Array.isArray(faits) ? faits : []).filter(x => Array.isArray(x) && themesOk.includes(x[0]) && typeof x[1] === 'string' && x[1].trim().length >= 25 && x[1].length <= 220).map(x => [x[0], x[1].trim()]);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, faits }));
+        return;
+      }
+
       if (req.url.startsWith('/ext-latest-info')) {
         let infoPub = null;
         if (pool) { try { const r2 = await pool.query("SELECT version, taille, date_pub FROM ext_release WHERE id = 1"); if (r2.rows.length) infoPub = r2.rows[0]; } catch(e) {} }
