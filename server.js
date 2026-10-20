@@ -1131,12 +1131,12 @@ out center tags;`;
           if (ex.rows.length) {
             // Si l'extraction a confondu les numéros (un FLA dans le champ USV), on garde le vrai USV déjà en base
             const cnbFinal = (/^FLA/i.test(cnb) && ex.rows[0].cnb && !/^FLA/i.test(ex.rows[0].cnb)) ? ex.rows[0].cnb : cnb;
-            await pool.query("UPDATE demandes_info SET cnb = $1, demande = $2, ref = $3, magasin = $4, ville = $5, ean = $6, qte = $7, fla = $8, dossier = COALESCE($9, dossier), revers_url = COALESCE($10, revers_url), tchat = $11, maj = now() WHERE id = $12",
-              [cnbFinal, demande, payload.ref || '', payload.magasin || '', payload.ville || '', payload.ean || '', payload.qte || '', payload.fla || '', dossierJson, payload.revers_url || null, payload.tchat ? '1' : '', ex.rows[0].id]);
+            await pool.query("UPDATE demandes_info SET cnb = $1, demande = $2, ref = $3, magasin = $4, ville = $5, ean = $6, qte = $7, fla = $8, dossier = COALESCE($9, dossier), revers_url = COALESCE($10, revers_url), tchat = COALESCE($11, tchat), maj = now() WHERE id = $12",
+              [cnbFinal, demande, payload.ref || '', payload.magasin || '', payload.ville || '', payload.ean || '', payload.qte || '', payload.fla || '', dossierJson, payload.revers_url || null, payload.tchat === undefined ? null : (payload.tchat ? '1' : ''), ex.rows[0].id]);
             mode = 'mis à jour';
           } else {
             await pool.query("INSERT INTO demandes_info (cnb, ref, magasin, ville, ean, qte, fla, demande, revers_url, dossier, type, tchat) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
-              [cnb, payload.ref || '', payload.magasin || '', payload.ville || '', payload.ean || '', payload.qte || '', payload.fla || '', demande, payload.revers_url || null, dossierJson, typeD, payload.tchat ? '1' : '']);
+              [cnb, payload.ref || '', payload.magasin || '', payload.ville || '', payload.ean || '', payload.qte || '', payload.fla || '', demande, payload.revers_url || null, dossierJson, typeD, payload.tchat === undefined ? '' : (payload.tchat ? '1' : '')]);
           }
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
