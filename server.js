@@ -3408,6 +3408,52 @@ Réponds UNIQUEMENT avec ce JSON, sans texte autour :
         res.end(JSON.stringify({ jours }));
         return;
       }
+      // ── 📦 Dossiers expédiés des 21 derniers jours (pour surveiller les messageries) ──
+      if (req.url === '/expedies-liste') {
+        if (!pool) { res.writeHead(200); res.end(JSON.stringify({ lignes: [] })); return; }
+        const q = await pool.query(`
+          SELECT numero_dossier, enseigne, departement_ville, ref_produit, piece, tracking, date_envoi, notes, fla, revers_url
+          FROM dossiers
+          WHERE COALESCE(tracking,'') <> '' AND COALESCE(date_envoi,'') <> '' AND LOWER(date_envoi) <> 'x'`);
+        const toISOx = v => {
+          const t = String(v || '').trim();
+          let m = t.match(/^(\d{4})-(\d{2})-(\d{2})/);
+          if (m) return m[1] + '-' + m[2] + '-' + m[3];
+          m = t.match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})$/);
+          if (m) return (m[3].length === 2 ? '20' + m[3] : m[3]) + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0');
+          m = t.match(/^(\d{1,2})[\/.\-](\d{1,2})$/);
+          if (m) {
+            const now = new Date();
+            let an = now.getFullYear();
+            if (parseInt(m[2]) > now.getMonth() + 1) an--;
+            return an + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0');
+          }
+          return null;
+        };
+        const limite = new Date(Date.now() - 21 * 24 * 3600 * 1000).toISOString().slice(0, 10);
+        const lignes = [];
+        q.rows.forEach(r => {
+          const iso = toISOx(r.date_envoi);
+          if (!iso || iso < limite) return; // plus de 3 semaines → disparition naturelle
+          lignes.push({
+            iso,
+            date_envoi: iso.slice(8, 10) + '/' + iso.slice(5, 7) + '/' + iso.slice(2, 4),
+            tracking: r.tracking,
+            usv: r.numero_dossier,
+            fla: r.fla || (((r.notes || '').match(/FLA:([^\s]+)/) || [])[1] || ''),
+            magasin: r.departement_ville || '',
+            enseigne: r.enseigne || '',
+            ref: r.ref_produit || '',
+            piece: r.piece || '',
+            revers_url: r.revers_url || null
+          });
+        });
+        lignes.sort((a2, b2) => b2.iso < a2.iso ? -1 : b2.iso > a2.iso ? 1 : 0);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ lignes: lignes.slice(0, 500) }));
+        return;
+      }
+
       if (req.url === '/livraisons-jour') {
         if (!pool) { res.writeHead(200); res.end(JSON.stringify({ lignes: [] })); return; }
         const iso = (payload.iso || '').trim();
