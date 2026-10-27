@@ -3414,6 +3414,12 @@ Réponds UNIQUEMENT avec ce JSON, sans texte autour :
       if (req.url === '/rapport-hebdo') {
         if (!pool) { res.writeHead(500); res.end(JSON.stringify({ error: 'pas de base de données' })); return; }
         await pool.query("CREATE TABLE IF NOT EXISTS app_meta (cle TEXT PRIMARY KEY, valeur TEXT)").catch(() => {});
+        if (payload.reset) {
+          await pool.query("DELETE FROM app_meta WHERE cle IN ('rapport_vus', 'rapport_dernier')").catch(() => {});
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, reset: true }));
+          return;
+        }
         let vus = { exp: [], remb: [] }, depuis = null;
         try {
           const r0 = await pool.query("SELECT cle, valeur FROM app_meta WHERE cle IN ('rapport_vus', 'rapport_dernier')");
@@ -3494,6 +3500,18 @@ Réponds UNIQUEMENT avec ce JSON, sans texte autour :
             };
           });
         } catch(e) {}
+        let attenteRefus = [];
+        try {
+          const qr = await pool.query("SELECT cnb, ref, ean, magasin, ville, demande, dossier, to_char(cree, 'DD/MM/YYYY') AS date FROM demandes_info WHERE statut = 'ouverte' AND type = 'refus' ORDER BY cree DESC LIMIT 300");
+          attenteRefus = qr.rows.map(r => {
+            let dj = null; try { dj = r.dossier ? JSON.parse(r.dossier) : null; } catch(e) {}
+            return {
+              date_dossier: (dj && (dj.date_reception || '')) || r.date,
+              usv: r.cnb || '', enseigne: r.magasin || '', magasin: r.ville || '',
+              ean: r.ean || '', ref: r.ref || '', message: r.demande || ''
+            };
+          });
+        } catch(e) {}
         const attenteGestes = [];
         for (let i = 1; i < rowsS.length; i++) {
           const r = rowsS[i] || [];
@@ -3520,7 +3538,7 @@ Réponds UNIQUEMENT avec ce JSON, sans texte autour :
           await pool.query("INSERT INTO app_meta (cle, valeur) VALUES ('rapport_dernier', $1) ON CONFLICT (cle) DO UPDATE SET valeur = $1", [new Date().toISOString()]).catch(() => {});
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, depuis, expedies, rembourses, attente_infos: attenteInfos, attente_gestes: attenteGestes }));
+        res.end(JSON.stringify({ ok: true, depuis, expedies, rembourses, attente_infos: attenteInfos, attente_gestes: attenteGestes, refus: attenteRefus }));
         return;
       }
 
