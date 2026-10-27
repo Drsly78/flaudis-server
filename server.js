@@ -3408,6 +3408,109 @@ Réponds UNIQUEMENT avec ce JSON, sans texte autour :
         res.end(JSON.stringify({ jours }));
         return;
       }
+      // ── 📊 Rapport hebdo (Cerveau) : expéditions + remboursements depuis la dernière
+      //    extraction, et dossiers en attente de réponse. Le serveur retient ce qui a
+      //    déjà été rapporté (app_meta rapport_vus) → « depuis la dernière fois » exact.
+      if (req.url === '/rapport-hebdo') {
+        if (!pool) { res.writeHead(500); res.end(JSON.stringify({ error: 'pas de base de données' })); return; }
+        await pool.query("CREATE TABLE IF NOT EXISTS app_meta (cle TEXT PRIMARY KEY, valeur TEXT)").catch(() => {});
+        let vus = { exp: [], remb: [] }, depuis = null;
+        try {
+          const r0 = await pool.query("SELECT cle, valeur FROM app_meta WHERE cle IN ('rapport_vus', 'rapport_dernier')");
+          r0.rows.forEach(r => { if (r.cle === 'rapport_vus') { try { vus = JSON.parse(r.valeur) || vus; } catch(e) {} } else depuis = r.valeur; });
+        } catch(e) {}
+        const vusExp = new Set(vus.exp || []), vusRemb = new Set(vus.remb || []);
+
+        // 1) Expéditions : tout dossier avec tracking, jamais rapporté
+        const qe = await pool.query(`
+          SELECT numero_dossier, enseigne, departement_ville, ref_produit, tracking, date_envoi, date_reception, notes, fla, revers_url
+          FROM dossiers WHERE COALESCE(tracking,'') <> '' AND LOWER(COALESCE(date_envoi,'')) <> 'x'`);
+        const expedies = [];
+        qe.rows.forEach(r => {
+          const cle = (r.numero_dossier || '') + '|' + (r.tracking || '');
+          if (vusExp.has(cle)) return;
+          expedies.push({
+            cle,
+            date_dossier: r.date_reception || '',
+            usv: r.numero_dossier || '',
+            enseigne: r.enseigne || '',
+            magasin: r.departement_ville || '',
+            ref: r.ref_produit || '',
+            fla: r.fla || (((r.notes || '').match(/FLA:([^\s]+)/) || [])[1] || ''),
+            tracking: r.tracking || '',
+            date_envoi: r.date_envoi || '',
+            revers_url: r.revers_url || null
+          });
+        });
+
+        // 2) Remboursements : lignes du Sheet avec un n° d'accord (col J), jamais rapportées
+        const token = await getSheetsToken();
+        const qs = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'REMBOURSEMENT SU'!A:M")}`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const rowsS = qs.values || [];
+        const rembourses = [];
+        for (let i = 1; i < rowsS.length; i++) {
+          const r = rowsS[i] || [];
+          const accord = (r[9] || '').toString().trim();
+          if (!accord) continue;
+          const cle = ((r[8] || '').toString().trim() || 'L' + (i + 1)) + '|' + accord;
+          if (vusRemb.has(cle)) continue;
+          rembourses.push({
+            cle,
+            date_dossier: (r[0] || '').toString().trim(),
+            usv: (r[8] || '').toString().trim(),
+            enseigne: (r[5] || '').toString().trim(),
+            magasin: (r[6] || '').toString().trim(),
+            ean: (r[3] || '').toString().trim(),
+            ref: (r[2] || '').toString().trim(),
+            accord,
+            commentaire: (r[7] || '').toString().trim()
+          });
+        }
+
+        // 3) En attente de réponse : demandes d'info ouvertes + propositions de geste co
+        let attenteInfos = [];
+        try {
+          const qa = await pool.query("SELECT cnb, ref, ean, magasin, ville, demande, dossier, to_char(cree, 'DD/MM/YYYY') AS date FROM demandes_info WHERE statut = 'ouverte' AND COALESCE(type, 'info') = 'info' ORDER BY cree DESC LIMIT 300");
+          attenteInfos = qa.rows.map(r => {
+            let dj = null; try { dj = r.dossier ? JSON.parse(r.dossier) : null; } catch(e) {}
+            return {
+              date_dossier: (dj && (dj.date_reception || '')) || r.date,
+              usv: r.cnb || '', enseigne: r.magasin || '', magasin: r.ville || '',
+              ean: r.ean || '', ref: r.ref || '', message: r.demande || ''
+            };
+          });
+        } catch(e) {}
+        const attenteGestes = [];
+        for (let i = 1; i < rowsS.length; i++) {
+          const r = rowsS[i] || [];
+          const hT = (r[7] || '').toString().trim();
+          if (!/^Proposition geste co/i.test(hT)) continue;
+          attenteGestes.push({
+            date_dossier: (r[0] || '').toString().trim(),
+            usv: (r[8] || '').toString().trim(),
+            enseigne: (r[5] || '').toString().trim(),
+            magasin: (r[6] || '').toString().trim(),
+            ean: (r[3] || '').toString().trim(),
+            ref: (r[2] || '').toString().trim(),
+            message: hT
+          });
+        }
+
+        // Marquage : ces dossiers ne réapparaîtront pas au prochain rapport
+        if (payload.marquer) {
+          expedies.forEach(x => vusExp.add(x.cle));
+          rembourses.forEach(x => vusRemb.add(x.cle));
+          const borne = arr => arr.slice(-4000); // on borne la mémoire
+          const neuf = JSON.stringify({ exp: borne([...vusExp]), remb: borne([...vusRemb]) });
+          await pool.query("INSERT INTO app_meta (cle, valeur) VALUES ('rapport_vus', $1) ON CONFLICT (cle) DO UPDATE SET valeur = $1", [neuf]).catch(() => {});
+          await pool.query("INSERT INTO app_meta (cle, valeur) VALUES ('rapport_dernier', $1) ON CONFLICT (cle) DO UPDATE SET valeur = $1", [new Date().toISOString()]).catch(() => {});
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, depuis, expedies, rembourses, attente_infos: attenteInfos, attente_gestes: attenteGestes }));
+        return;
+      }
+
       // ── 📦 Dossiers expédiés des 21 derniers jours (pour surveiller les messageries) ──
       if (req.url === '/expedies-liste') {
         if (!pool) { res.writeHead(200); res.end(JSON.stringify({ lignes: [] })); return; }
