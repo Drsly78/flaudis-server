@@ -3425,10 +3425,21 @@ Réponds UNIQUEMENT avec ce JSON, sans texte autour :
         const qe = await pool.query(`
           SELECT numero_dossier, enseigne, departement_ville, ref_produit, tracking, date_envoi, date_reception, notes, fla, revers_url
           FROM dossiers WHERE COALESCE(tracking,'') <> '' AND LOWER(COALESCE(date_envoi,'')) <> 'x'`);
+        const toISOr = v => {
+          const t = String(v || '').trim();
+          let m = t.match(/^(\d{4})-(\d{2})-(\d{2})/);
+          if (m) return m[1] + '-' + m[2] + '-' + m[3];
+          m = t.match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})$/);
+          if (m) return (m[3].length === 2 ? '20' + m[3] : m[3]) + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0');
+          return null;
+        };
+        const borne90 = new Date(Date.now() - 90 * 24 * 3600 * 1000).toISOString().slice(0, 10);
         const expedies = [];
         qe.rows.forEach(r => {
           const cle = (r.numero_dossier || '') + '|' + (r.tracking || '');
           if (vusExp.has(cle)) return;
+          const isoEnv = toISOr(r.date_envoi);
+          if (!isoEnv || isoEnv < borne90) return; // l'ancien historique n'entre jamais dans un rapport
           expedies.push({
             cle,
             date_dossier: r.date_reception || '',
@@ -3453,6 +3464,8 @@ Réponds UNIQUEMENT avec ce JSON, sans texte autour :
           const r = rowsS[i] || [];
           const accord = (r[9] || '').toString().trim();
           if (!accord) continue;
+          const isoA = toISOr((r[0] || '').toString().trim());
+          if (!isoA || isoA < borne90) continue; // historique ancien exclu
           const cle = ((r[8] || '').toString().trim() || 'L' + (i + 1)) + '|' + accord;
           if (vusRemb.has(cle)) continue;
           rembourses.push({
