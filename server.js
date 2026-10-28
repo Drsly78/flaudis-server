@@ -3921,9 +3921,11 @@ Réponds UNIQUEMENT avec ce JSON, sans texte autour :
         const _now = new Date();
         const _jours = ['dimanche','lundi','mardi','mercredi','jeudi','vendredi','samedi'];
         const _aujourdhui = _jours[_now.getDay()] + ' ' + String(_now.getDate()).padStart(2,'0') + '/' + String(_now.getMonth()+1).padStart(2,'0') + '/' + _now.getFullYear();
-        content.push({ type: 'text', text: `NOUS SOMMES LE ${_aujourdhui}.
+        const _dateDom = String(payload.date_dom || '').trim();
+        content.push({ type: 'text', text: `NOUS SOMMES LE ${_aujourdhui}.${_dateDom ? `
+DATE DE RECEPTION DU MAIL, lue directement dans le webmail (FIABLE) : ${_dateDom} — recopie-la telle quelle dans date_mail, sans la recalculer ni la mettre en incertitude.` : ''}
 
-Voici un dossier SAV Intersport : le texte du mail reçu, et si joints, des documents (bon de retour PDF, photos du produit, ticket de caisse).
+Voici un dossier SAV Intersport : le texte du mail recu (uniquement le mail ouvert, pas la liste de la boite), et si joints, des documents (bon de retour PDF, photos du produit, ticket de caisse).
 
 TEXTE DU MAIL :
 ${(payload.mail_text || '(non fourni)').slice(0, 6000)}
