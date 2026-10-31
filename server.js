@@ -756,6 +756,67 @@ const server = http.createServer(async function(req, res) {
         return;
       }
 
+      // ── 🔎 Audit du Google Sheet (LECTURE SEULE) : lignes incomplètes, formats de dates ──
+      if (req.url === '/sheet-audit') {
+        const token = await getSheetsToken();
+        const meta = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}?fields=sheets.properties`,
+          { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+        const tousOnglets = (meta.sheets || []).map(x => x.properties && x.properties.title).filter(Boolean);
+        const connus = ['SYSTEME U', 'REMBOURSEMENT SU', 'INTERSPORT', 'REMBOURSEMENT ITS', 'CODE PRODUITS', 'PRIX AVOIR', 'CODE SOCIETAIRE'];
+        const colLettre = i2 => { let n = i2, r2 = ''; do { r2 = String.fromCharCode(65 + (n % 26)) + r2; n = Math.floor(n / 26) - 1; } while (n >= 0); return r2; };
+        const formatDate = v => {
+          const t = String(v || '').trim();
+          if (!t) return null;
+          if (/^\d{2}\/\d{2}\/\d{4}$/.test(t)) return 'JJ/MM/AAAA';
+          if (/^\d{2}\/\d{2}\/\d{2}$/.test(t)) return 'JJ/MM/AA';
+          if (/^\d{1,2}\/\d{1,2}\/\d{2,4}$/.test(t)) return 'J/M/AA(AA) sans zéros';
+          if (/^\d{4}-\d{2}-\d{2}/.test(t)) return 'AAAA-MM-JJ (ISO)';
+          if (/^\d{1,2}[.-]\d{1,2}[.-]\d{2,4}$/.test(t)) return 'JJ-MM ou JJ.MM';
+          if (/^\d{1,2}\s+(janv|f[ée]v|mars|avr|mai|juin|juil|ao[ûu]|sept|oct|nov|d[ée]c)/i.test(t)) return 'texte (12 juillet…)';
+          if (/^\d{5}$/.test(t)) return 'numéro de série Sheets';
+          return 'autre';
+        };
+        const audit = { onglets_inconnus: tousOnglets.filter(t => !connus.includes(t)), onglets: {} };
+        for (const nom of connus.filter(t => tousOnglets.includes(t))) {
+          const v = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'" + nom + "'!A1:AU")}`,
+            { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+          const rows = v.values || [];
+          const entetes = rows[0] || [];
+          const data = rows.slice(1);
+          const nbCols = Math.max(entetes.length, ...data.slice(0, 50).map(r2 => r2.length), 0);
+          const colonnes = [];
+          for (let c = 0; c < nbCols; c++) {
+            let remplies = 0; const formats = {}; let datesVues = 0;
+            data.forEach(r2 => {
+              const val = (r2[c] || '').toString().trim();
+              if (!val) return;
+              remplies++;
+              const f = formatDate(val);
+              if (f && f !== 'autre') { datesVues++; formats[f] = (formats[f] || 0) + 1; }
+            });
+            if (!remplies && !entetes[c]) continue;
+            const col = { col: colLettre(c), entete: entetes[c] || '', remplies, vides: data.length - remplies };
+            if (datesVues >= Math.max(3, remplies * 0.3) && Object.keys(formats).length) col.formats_date = formats;
+            colonnes.push(col);
+          }
+          const o = { lignes: data.length, colonnes };
+          if (nom === 'REMBOURSEMENT SU') {
+            const sansCle = [], sansDate = [];
+            data.forEach((r2, i2) => {
+              const ligne = i2 + 2;
+              if (!(r2[8] || '').trim() && !(r2[12] || '').trim()) sansCle.push(ligne);
+              if (!(r2[0] || '').trim()) sansDate.push(ligne);
+            });
+            o.lignes_sans_cnb_ni_fla = { nb: sansCle.length, exemples: sansCle.slice(0, 15) };
+            o.lignes_sans_date_A = { nb: sansDate.length, exemples: sansDate.slice(0, 15) };
+          }
+          audit.onglets[nom] = o;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(audit));
+        return;
+      }
+
       // ── ⬆️ Version de l'extension : chaque poste s'annonce, le serveur retient la plus haute ──
       if (req.url === '/version-ping') {
         const v = String(payload.version || '').trim();
