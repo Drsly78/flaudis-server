@@ -1,6 +1,7 @@
 const https  = require('https');
 const http   = require('http');
 const { Pool } = require('pg');
+const prepa  = require('./prepa');
 
 const API_KEY         = process.env.ANTHROPIC_API_KEY;
 const APP_SECRET      = process.env.APP_SECRET || 'sav-flaudis-2024';
@@ -540,6 +541,9 @@ const server = http.createServer(async function(req, res) {
     return;
   }
 
+  // 📦 App préparateurs : page publique + API protégée par son propre code
+  if (await prepa.handleApp(req, res)) return;
+
   // Exception lecture navigateur : le diagnostic du référentiel ITS
   // accepte la clé en paramètre d'URL (?key=…)
   const urlKey = (req.url.match(/[?&]key=([^&]+)/) || [])[1];
@@ -755,6 +759,9 @@ const server = http.createServer(async function(req, res) {
         res.end(dump);
         return;
       }
+
+      // ── 📦 App préparateurs : routes de l'extension ──
+      if (req.url.startsWith('/prepa-ext/')) { await prepa.handleExt(req, res, payload); return; }
 
       // ── 🔎 Audit du Google Sheet (LECTURE SEULE) : lignes incomplètes, formats de dates ──
       if (req.url === '/sheet-audit') {
@@ -4760,6 +4767,26 @@ Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
       res.writeHead(500); res.end(JSON.stringify({ error: err.message }));
     }
   });
+});
+
+prepa.init({
+  pool, MODEL_LIGHT, callAnthropic, parseJsonModel,
+  lireSheet: async (range) => {
+    const token = await getSheetsToken();
+    const r = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent(range)}`,
+      { headers: { Authorization: 'Bearer ' + token } }).then(x => x.json());
+    if (r.error) throw new Error(r.error.message || 'lecture Sheet');
+    return r.values || [];
+  },
+  ecrireCellule: async (range, valeur) => {
+    const token = await getSheetsToken();
+    const r = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent(range)}?valueInputOption=RAW`, {
+      method: 'PUT', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ values: [[valeur]] })
+    }).then(x => x.json());
+    if (r.error) throw new Error(r.error.message || 'écriture Sheet');
+    return r;
+  }
 });
 
 initDB().then(() => {

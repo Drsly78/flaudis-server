@@ -1,0 +1,421 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<meta name="theme-color" content="#1F3864">
+<title>Prépa SAV</title>
+<style>
+:root {
+  --bg: #f3f5f8; --surface: #ffffff; --surface2: #f7f9fc; --text: #1b2330; --muted: #6b7686;
+  --border: #dde3ea; --navy: #1F3864; --accent: #1a5fa8; --accent-bg: #eaf3fc;
+  --green: #1a9e4a; --green-bg: #e8f5e9; --amber: #b7791f; --amber-bg: #fff3dd;
+  --dsv: #1a56c4; --dpd: #d0191f; --shadow: 0 1px 2px rgba(16,24,40,.06), 0 1px 3px rgba(16,24,40,.08);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #11151b; --surface: #1a2029; --surface2: #202834; --text: #e6ebf2; --muted: #93a0b2;
+    --border: #2c3644; --navy: #2b4a80; --accent: #6fa8ec; --accent-bg: #1c2a3d;
+    --green: #3fbf6e; --green-bg: #183324; --amber: #e0a33e; --amber-bg: #33280f;
+    --dsv: #4d86f0; --dpd: #f0484e; --shadow: none;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text); }
+body { font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; -webkit-text-size-adjust: 100%; }
+button { font: inherit; cursor: pointer; }
+[hidden] { display: none !important; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+/* Connexion */
+.login { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px; }
+.login-box { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 28px 22px; width: 100%; max-width: 340px; box-shadow: var(--shadow); text-align: center; }
+.login-box h1 { font-size: 20px; margin: 6px 0 4px; }
+.login-box p { color: var(--muted); margin: 0 0 18px; font-size: 13px; }
+.login-box input { width: 100%; font-size: 22px; letter-spacing: 6px; text-align: center; text-transform: uppercase; padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface2); color: var(--text); }
+.login-box button { margin-top: 12px; width: 100%; padding: 12px; border: 0; border-radius: 10px; background: var(--navy); color: #fff; font-weight: 700; font-size: 15px; }
+.login-err { color: var(--dpd); font-size: 13px; min-height: 18px; margin-top: 10px; }
+
+/* En-tête */
+header { position: sticky; top: 0; z-index: 5; background: var(--navy); color: #fff; padding: 10px 16px; padding-top: max(10px, env(safe-area-inset-top)); }
+.h-ligne { display: flex; align-items: center; gap: 10px; max-width: 980px; margin: 0 auto; }
+.h-titre { font-weight: 800; font-size: 17px; flex: 1; white-space: nowrap; }
+.h-titre small { font-weight: 500; opacity: .75; font-size: 12px; margin-left: 6px; }
+.h-btn { background: rgba(255,255,255,.14); color: #fff; border: 1px solid rgba(255,255,255,.25); border-radius: 9px; padding: 7px 11px; font-size: 13px; font-weight: 600; white-space: nowrap; }
+.h-btn:active { background: rgba(255,255,255,.25); }
+.barre { max-width: 980px; margin: 0 auto; padding: 12px 16px 4px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.barre input { flex: 1 1 220px; min-width: 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); color: var(--text); font-size: 15px; }
+.seg { display: inline-flex; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 3px; }
+.seg button { border: 0; background: none; color: var(--muted); padding: 7px 10px; border-radius: 7px; font-weight: 600; font-size: 13px; white-space: nowrap; }
+.seg button.on { background: var(--accent-bg); color: var(--accent); }
+.info { max-width: 980px; margin: 0 auto; padding: 2px 16px 0; color: var(--muted); font-size: 12px; min-height: 18px; }
+main { max-width: 980px; margin: 0 auto; padding: 8px 16px 40px; display: grid; gap: 12px; }
+.vide { text-align: center; color: var(--muted); padding: 50px 10px; }
+
+/* Carte dossier */
+.carte { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow); overflow: hidden; }
+.carte.prepare { border-color: var(--green); box-shadow: inset 4px 0 0 var(--green), var(--shadow); }
+.c-haut { display: flex; align-items: flex-start; gap: 10px; padding: 12px 14px 0; flex-wrap: wrap; }
+.c-ids { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; flex: 1; min-width: 0; }
+.usv { font-weight: 800; font-size: 15px; }
+.chip { font-size: 12px; font-weight: 700; padding: 2px 8px; border-radius: 8px; border: 1px solid; white-space: nowrap; }
+.chip-fla { color: var(--accent); background: var(--accent-bg); border-color: transparent; }
+.chip-age { color: var(--muted); border-color: var(--border); font-weight: 600; }
+.chip-age.vieux { color: var(--amber); background: var(--amber-bg); border-color: transparent; }
+.c-date { color: var(--muted); font-size: 12px; white-space: nowrap; padding-top: 2px; }
+.c-mag { padding: 2px 14px 0; font-weight: 700; font-size: 14px; }
+.c-mag span { color: var(--muted); font-weight: 500; }
+.c-infos { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; padding: 10px 14px; }
+.inf { background: var(--surface2); border-radius: 8px; padding: 7px 9px; min-width: 0; }
+.inf b { display: block; font-size: 10.5px; text-transform: uppercase; letter-spacing: .4px; color: var(--muted); font-weight: 700; }
+.inf div { font-weight: 700; overflow-wrap: anywhere; }
+.inf.piece { background: var(--amber-bg); }
+.inf.piece div { color: var(--amber); }
+.copiable { cursor: copy; }
+.c-pb { padding: 0 14px 10px; }
+.c-pb .titre { font-size: 10.5px; text-transform: uppercase; letter-spacing: .4px; color: var(--muted); font-weight: 700; margin-bottom: 3px; }
+.c-pb .synth { font-weight: 600; }
+.c-pb blockquote { margin: 6px 0 0; padding: 6px 10px; border-left: 3px solid var(--border); color: var(--text); background: var(--surface2); border-radius: 0 8px 8px 0; white-space: pre-wrap; font-size: 13px; }
+.c-manque { margin: 0 14px 10px; padding: 7px 10px; border-radius: 8px; background: var(--surface2); color: var(--muted); font-size: 12.5px; }
+.galerie { display: flex; gap: 6px; overflow-x: auto; padding: 0 14px 10px; scrollbar-width: thin; }
+.galerie button { flex: 0 0 auto; padding: 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--surface2); position: relative; }
+.galerie img { display: block; height: 92px; width: auto; max-width: 160px; object-fit: cover; }
+.galerie .tag { position: absolute; left: 4px; bottom: 4px; background: rgba(0,0,0,.6); color: #fff; font-size: 10px; padding: 1px 5px; border-radius: 5px; max-width: 90%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.docs { display: flex; gap: 6px; flex-wrap: wrap; padding: 0 14px 10px; }
+.docs a { display: inline-flex; gap: 6px; align-items: center; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); text-decoration: none; font-size: 13px; background: var(--surface2); max-width: 100%; }
+.docs a span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.c-actions { display: flex; gap: 8px; padding: 10px 14px 12px; border-top: 1px solid var(--border); align-items: center; flex-wrap: wrap; }
+.b-prep { flex: 1 1 160px; padding: 10px 12px; border-radius: 10px; border: 1.5px solid var(--border); background: var(--surface); color: var(--text); font-weight: 700; font-size: 14px; }
+.b-prep.on { background: var(--green); border-color: var(--green); color: #fff; }
+.transp { display: flex; gap: 8px; }
+.b-t { min-width: 74px; padding: 10px 14px; border-radius: 10px; font-weight: 800; font-size: 14px; letter-spacing: .5px; background: var(--surface); border: 2px solid; }
+.b-t.dsv { color: var(--dsv); border-color: var(--dsv); }
+.b-t.dpd { color: var(--dpd); border-color: var(--dpd); }
+.b-t.dsv.on { background: var(--dsv); color: #fff; }
+.b-t.dpd.on { background: var(--dpd); color: #fff; }
+button:disabled { opacity: .55; cursor: wait; }
+.lien-revers { font-size: 12px; color: var(--muted); margin-left: auto; text-decoration: none; }
+
+/* Visionneuse */
+.lb { position: fixed; inset: 0; background: rgba(0,0,0,.92); z-index: 20; display: flex; align-items: center; justify-content: center; }
+.lb img { max-width: 100vw; max-height: 100vh; object-fit: contain; }
+.lb button { position: absolute; background: rgba(255,255,255,.15); border: 0; color: #fff; width: 46px; height: 46px; border-radius: 23px; font-size: 22px; }
+.lb .x { top: max(12px, env(safe-area-inset-top)); right: 12px; }
+.lb .g { left: 10px; top: 50%; transform: translateY(-50%); }
+.lb .d { right: 10px; top: 50%; transform: translateY(-50%); }
+.lb .leg { position: absolute; bottom: max(14px, env(safe-area-inset-bottom)); left: 0; right: 0; text-align: center; color: #fff; font-size: 13px; opacity: .85; }
+.toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); background: #222; color: #fff; padding: 9px 14px; border-radius: 10px; font-size: 13px; z-index: 30; max-width: calc(100% - 32px); }
+@media (max-width: 520px) {
+  .h-titre small { display: none; }
+  .b-t { min-width: 0; flex: 1; }
+  .transp { flex: 1 1 100%; }
+}
+</style>
+</head>
+<body>
+
+<div id="login" class="login" hidden>
+  <form class="login-box" id="login-form" autocomplete="off">
+    <div style="font-size:34px">📦</div>
+    <h1>Prépa SAV</h1>
+    <p>Dossiers « envoi pièce » à préparer</p>
+    <input id="code" inputmode="text" maxlength="20" placeholder="CODE" autocapitalize="characters" spellcheck="false">
+    <button type="submit">Entrer</button>
+    <div class="login-err" id="login-err"></div>
+  </form>
+</div>
+
+<div id="app" hidden>
+  <header>
+    <div class="h-ligne">
+      <div class="h-titre">📦 Prépa SAV<small id="h-compte"></small></div>
+      <button class="h-btn" id="b-export" title="Exporter la liste affichée en Excel">⬇ Excel</button>
+      <button class="h-btn" id="b-refresh" title="Rafraîchir">↻</button>
+    </div>
+  </header>
+  <div class="barre">
+    <input id="recherche" type="search" placeholder="Rechercher USV, FLA, réf, EAN, magasin, pièce…" autocomplete="off">
+    <div class="seg" id="filtre">
+      <button data-f="afaire" class="on">À préparer</button>
+      <button data-f="prepares">Préparés</button>
+      <button data-f="tous">Tous</button>
+    </div>
+  </div>
+  <div class="info" id="info"></div>
+  <main id="liste"></main>
+</div>
+
+<div id="lb" class="lb" hidden>
+  <img id="lb-img" alt="">
+  <button class="x" id="lb-x" aria-label="Fermer">✕</button>
+  <button class="g" id="lb-g" aria-label="Précédente">‹</button>
+  <button class="d" id="lb-d" aria-label="Suivante">›</button>
+  <div class="leg" id="lb-leg"></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js" defer></script>
+<script>
+(function () {
+  'use strict';
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const store = {
+    get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+    set(k, v) { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch (e) {} }
+  };
+  let CODE = (store.get('prepaCode') || '').toUpperCase();
+  let ITEMS = [];
+  let FILTRE = store.get('prepaFiltre') || 'afaire';
+  let chargement = false;
+
+  function toast(m, ms) {
+    const t = document.createElement('div');
+    t.className = 'toast'; t.textContent = m;
+    document.body.appendChild(t);
+    setTimeout(() => t.remove(), ms || 2600);
+  }
+
+  async function api(route, corps) {
+    const r = await fetch('/prepa-api/' + route, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-prepa-code': CODE },
+      body: JSON.stringify(corps || {})
+    });
+    let d = {};
+    try { d = await r.json(); } catch (e) {}
+    if (r.status === 401) { deconnecter('Code incorrect ou changé — saisis le nouveau code.'); throw new Error('code'); }
+    if (!r.ok || d.error) throw new Error(d.error || ('Erreur ' + r.status));
+    return d;
+  }
+
+  // ── Connexion ──
+  function deconnecter(msg) {
+    CODE = ''; store.set('prepaCode', null);
+    $('app').hidden = true; $('login').hidden = false;
+    $('login-err').textContent = msg || '';
+    setTimeout(() => $('code').focus(), 50);
+  }
+  $('login-form').addEventListener('submit', async e => {
+    e.preventDefault();
+    CODE = $('code').value.trim().toUpperCase();
+    if (!CODE) return;
+    $('login-err').textContent = '…';
+    try {
+      await charger(true);
+      store.set('prepaCode', CODE);
+      $('login').hidden = true; $('app').hidden = false;
+      $('login-err').textContent = '';
+    } catch (err) { if (err.message !== 'code') $('login-err').textContent = err.message; }
+  });
+
+  // ── Chargement ──
+  async function charger(force) {
+    if (chargement) return;
+    chargement = true;
+    $('b-refresh').disabled = true;
+    try {
+      const d = await api('liste', { force: !!force });
+      ITEMS = d.items || [];
+      rendre();
+      $('info').textContent = 'Mis à jour à ' + new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+    } finally { chargement = false; $('b-refresh').disabled = false; }
+  }
+
+  const fichierUrl = f => '/prepa-api/fichier/' + f.id + '?c=' + encodeURIComponent(CODE);
+  const estImage = f => /^image\//.test(f.media);
+  function age(iso) {
+    const d = new Date(iso + 'T00:00:00');
+    const j = Math.floor((Date.now() - d.getTime()) / 86400000);
+    return isNaN(j) ? null : j;
+  }
+  function correspond(it, q) {
+    if (!q) return true;
+    const h = [it.cnb, it.fla, it.ref, it.ean, it.enseigne, it.ville, it.piece, it.emplacement, it.modele, it.description_panne, it.message_magasin].join(' ').toUpperCase();
+    return q.toUpperCase().split(/\s+/).filter(Boolean).every(m => h.includes(m));
+  }
+  function visibles() {
+    const q = $('recherche').value.trim();
+    return ITEMS.filter(it => (FILTRE === 'tous' || (FILTRE === 'prepares') === !!it.prepare) && correspond(it, q));
+  }
+
+  function carte(it) {
+    const j = age(it.iso);
+    const imgs = it.fichiers.filter(estImage);
+    const docs = it.fichiers.filter(f => !estImage(f));
+    const fla = it.fla ? String(it.fla).replace(/^FLA[\s-]*/i, '') : '';
+    const info = (lib, val, cls) => val ? '<div class="inf ' + (cls || '') + '"><b>' + lib + '</b><div class="copiable" data-copie="' + esc(val) + '">' + esc(val) + '</div></div>' : '';
+    return '<article class="carte' + (it.prepare ? ' prepare' : '') + '" data-cle="' + esc(it.cle) + '">' +
+      '<div class="c-haut"><div class="c-ids">' +
+        '<span class="usv mono copiable" data-copie="' + esc(it.cnb || it.fla) + '">' + esc(it.cnb || ('FLA ' + fla)) + '</span>' +
+        (it.cnb && fla ? '<span class="chip chip-fla mono copiable" data-copie="' + esc(it.fla) + '">FLA ' + esc(fla) + '</span>' : '') +
+        (j != null ? '<span class="chip chip-age' + (j >= 10 ? ' vieux' : '') + '">' + (j === 0 ? "aujourd'hui" : 'J+' + j) + '</span>' : '') +
+      '</div><div class="c-date">Reçu le ' + esc(it.date) + '</div></div>' +
+      '<div class="c-mag">' + esc(it.enseigne) + ' <span>' + esc(it.ville) + '</span></div>' +
+      '<div class="c-infos">' +
+        info('Pièce à envoyer', it.piece, 'piece') +
+        info('Réf', it.ref + (it.couleur && !String(it.ref).toUpperCase().includes(String(it.couleur).toUpperCase()) ? ' · ' + it.couleur : '')) +
+        info('EAN', it.ean) +
+        info('Emplacement', it.emplacement) +
+        (it.modele ? info('Produit', it.modele) : '') +
+      '</div>' +
+      ((it.description_panne || it.message_magasin)
+        ? '<div class="c-pb"><div class="titre">Problème</div>' +
+            (it.description_panne ? '<div class="synth">' + esc(it.description_panne) + '</div>' : '') +
+            (it.message_magasin ? '<blockquote>« ' + esc(it.message_magasin) + ' »</blockquote>' : '') + '</div>'
+        : '') +
+      (imgs.length ? '<div class="galerie">' + imgs.map(f =>
+          '<button data-photo="' + f.id + '" title="' + esc(f.type_doc || f.nom) + '"><img loading="lazy" src="' + fichierUrl(f) + '" alt="">' +
+          (f.type_doc ? '<span class="tag">' + esc(f.type_doc) + '</span>' : '') + '</button>').join('') + '</div>' : '') +
+      (docs.length ? '<div class="docs">' + docs.map(f =>
+          '<a href="' + fichierUrl(f) + '" target="_blank" rel="noopener">🧾 <span>' + esc(f.type_doc ? f.type_doc + ' — ' + f.nom : f.nom) + '</span></a>').join('') + '</div>' : '') +
+      (!it.fichiers.length && !it.avec_donnees ? '<div class="c-manque">📸 Photos et description pas encore récupérées pour ce dossier.</div>' : '') +
+      '<div class="c-actions">' +
+        '<button class="b-prep' + (it.prepare ? ' on' : '') + '" data-act="prep">' + (it.prepare ? '✅ Préparé' : '☐ Marquer préparé') + '</button>' +
+        '<div class="transp">' +
+          '<button class="b-t dsv' + (it.transporteur === 'DSV' ? ' on' : '') + '" data-act="t" data-t="DSV">DSV</button>' +
+          '<button class="b-t dpd' + (it.transporteur === 'DPD' ? ' on' : '') + '" data-act="t" data-t="DPD">DPD</button>' +
+        '</div>' +
+      '</div>' +
+    '</article>';
+  }
+
+  function rendre() {
+    const nbAF = ITEMS.filter(i => !i.prepare).length, nbP = ITEMS.length - nbAF;
+    $('h-compte').textContent = nbAF + ' à préparer · ' + nbP + ' préparé' + (nbP > 1 ? 's' : '');
+    document.querySelectorAll('#filtre button').forEach(b => {
+      b.classList.toggle('on', b.dataset.f === FILTRE);
+      const n = b.dataset.f === 'afaire' ? nbAF : b.dataset.f === 'prepares' ? nbP : ITEMS.length;
+      b.textContent = b.textContent.replace(/\s*\(\d+\)$/, '') + ' (' + n + ')';
+    });
+    const v = visibles();
+    $('liste').innerHTML = v.length ? v.map(carte).join('')
+      : '<div class="vide">' + (ITEMS.length ? 'Aucun dossier ne correspond.' : '🎉 Rien à préparer pour le moment.') + '</div>';
+  }
+
+  // ── Actions sur les cartes ──
+  $('liste').addEventListener('click', async e => {
+    const cp = e.target.closest('.copiable');
+    if (cp && !e.target.closest('button')) {
+      try { await navigator.clipboard.writeText(cp.dataset.copie); toast('Copié : ' + cp.dataset.copie, 1400); } catch (err) {}
+      return;
+    }
+    const ph = e.target.closest('[data-photo]');
+    if (ph) { ouvrirVisionneuse(ph.closest('.carte').dataset.cle, parseInt(ph.dataset.photo, 10)); return; }
+    const b = e.target.closest('button[data-act]');
+    if (!b) return;
+    const cle = b.closest('.carte').dataset.cle;
+    const it = ITEMS.find(x => x.cle === cle);
+    if (!it) return;
+    b.disabled = true;
+    try {
+      if (b.dataset.act === 'prep') {
+        const d = await api('prepare', { cle, ligne: it.ligne, prepare: !it.prepare });
+        it.prepare = d.prepare; it.ligne = d.ligne || it.ligne;
+        toast(it.prepare ? '✅ ' + (it.cnb || it.fla) + ' préparé (« x » posé dans le Sheet)' : '↩︎ Marque « préparé » retirée');
+      } else {
+        const t = it.transporteur === b.dataset.t ? '' : b.dataset.t;
+        const d = await api('transporteur', { cle, cnb: it.cnb, fla: it.fla, transporteur: t });
+        it.transporteur = d.transporteur || '';
+      }
+      rendre();
+    } catch (err) {
+      if (err.message !== 'code') toast('⚠️ ' + err.message, 4500);
+      b.disabled = false;
+    }
+  });
+
+  // ── Visionneuse photos ──
+  let LB = { photos: [], i: 0 };
+  function ouvrirVisionneuse(cle, id) {
+    const it = ITEMS.find(x => x.cle === cle);
+    LB.photos = it.fichiers.filter(estImage);
+    LB.i = Math.max(0, LB.photos.findIndex(f => f.id === id));
+    LB.titre = (it.cnb || it.fla) + ' — ' + it.ref;
+    montrer();
+    $('lb').hidden = false;
+  }
+  function montrer() {
+    const f = LB.photos[LB.i];
+    if (!f) return;
+    $('lb-img').src = fichierUrl(f);
+    $('lb-leg').textContent = LB.titre + ' · ' + (f.type_doc || f.nom || 'photo') + ' · ' + (LB.i + 1) + '/' + LB.photos.length;
+    $('lb-g').hidden = $('lb-d').hidden = LB.photos.length < 2;
+  }
+  const fermerLB = () => { $('lb').hidden = true; $('lb-img').src = ''; };
+  const pas = n => { LB.i = (LB.i + n + LB.photos.length) % LB.photos.length; montrer(); };
+  $('lb-x').onclick = fermerLB;
+  $('lb-g').onclick = () => pas(-1);
+  $('lb-d').onclick = () => pas(1);
+  $('lb').addEventListener('click', e => { if (e.target.id === 'lb') fermerLB(); });
+  document.addEventListener('keydown', e => {
+    if ($('lb').hidden) return;
+    if (e.key === 'Escape') fermerLB();
+    if (e.key === 'ArrowLeft') pas(-1);
+    if (e.key === 'ArrowRight') pas(1);
+  });
+  let tx = null;
+  $('lb').addEventListener('touchstart', e => { tx = e.touches[0].clientX; }, { passive: true });
+  $('lb').addEventListener('touchend', e => { if (tx == null) return; const dx = e.changedTouches[0].clientX - tx; if (Math.abs(dx) > 50) pas(dx < 0 ? 1 : -1); tx = null; });
+
+  // ── Filtres / recherche / rafraîchissement ──
+  $('filtre').addEventListener('click', e => {
+    const b = e.target.closest('button[data-f]');
+    if (!b) return;
+    FILTRE = b.dataset.f; store.set('prepaFiltre', FILTRE); rendre();
+  });
+  let tRech = null;
+  $('recherche').addEventListener('input', () => { clearTimeout(tRech); tRech = setTimeout(rendre, 120); });
+  $('b-refresh').onclick = () => charger(true).catch(err => { if (err.message !== 'code') toast('⚠️ ' + err.message, 4500); });
+  setInterval(() => { if (CODE && !document.hidden && $('lb').hidden) charger(false).catch(() => {}); }, 120000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden && CODE) charger(false).catch(() => {}); });
+
+  // ── Export Excel (liste affichée) ──
+  $('b-export').onclick = () => {
+    const X = window.XLSX;
+    if (!X) { toast('⚠️ Module Excel pas encore chargé — réessaie dans 2 secondes.'); return; }
+    const v = visibles();
+    if (!v.length) { toast('Rien à exporter avec ce filtre.'); return; }
+    const ent = ['DATE RÉCEPTION', 'USV', 'FLA', 'MAGASIN', 'RÉF', 'EAN', 'PIÈCE', 'EMPLACEMENT', 'PROBLÈME', 'MESSAGE MAGASIN', 'TRANSPORTEUR', 'PRÉPARÉ', 'PHOTOS'];
+    const lignes = v.map(it => [it.date, it.cnb, it.fla, (it.enseigne + ' ' + it.ville).trim(), it.ref, it.ean, it.piece, it.emplacement,
+      it.description_panne, it.message_magasin, it.transporteur, it.prepare ? 'OUI' : '', it.fichiers.filter(estImage).length || '']);
+    const ws = X.utils.aoa_to_sheet([ent].concat(lignes));
+    const bord = { style: 'thin', color: { rgb: 'C9CFD6' } };
+    const B = { top: bord, bottom: bord, left: bord, right: bord };
+    const largeurs = [12, 17, 15, 26, 18, 15, 22, 16, 34, 44, 12, 10, 8];
+    ws['!cols'] = largeurs.map(w => ({ wch: w }));
+    ws['!autofilter'] = { ref: 'A1:' + X.utils.encode_col(ent.length - 1) + (lignes.length + 1) };
+    ws['!rows'] = [{ hpt: 22 }];
+    for (let c = 0; c < ent.length; c++) {
+      const a = X.utils.encode_cell({ r: 0, c });
+      ws[a].s = { font: { bold: true, color: { rgb: 'FFFFFF' } }, fill: { fgColor: { rgb: '1F3864' } }, alignment: { vertical: 'center', horizontal: 'center', wrapText: true }, border: B };
+    }
+    lignes.forEach((l, i) => {
+      for (let c = 0; c < ent.length; c++) {
+        const a = X.utils.encode_cell({ r: i + 1, c });
+        if (!ws[a]) ws[a] = { t: 's', v: '' };
+        const s = { font: { color: { rgb: '1B2330' } }, alignment: { vertical: 'top', wrapText: c === 8 || c === 9 || c === 6 }, border: B, fill: { fgColor: { rgb: i % 2 ? 'F7F9FC' : 'FFFFFF' } } };
+        if (c === 1 || c === 2) s.font = { name: 'Consolas', bold: true, color: { rgb: '1A5FA8' } };
+        if (c === 6) s.font = { bold: true, color: { rgb: 'B7791F' } };
+        if (c === 10 && l[10]) s.font = { bold: true, color: { rgb: l[10] === 'DSV' ? '1A56C4' : 'D0191F' } };
+        if (c === 11 && l[11]) { s.fill = { fgColor: { rgb: 'E8F5E9' } }; s.font = { bold: true, color: { rgb: '1A9E4A' } }; s.alignment.horizontal = 'center'; }
+        if (c === 12) s.alignment.horizontal = 'center';
+        ws[a].s = s;
+      }
+    });
+    const wb = X.utils.book_new();
+    X.utils.book_append_sheet(wb, ws, 'Prépa SAV');
+    const j = new Date();
+    const nom = 'prepa-sav-' + j.getFullYear() + '-' + String(j.getMonth() + 1).padStart(2, '0') + '-' + String(j.getDate()).padStart(2, '0') + '.xlsx';
+    X.writeFile(wb, nom);
+    toast('⬇ ' + v.length + ' dossier(s) exporté(s)');
+  };
+
+  // ── Démarrage ──
+  if (CODE) {
+    $('app').hidden = false;
+    charger(true).catch(err => { if (err.message !== 'code') { $('info').textContent = '⚠️ ' + err.message; } });
+  } else deconnecter();
+})();
+</script>
+</body>
+</html>
