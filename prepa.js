@@ -7,8 +7,6 @@
 // Règles Sheet SYSTEME U : A date récep · B date expé (« x » = préparé) · C réf · D pièce
 //                         E enseigne · F dépt+ville · G emplacement puis tracking · H USV · I FLA
 'use strict';
-const fs = require('fs');
-const path = require('path');
 const crypto = require('crypto');
 
 let D = null;     // dépendances injectées par server.js
@@ -246,11 +244,7 @@ function lireCorps(req, max) {
   });
 }
 
-let pageCache = null;
-function page() {
-  if (!pageCache || process.env.PREPA_DEV) pageCache = fs.readFileSync(path.join(__dirname, 'prepa.html'), 'utf8');
-  return pageCache;
-}
+const APP_ENTREPOT = 'https://drsly78.github.io/flaudis-notices/notices-app.html#prepa';
 
 // Retrouve la ligne Sheet d'un dossier et vérifie qu'elle n'a pas bougé
 async function ligneVerifiee(cle, ligneAnnoncee) {
@@ -267,8 +261,9 @@ async function handleApp(req, res) {
   if (!(u === '/prepa' || u === '/prepa/' || u.startsWith('/prepa?') || u.startsWith('/prepa-api/'))) return false;
   try {
     if (!u.startsWith('/prepa-api/')) {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', 'X-Robots-Tag': 'noindex' });
-      res.end(page());
+      // L'app vit désormais dans l'app Entrepôt (section 📦 Prépa SAV), à côté des notices
+      res.writeHead(302, { Location: APP_ENTREPOT, 'Cache-Control': 'no-cache' });
+      res.end();
       return true;
     }
     if (!D || !D.pool) { json(res, 503, { error: 'Base de données indisponible' }); return true; }
