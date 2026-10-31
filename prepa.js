@@ -435,7 +435,8 @@ async function handleExt(req, res, p) {
     // Aperçu LECTURE SEULE d'un onglet du Sheet (entêtes + premières lignes)
     if (u === '/prepa-ext/apercu-onglet') {
       const nom = String(p.onglet || '').replace(/'/g, "''");
-      const rows = await D.lireSheet("'" + nom + "'!A1:Z" + Math.min(parseInt(p.lignes, 10) || 12, 60));
+      const plage = /^[A-Z]{1,2}\d{1,6}:[A-Z]{1,2}\d{1,6}$/.test(String(p.plage || '')) ? p.plage : 'A1:Z' + Math.min(parseInt(p.lignes, 10) || 12, 60);
+      const rows = await D.lireSheet("'" + nom + "'!" + plage);
       json(res, 200, { ok: true, rows });
       return;
     }
