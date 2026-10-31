@@ -432,6 +432,14 @@ async function handleExt(req, res, p) {
       return;
     }
 
+    // Aperçu LECTURE SEULE d'un onglet du Sheet (entêtes + premières lignes)
+    if (u === '/prepa-ext/apercu-onglet') {
+      const nom = String(p.onglet || '').replace(/'/g, "''");
+      const rows = await D.lireSheet("'" + nom + "'!A1:Z" + Math.min(parseInt(p.lignes, 10) || 12, 60));
+      json(res, 200, { ok: true, rows });
+      return;
+    }
+
     if (u === '/prepa-ext/save') {
       const cnb = String(p.cnb || '').trim(), fla = String(p.fla || '').trim();
       const cle = cleDe(cnb, fla);
