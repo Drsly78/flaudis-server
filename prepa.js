@@ -37,6 +37,7 @@ async function initDB() {
     await q(`CREATE UNIQUE INDEX IF NOT EXISTS prepa_fichiers_uniq ON prepa_fichiers (cle, empreinte)`);
     await q(`CREATE INDEX IF NOT EXISTS prepa_fichiers_cle ON prepa_fichiers (cle)`);
     await q(`CREATE TABLE IF NOT EXISTS app_meta (cle TEXT PRIMARY KEY, valeur TEXT)`);
+    await q(`ALTER TABLE prepa_dossiers ADD COLUMN IF NOT EXISTS colis INT`);
   })();
   try { await pret; } catch (e) { pret = null; throw e; }
 }
@@ -54,6 +55,31 @@ function isoDe(v) {
   return null;
 }
 const estTracking = v => /^\d{8,}$/.test(String(v || '').replace(/\s/g, ''));
+// Texte magasin : on retire les automatismes du formulaire Revers.io
+// (« Pour traiter votre SAV, merci de… : true », cases cochées « …: true/false »)
+function nettoyerMessage(t) {
+  return String(t == null ? '' : t)
+    .replace(/\r/g, '')
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => l && !/^null$/i.test(l))
+    .filter(l => !/pour traiter votre sav/i.test(l))
+    .filter(l => !/:\s*(true|false|vrai|faux|oui|non)\s*$/i.test(l))
+    .map(l => l
+      .replace(/^description d[ée]taill[ée]e du probl[èe]me\s*\/?\s*(informations pour le fournisseur)?\s*:\s*/i, '')
+      .replace(/^informations pour le fournisseur\s*:\s*/i, '')
+      .replace(/^label de la pi[èe]ce identifi[ée]e\s*:\s*/i, 'Pièce signalée : '))
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+}
+// « 44 NANTES » → 44 ; Corse 2A/2B → 20 ; inconnu → tout à la fin
+function deptDe(ville) {
+  const m = String(ville || '').trim().match(/^(2A|2B|\d{2,3})\b/i);
+  if (!m) return 999;
+  return /^2[AB]$/i.test(m[1]) ? 20 : parseInt(m[1], 10);
+}
+const sansAccent = v => String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().trim();
 const json = (res, code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); };
 
 // ── Code préparateurs (stocké en base, changeable depuis l'extension) ──
@@ -167,15 +193,20 @@ async function construireListe(force) {
       cnb: a.cnb, fla: a.fla, enseigne: a.enseigne, ville: a.ville,
       ref: a.ref, piece: a.piece, emplacement: a.emplacement, prepare: a.prepare,
       transporteur: (d && d.transporteur) || '',
+      colis: (a.prepare && d && d.colis) || null,
+      dept: deptDe(a.ville),
       ean: (d && d.ean) || eanDeRef(eans, a.ref),
       modele: (d && d.modele) || '', couleur: (d && d.couleur) || '',
       description_panne: (d && d.description_panne) || '',
-      message_magasin: (d && d.message_magasin) || '',
+      message_magasin: nettoyerMessage(d && d.message_magasin),
       revers_url: (d && d.revers_url) || urls[N(sansBis(a.cnb))] || urls[N(sansBis(a.fla))] || '',
       avec_donnees: !!(d && (d.description_panne || d.message_magasin || d.ean)),
       fichiers
     };
-  }).sort((x, y) => (x.iso < y.iso ? -1 : x.iso > y.iso ? 1 : x.ligne - y.ligne));
+  }).sort((x, y) => (x.dept - y.dept)
+    || sansAccent(x.ville).localeCompare(sansAccent(y.ville))
+    || sansAccent(x.enseigne).localeCompare(sansAccent(y.enseigne))
+    || (x.iso < y.iso ? -1 : x.iso > y.iso ? 1 : x.ligne - y.ligne));
 
   // Ménage : marquer les expédiés, purger les vieux (jamais si le Sheet n'a pas été lu)
   try {
@@ -266,22 +297,70 @@ async function handleApp(req, res) {
       return true;
     }
 
-    // ✅ Préparé = « x » en colonne B du Sheet (la convention du bordereau de tracking)
-    if (u.startsWith('/prepa-api/prepare')) {
+    // ✅ Préparer un ou plusieurs dossiers dans UN colis — transporteur obligatoire.
+    // Préparé = « x » en colonne B du Sheet (convention du bordereau de tracking).
+    if (u.startsWith('/prepa-api/preparer')) {
+      const cles = [...new Set((Array.isArray(p.cles) ? p.cles : []).map(N).filter(Boolean))];
+      if (!cles.length) { json(res, 400, { error: 'Aucun dossier sélectionné.' }); return true; }
+      let transp = N(p.transporteur);
+      let colis = null;
+      if (p.colis && p.colis !== 'nouveau') {
+        colis = parseInt(p.colis, 10);
+        const ex = await D.pool.query('SELECT transporteur FROM prepa_dossiers WHERE colis = $1 AND prepare_le IS NOT NULL AND expedie_le IS NULL LIMIT 1', [colis]);
+        if (!ex.rows.length) { json(res, 409, { error: 'Le colis ' + colis + ' n\u2019existe plus (expédié ou défait) — rafraîchis.' }); return true; }
+        transp = N(ex.rows[0].transporteur) || transp;
+      }
+      if (transp !== 'DSV' && transp !== 'DPD') { json(res, 400, { error: 'Choisis le transporteur (DSV ou DPD) avant de valider.' }); return true; }
+      // Vérifications AVANT toute écriture : tout passe ou rien ne bouge
+      const lignes = p.lignes || {};
+      const plan = [];
+      for (const cle of cles) {
+        const v = await ligneVerifiee(cle, parseInt(lignes[cle], 10) || 0);
+        if (!v) { json(res, 404, { error: cle + ' introuvable dans SYSTEME U (ligne déplacée ou supprimée ?) — rafraîchis.' }); return true; }
+        const b = String(v.r[1] || '').trim();
+        if (isoDe(b)) { json(res, 409, { error: cle + ' est déjà marqué expédié dans le Sheet.' }); return true; }
+        if (b && !/^x$/i.test(b)) { json(res, 409, { error: cle + ' : la colonne B contient « ' + b + ' » — je ne l\u2019écrase pas. Corrige-la dans le Sheet.' }); return true; }
+        plan.push({ cle, v, b });
+      }
+      if (!colis) {
+        const r = await D.pool.query(
+          `INSERT INTO app_meta (cle, valeur) VALUES ('prepa_colis_seq', '1')
+           ON CONFLICT (cle) DO UPDATE SET valeur = (CAST(app_meta.valeur AS INT) + 1)::TEXT RETURNING valeur`);
+        colis = parseInt(r.rows[0].valeur, 10);
+      }
+      const aEcrire = plan.filter(x => !/^x$/i.test(x.b)).map(x => ["'SYSTEME U'!B" + x.v.ligne, 'x']);
+      if (aEcrire.length) await D.ecrireCellules(aEcrire);
+      cacheSheet.t = 0;
+      for (const x of plan) {
+        await D.pool.query(
+          `INSERT INTO prepa_dossiers (cle, cnb, fla, prepare_le, transporteur, colis, maj) VALUES ($1,$2,$3,NOW(),$4,$5,NOW())
+           ON CONFLICT (cle) DO UPDATE SET prepare_le = NOW(), transporteur = $4, colis = $5, expedie_le = NULL`,
+          [x.cle, String(x.v.r[7] || '').trim(), String(x.v.r[8] || '').trim(), transp, colis]);
+      }
+      json(res, 200, { ok: true, colis, transporteur: transp, cles: plan.map(x => x.cle) });
+      return true;
+    }
+
+    // ↩︎ Retirer « préparé » d'un dossier (il sort de son colis)
+    if (u.startsWith('/prepa-api/annuler')) {
       const cle = N(p.cle);
       const v = await ligneVerifiee(cle, parseInt(p.ligne, 10) || 0);
-      if (!v) { json(res, 404, { error: 'Dossier introuvable dans SYSTEME U (ligne déplacée ou supprimée ?) — rafraîchis.' }); return true; }
+      if (!v) { json(res, 404, { error: 'Dossier introuvable dans SYSTEME U — rafraîchis.' }); return true; }
       const b = String(v.r[1] || '').trim();
-      if (isoDe(b)) { json(res, 409, { error: 'Ce dossier est déjà marqué expédié dans le Sheet.' }); return true; }
-      if (b && !/^x$/i.test(b)) { json(res, 409, { error: 'La colonne B contient « ' + b + ' » — je ne l’écrase pas. Corrige-la dans le Sheet.' }); return true; }
-      const voulu = !!p.prepare;
-      if (voulu !== /^x$/i.test(b)) await D.ecrireCellule("'SYSTEME U'!B" + v.ligne, voulu ? 'x' : '');
+      if (isoDe(b)) { json(res, 409, { error: 'Déjà expédié dans le Sheet — rien à annuler.' }); return true; }
+      if (/^x$/i.test(b)) await D.ecrireCellules([["'SYSTEME U'!B" + v.ligne, '']]);
       cacheSheet.t = 0;
-      await D.pool.query(
-        `INSERT INTO prepa_dossiers (cle, cnb, fla, prepare_le) VALUES ($1,$2,$3,$4)
-         ON CONFLICT (cle) DO UPDATE SET prepare_le = $4`,
-        [cle, String(v.r[7] || '').trim(), String(v.r[8] || '').trim(), voulu ? new Date() : null]);
-      json(res, 200, { ok: true, prepare: voulu, ligne: v.ligne });
+      await D.pool.query('UPDATE prepa_dossiers SET prepare_le = NULL, colis = NULL WHERE cle = $1', [cle]);
+      json(res, 200, { ok: true });
+      return true;
+    }
+
+    // 🚚 Changer le transporteur d'un colis entier
+    if (u.startsWith('/prepa-api/colis-transporteur')) {
+      const t = N(p.transporteur);
+      if (t !== 'DSV' && t !== 'DPD') { json(res, 400, { error: 'transporteur inconnu' }); return true; }
+      const r = await D.pool.query('UPDATE prepa_dossiers SET transporteur = $1 WHERE colis = $2 AND prepare_le IS NOT NULL', [t, parseInt(p.colis, 10)]);
+      json(res, 200, { ok: true, transporteur: t, n: r.rowCount });
       return true;
     }
 
@@ -321,7 +400,8 @@ async function extraireTextes(textes) {
 ${t}
 
 Extrais en JSON strict, sans texte autour :
-{"ean":"code EAN 13 chiffres ou null","modele":"nom du produit ou null","couleur":"couleur si écrite, sinon null","description_panne":"synthèse du problème en 15 mots max, sans invention","message_magasin":"texte EXACT du commentaire écrit par le magasin, recopié tel quel, ou null"}` }] }]
+{"ean":"code EAN 13 chiffres ou null","modele":"nom du produit ou null","couleur":"couleur si écrite, sinon null","description_panne":"synthèse du problème en 15 mots max, sans invention","message_magasin":"texte EXACT du commentaire écrit par le magasin, recopié tel quel, ou null"}
+IGNORE les mentions automatiques du formulaire (ex : « Pour traiter votre SAV, merci de nous envoyer et entourer sur la notice… : true », toute ligne finissant par « : true » ou « : false ») : ce ne sont pas des commentaires du magasin.` }] }]
   });
   const raw = (ai.content || []).map(b => b.text || '').join('');
   const p = D.parseJsonModel ? D.parseJsonModel(raw) : null;
@@ -361,7 +441,7 @@ async function handleExt(req, res, p) {
       }
       const s = x => (x == null ? '' : String(x).trim()).replace(/^null$/i, '');
       const champs = ['ean', 'modele', 'couleur', 'description_panne', 'message_magasin', 'revers_url'];
-      const vals = [cle, cnb, fla, s(v.ean), s(v.modele), s(v.couleur), s(v.description_panne), s(v.message_magasin), s(p.revers_url), source];
+      const vals = [cle, cnb, fla, s(v.ean), s(v.modele), s(v.couleur), s(v.description_panne), nettoyerMessage(v.message_magasin), s(p.revers_url), source];
       // Scan = données fraîches qui priment ; rattrapage = ne comble que les trous
       const maj = champs.map(c => source === 'scan'
         ? `${c} = COALESCE(NULLIF(EXCLUDED.${c}, ''), prepa_dossiers.${c})`
@@ -414,4 +494,4 @@ async function handleExt(req, res, p) {
   }
 }
 
-module.exports = { init, handleApp, handleExt, _test: { analyser, isoDe, cleDe, eanDeRef, reset: () => { cacheSheet = { t: 0, rows: null }; cacheCode = { t: 0, v: null }; cacheEan = { t: 0, parRef: null }; pret = null; } } };
+module.exports = { init, handleApp, handleExt, _test: { analyser, isoDe, cleDe, eanDeRef, nettoyerMessage, deptDe, reset: () => { cacheSheet = { t: 0, rows: null }; cacheCode = { t: 0, v: null }; cacheEan = { t: 0, parRef: null }; pret = null; } } };

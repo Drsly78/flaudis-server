@@ -4778,6 +4778,15 @@ prepa.init({
     if (r.error) throw new Error(r.error.message || 'lecture Sheet');
     return r.values || [];
   },
+  ecrireCellules: async (liste) => {   // [[range, valeur], …] en une seule requête
+    const token = await getSheetsToken();
+    const r = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchUpdate`, {
+      method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ valueInputOption: 'RAW', data: liste.map(([range, v]) => ({ range, values: [[v]] })) })
+    }).then(x => x.json());
+    if (r.error) throw new Error(r.error.message || 'écriture Sheet');
+    return r;
+  },
   ecrireCellule: async (range, valeur) => {
     const token = await getSheetsToken();
     const r = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent(range)}?valueInputOption=RAW`, {
