@@ -38,6 +38,9 @@ async function initDB() {
     await q(`CREATE INDEX IF NOT EXISTS prepa_fichiers_cle ON prepa_fichiers (cle)`);
     await q(`CREATE TABLE IF NOT EXISTS app_meta (cle TEXT PRIMARY KEY, valeur TEXT)`);
     await q(`ALTER TABLE prepa_dossiers ADD COLUMN IF NOT EXISTS colis INT`);
+    await q(`ALTER TABLE prepa_dossiers ADD COLUMN IF NOT EXISTS texte_demande TEXT`);
+    await q(`ALTER TABLE prepa_dossiers ADD COLUMN IF NOT EXISTS texte_brut TEXT`);
+    await q(`ALTER TABLE prepa_dossiers ADD COLUMN IF NOT EXISTS texte_le TIMESTAMPTZ`);
   })();
   try { await pret; } catch (e) { pret = null; throw e; }
 }
@@ -199,6 +202,8 @@ async function construireListe(force) {
       modele: (d && d.modele) || '', couleur: (d && d.couleur) || '',
       description_panne: (d && d.description_panne) || '',
       message_magasin: nettoyerMessage(d && d.message_magasin),
+      texte_demande: nettoyerMessage(d && d.texte_demande),
+      prepare_le: (a.prepare && d && d.prepare_le) ? new Date(d.prepare_le).toISOString() : null,
       revers_url: (d && d.revers_url) || urls[N(sansBis(a.cnb))] || urls[N(sansBis(a.fla))] || '',
       avec_donnees: !!(d && (d.description_panne || d.message_magasin || d.ean)),
       fichiers
@@ -390,17 +395,17 @@ async function handleApp(req, res) {
 // ── Extraction IA légère pour le rattrapage (dossiers validés avant l'app) ──
 async function extraireTextes(textes) {
   if (!D.callAnthropic) return {};
-  const t = String(textes || '').slice(0, 9000);
+  const t = String(textes || '').slice(0, 12000);
   if (t.length < 40) return {};
   const ai = await D.callAnthropic({
-    model: D.MODEL_LIGHT, max_tokens: 700,
-    messages: [{ role: 'user', content: [{ type: 'text', text:
+    model: D.MODEL_LIGHT,
+    max_tokens: 1800, messages: [{ role: 'user', content: [{ type: 'text', text:
 `Voici le texte brut des pages « résumé » et « produit » d'un dossier SAV Revers.io (produit défectueux signalé par un magasin Système U).
 
 ${t}
 
 Extrais en JSON strict, sans texte autour :
-{"ean":"code EAN 13 chiffres ou null","modele":"nom du produit ou null","couleur":"couleur si écrite, sinon null","description_panne":"synthèse du problème en 15 mots max, sans invention","message_magasin":"texte EXACT du commentaire écrit par le magasin, recopié tel quel, ou null"}
+{"ean":"code EAN 13 chiffres ou null","modele":"nom du produit ou null","couleur":"couleur si écrite, sinon null","description_panne":"synthèse du problème en 15 mots max, sans invention","message_magasin":"texte EXACT du commentaire écrit par le magasin, recopié tel quel, ou null","demande_complete":"TOUT le contenu de la section commentaire / description de la demande du magasin, recopié MOT POUR MOT, avec chaque champ sur sa ligne (libellé : valeur), sans résumer, sans reformuler, sans rien ajouter ; null si la section est absente"}
 IGNORE les mentions automatiques du formulaire (ex : « Pour traiter votre SAV, merci de nous envoyer et entourer sur la notice… : true », toute ligne finissant par « : true » ou « : false ») : ce ne sont pas des commentaires du magasin.` }] }]
   });
   const raw = (ai.content || []).map(b => b.text || '').join('');
@@ -434,23 +439,29 @@ async function handleExt(req, res, p) {
       const source = p.source === 'rattrapage' ? 'rattrapage' : 'scan';
       const v = {
         ean: p.ean, modele: p.modele, couleur: p.couleur,
-        description_panne: p.description_panne, message_magasin: p.message_magasin
+        description_panne: p.description_panne, message_magasin: p.message_magasin, texte_demande: p.texte_demande
       };
-      if (p.textes && !v.message_magasin && !v.description_panne) {
-        try { Object.assign(v, Object.fromEntries(Object.entries(await extraireTextes(p.textes)).filter(([, x]) => x))); } catch (e) { console.warn('Prépa extraction :', e.message); }
+      if (p.textes) {
+        try {
+          const ex = await extraireTextes(p.textes);
+          ['ean', 'modele', 'couleur', 'description_panne', 'message_magasin'].forEach(k => { if (!v[k] && ex[k]) v[k] = ex[k]; });
+          if (ex.demande_complete) v.texte_demande = ex.demande_complete;
+        } catch (e) { console.warn('Prépa extraction :', e.message); }
       }
       const s = x => (x == null ? '' : String(x).trim()).replace(/^null$/i, '');
-      const champs = ['ean', 'modele', 'couleur', 'description_panne', 'message_magasin', 'revers_url'];
-      const vals = [cle, cnb, fla, s(v.ean), s(v.modele), s(v.couleur), s(v.description_panne), nettoyerMessage(v.message_magasin), s(p.revers_url), source];
+      const champs = ['ean', 'modele', 'couleur', 'description_panne', 'message_magasin', 'revers_url', 'texte_demande'];
+      const brut = p.textes ? String(p.textes).slice(0, 15000) : '';
+      const vals = [cle, cnb, fla, s(v.ean), s(v.modele), s(v.couleur), s(v.description_panne), nettoyerMessage(v.message_magasin), s(p.revers_url), source, nettoyerMessage(v.texte_demande), brut];
       // Scan = données fraîches qui priment ; rattrapage = ne comble que les trous
       const maj = champs.map(c => source === 'scan'
         ? `${c} = COALESCE(NULLIF(EXCLUDED.${c}, ''), prepa_dossiers.${c})`
         : `${c} = COALESCE(NULLIF(prepa_dossiers.${c}, ''), EXCLUDED.${c})`).join(', ');
       await D.pool.query(
-        `INSERT INTO prepa_dossiers (cle, cnb, fla, ean, modele, couleur, description_panne, message_magasin, revers_url, source, maj, rattrapage_le)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW(), ${source === 'rattrapage' ? 'NOW()' : 'NULL'})
+        `INSERT INTO prepa_dossiers (cle, cnb, fla, ean, modele, couleur, description_panne, message_magasin, revers_url, source, texte_demande, texte_brut, texte_le, maj, rattrapage_le)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NULLIF($12,''), ${brut ? 'NOW()' : 'NULL'}, NOW(), ${source === 'rattrapage' ? 'NOW()' : 'NULL'})
          ON CONFLICT (cle) DO UPDATE SET cnb = COALESCE(NULLIF(EXCLUDED.cnb,''), prepa_dossiers.cnb), fla = COALESCE(NULLIF(EXCLUDED.fla,''), prepa_dossiers.fla),
-           ${maj}, source = CASE WHEN prepa_dossiers.source = 'scan' THEN 'scan' ELSE EXCLUDED.source END, maj = NOW(), expedie_le = NULL
+           ${maj}, texte_brut = COALESCE(NULLIF(EXCLUDED.texte_brut, ''), prepa_dossiers.texte_brut),
+           texte_le = COALESCE(EXCLUDED.texte_le, prepa_dossiers.texte_le), source = CASE WHEN prepa_dossiers.source = 'scan' THEN 'scan' ELSE EXCLUDED.source END, maj = NOW(), expedie_le = NULL
            ${source === 'rattrapage' ? ', rattrapage_le = NOW()' : ''}`, vals);
       json(res, 200, { ok: true, cle });
       return;
@@ -476,12 +487,17 @@ async function handleExt(req, res, p) {
     // Dossiers en attente sans pièces jointes → à compléter par l'extension
     if (u === '/prepa-ext/manquants') {
       const items = await construireListe(true);
-      const tentes = new Set((await D.pool.query('SELECT cle FROM prepa_dossiers WHERE rattrapage_le IS NOT NULL')).rows.map(x => x.cle));
+      const etat = {};
+      (await D.pool.query('SELECT cle, rattrapage_le, texte_le FROM prepa_dossiers')).rows.forEach(x => { etat[x.cle] = x; });
       const cibles = [], sansUrl = [];
       items.forEach(it => {
-        if (it.fichiers.length || (!p.forcer && tentes.has(it.cle))) return;
-        if (it.revers_url) cibles.push({ cle: it.cle, cnb: it.cnb, fla: it.fla, ref: it.ref, revers_url: it.revers_url });
-        else sansUrl.push(it.cnb || it.fla);
+        const e = etat[it.cle] || {};
+        let mode = null;
+        if (!it.fichiers.length && (p.forcer || !e.rattrapage_le)) mode = 'complet';
+        else if (!e.texte_le) mode = 'textes';      // photos déjà là, description complète jamais importée
+        if (!mode) return;
+        if (it.revers_url) cibles.push({ cle: it.cle, cnb: it.cnb, fla: it.fla, ref: it.ref, revers_url: it.revers_url, mode });
+        else if (mode === 'complet') sansUrl.push(it.cnb || it.fla);
       });
       json(res, 200, { ok: true, cibles, sans_url: sansUrl });
       return;

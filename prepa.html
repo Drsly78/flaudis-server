@@ -124,6 +124,7 @@ main { max-width: 1040px; margin: 0 auto; padding: 6px 16px 60px; }
 .photos .sans { height: 88px; width: 118px; border: 1.5px dashed var(--line2); border-radius: 9px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; color: var(--faint); font-size: 11.5px; font-weight: 600; flex: 0 0 auto; }
 .photos .sans i { font-style: normal; font-size: 20px; opacity: .6; }
 details.tiroir { margin: 10px 14px 0; border-top: 1px dashed var(--line2); }
+details.tiroir.t2 { margin-top: 0; border-top: 0; }
 details.tiroir summary { list-style: none; cursor: pointer; padding: 8px 0 2px; color: var(--muted); font-size: 12.5px; font-weight: 600; user-select: none; }
 details.tiroir summary::-webkit-details-marker { display: none; }
 details.tiroir summary::before { content: "▸"; display: inline-block; width: 14px; transition: transform .15s; }
@@ -171,6 +172,17 @@ button:disabled { opacity: .5; cursor: wait; }
 .transp-choix.manque button { animation: secoue .35s; }
 @keyframes secoue { 25% { transform: translateX(-4px); } 75% { transform: translateX(4px); } }
 .f-aide { font-size: 12.5px; color: var(--muted); margin-top: 6px; }
+.f-alerte { background: var(--piece-bg); border: 1px solid var(--piece-line); border-radius: 13px; padding: 12px 12px 6px; }
+.f-alerte h3 { color: var(--piece); }
+.f-alerte .f-ligne { background: var(--surface); }
+#f-colis .q > b { font-family: inherit; font-size: 13.5px; }
+.f-colis-usv { margin-top: 5px; display: grid; gap: 2px; }
+.f-colis-usv span { font-size: 12px; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.f-colis-usv b { font-family: var(--mono); font-size: 12px; }
+.f-colis-usv em { font-style: normal; color: var(--piece); font-weight: 700; }
+.g-badge.attente { color: var(--piece); background: var(--piece-bg); }
+.demande { white-space: pre-wrap; font-size: 13px; line-height: 1.5; padding: 4px 0 4px 14px; color: var(--ink); }
+.demande.vide { color: var(--faint); }
 .f-aide.err { color: var(--warn); font-weight: 600; }
 .f-pied { padding: 12px 20px 16px; border-top: 1px solid var(--line); display: flex; gap: 10px; justify-content: flex-end; padding-bottom: max(16px, env(safe-area-inset-bottom)); }
 .f-pied .annul { padding: 11px 16px; border-radius: 11px; border: 1px solid var(--line2); background: var(--surface); font-weight: 600; }
@@ -241,14 +253,15 @@ button:disabled { opacity: .5; cursor: wait; }
       <div><h2 id="f-titre">Préparer un colis</h2><p id="f-mag"></p></div>
     </div>
     <div class="f-corps">
+      <div class="f-sec f-alerte" id="f-sec-colis" hidden>
+        <h3>⚠️ Un envoi attend déjà pour ce magasin <small>— choisis</small></h3>
+        <div id="f-colis"></div>
+        <div class="f-aide" id="f-aide-colis"></div>
+      </div>
       <div class="f-sec">
-        <h3>Dossiers dans ce colis <small id="f-nb"></small></h3>
+        <h3>Dossiers à ajouter <small id="f-nb"></small></h3>
         <div id="f-dossiers"></div>
         <div class="f-aide" id="f-aide-dossiers"></div>
-      </div>
-      <div class="f-sec" id="f-sec-colis" hidden>
-        <h3>Colis</h3>
-        <div id="f-colis"></div>
       </div>
       <div class="f-sec">
         <h3>Transporteur <small>— obligatoire</small></h3>
@@ -393,7 +406,10 @@ button:disabled { opacity: .5; cursor: wait; }
           '<button data-photo="' + f.id + '" title="' + esc(f.type_doc || f.nom) + '"><img loading="lazy" src="' + fichierUrl(f) + '" alt="">' +
           (f.type_doc ? '<span class="tag">' + esc(f.type_doc) + '</span>' : '') + '</button>').join('')
         : '<span class="sans"><i>📷</i>Aucune photo</span>') + '</div>' +
-      '<details class="tiroir"><summary>Détails · EAN, produit' + (docs.length ? ', ' + docs.length + ' document' + (docs.length > 1 ? 's' : '') : '') + '</summary>' +
+      '<details class="tiroir"><summary>Description de la demande</summary>' +
+        '<div class="demande' + (it.texte_demande ? '' : ' vide') + '">' + (it.texte_demande ? esc(it.texte_demande) : (it.avec_donnees || it.fichiers.length ? 'Pas encore importée — ⚙️ › 📸 Compléter la prépa dans l\u2019extension.' : '—')) + '</div>' +
+      '</details>' +
+      '<details class="tiroir t2"><summary>Détails · EAN, produit' + (docs.length ? ', ' + docs.length + ' document' + (docs.length > 1 ? 's' : '') : '') + '</summary>' +
         '<div class="t-grille">' + detail('EAN', it.ean) + detail('Produit', it.modele) + detail('Couleur', it.couleur) + '</div>' +
         (docs.length ? '<div class="docs">' + docs.map(f => '<a href="' + fichierUrl(f) + '" target="_blank" rel="noopener">🧾 <span>' + esc(f.type_doc ? f.type_doc + ' — ' + f.nom : f.nom) + '</span></a>').join('') + '</div>' : '') +
       '</details>' +
@@ -450,9 +466,11 @@ button:disabled { opacity: .5; cursor: wait; }
       grouper(v, magKey).forEach(g => {
         const a = g.items[0];
         const aFaire = g.items.filter(i => !i.prepare).length;
+        const ouverts = [...new Set(ITEMS.filter(i => magKey(i) === g.k && i.prepare && i.colis).map(i => i.colis))];
         html += '<section class="groupe"><div class="g-tete">' +
           '<span class="dept">' + esc(deptTxt(a)) + '</span>' +
           '<div class="g-titre"><b>' + esc(villeSeule(a)) + '</b><span>' + esc(a.enseigne) + ' · ' + g.items.length + ' dossier' + (g.items.length > 1 ? 's' : '') + '</span></div>' +
+          (aFaire && ouverts.length ? '<span class="g-badge attente">📦 Colis ' + ouverts.join(', ') + ' prêt, pas encore expédié</span>' : '') +
           (aFaire >= 2 ? '<span class="g-badge">' + aFaire + ' dossiers → 1 colis possible</span><button class="g-act" data-groupe="' + esc(g.k) + '">📦 Préparer ensemble</button>' : '') +
           '</div><div class="cartes">' + g.items.map(carte).join('') + '</div></section>';
       });
@@ -468,18 +486,31 @@ button:disabled { opacity: .5; cursor: wait; }
     // Tous les dossiers non préparés du même magasin (+ celui qu'on met en colis s'il a un x sans colis)
     const candidats = ITEMS.filter(i => magKey(i) === mag && (!i.prepare || (cles.includes(i.cle) && !i.colis)));
     const existants = {};
-    ITEMS.filter(i => magKey(i) === mag && i.prepare && i.colis).forEach(i => { (existants[i.colis] = existants[i.colis] || { n: 0, t: i.transporteur }).n++; });
-    FEN = { mag, candidats, existants, cochees: new Set(candidats.map(i => i.cle)), colis: 'nouveau', t: '' };
+    ITEMS.filter(i => magKey(i) === mag && i.prepare && i.colis).forEach(i => {
+      const e = existants[i.colis] = existants[i.colis] || { t: i.transporteur, dossiers: [], le: null };
+      e.dossiers.push(i);
+      if (i.prepare_le && (!e.le || i.prepare_le < e.le)) e.le = i.prepare_le;
+    });
+    const aChoisir = Object.keys(existants).length > 0;
+    FEN = { mag, candidats, existants, cochees: new Set(candidats.map(i => i.cle)), colis: aChoisir ? null : 'nouveau', t: '' };
     $('f-dept').textContent = deptTxt(base);
     $('f-mag').textContent = base.enseigne + ' · ' + villeSeule(base);
     $('f-dossiers').innerHTML = candidats.map(i =>
       '<label class="f-ligne on" data-cle="' + esc(i.cle) + '"><input type="checkbox" checked>' +
       '<div class="q"><b>' + esc(i.cnb || i.fla) + '</b><div><span class="p">' + esc(i.piece || '—') + '</span> · ' + esc(i.ref) + (i.emplacement ? ' · 📍 ' + esc(i.emplacement) : '') + '</div></div></label>').join('');
-    $('f-aide-dossiers').textContent = candidats.length > 1 ? 'Tous les dossiers de ce magasin sont cochés : décoche ceux qui ne partent pas dans ce colis.' : '';
+    $('f-aide-dossiers').textContent = candidats.length > 1 ? 'Tous les dossiers à préparer de ce magasin sont cochés : décoche ceux qui ne partent pas.' : '';
+    document.querySelector('#f-sec-colis + .f-sec h3').firstChild.textContent = aChoisir ? 'Dossiers à ajouter ' : 'Dossiers dans ce colis ';
     const ids = Object.keys(existants);
     $('f-sec-colis').hidden = !ids.length;
-    $('f-colis').innerHTML = '<label class="f-ligne on" data-colis="nouveau"><input type="radio" name="colis" checked><div class="q"><b>Nouveau colis</b></div></label>' +
-      ids.map(id => '<label class="f-ligne" data-colis="' + id + '"><input type="radio" name="colis"><div class="q"><b>Ajouter au colis ' + id + '</b><div>' + existants[id].n + ' dossier' + (existants[id].n > 1 ? 's' : '') + ' déjà dedans · ' + esc(existants[id].t || '?') + '</div></div></label>').join('');
+    $('f-aide-colis').textContent = ''; $('f-aide-colis').className = 'f-aide';
+    const depuis = iso => { if (!iso) return ''; const j = Math.floor((Date.now() - new Date(iso).getTime()) / 86400000); return j <= 0 ? "préparé aujourd'hui" : j === 1 ? 'préparé hier' : 'préparé il y a ' + j + ' jours'; };
+    $('f-colis').innerHTML = ids.map(id => {
+        const e = existants[id];
+        return '<label class="f-ligne" data-colis="' + id + '"><input type="radio" name="colis"><div class="q"><b>Ajouter à l\u2019envoi existant — Colis ' + id + '</b>' +
+          '<div>' + [esc(e.t || '?'), depuis(e.le), e.dossiers.length + ' dossier' + (e.dossiers.length > 1 ? 's' : '') + ' déjà dedans :'].filter(Boolean).join(' · ') + '</div>' +
+          '<div class="f-colis-usv">' + e.dossiers.map(d => '<span><b>' + esc(d.cnb || d.fla) + '</b> · <em>' + esc(d.piece || '—') + '</em> · ' + esc(d.ref) + '</span>').join('') + '</div></div></label>';
+      }).join('') +
+      '<label class="f-ligne" data-colis="nouveau"><input type="radio" name="colis"><div class="q"><b>Faire un nouvel envoi</b><div>Nouveau colis séparé</div></div></label>';
     $('f-aide-t').textContent = ''; $('f-aide-t').className = 'f-aide';
     majFen();
     $('fen').hidden = false;
@@ -487,14 +518,16 @@ button:disabled { opacity: .5; cursor: wait; }
   function majFen() {
     const n = FEN.cochees.size;
     $('f-nb').textContent = '— ' + n + ' sélectionné' + (n > 1 ? 's' : '');
-    const verrou = FEN.colis !== 'nouveau' ? (FEN.existants[FEN.colis] || {}).t : '';
+    const verrou = (FEN.colis && FEN.colis !== 'nouveau') ? (FEN.existants[FEN.colis] || {}).t : '';
     if (verrou) FEN.t = verrou;
     document.querySelectorAll('#f-transp button').forEach(b => { b.classList.toggle('on', b.dataset.t === FEN.t); b.disabled = !!verrou && b.dataset.t !== verrou; });
     if (verrou) { $('f-aide-t').textContent = 'Transporteur du colis ' + FEN.colis + ' : ' + verrou + '.'; $('f-aide-t').className = 'f-aide'; }
-    const pret = n > 0 && !!FEN.t;
+    const pret = n > 0 && !!FEN.t && !!FEN.colis;
     const btn = $('f-valider');
     btn.classList.toggle('inactif', !pret);
-    btn.textContent = n ? '✅ Valider · ' + n + ' dossier' + (n > 1 ? 's' : '') + ' · ' + (FEN.colis === 'nouveau' ? '1 colis' : 'colis ' + FEN.colis) + (FEN.t ? ' ' + FEN.t : '') : 'Sélectionne au moins un dossier';
+    btn.textContent = !n ? 'Sélectionne au moins un dossier'
+      : !FEN.colis ? 'Choisis : envoi existant ou nouvel envoi'
+      : '✅ Valider · ' + n + ' dossier' + (n > 1 ? 's' : '') + ' · ' + (FEN.colis === 'nouveau' ? 'nouveau colis' : '→ colis ' + FEN.colis) + (FEN.t ? ' ' + FEN.t : '');
   }
   $('f-dossiers').addEventListener('change', e => {
     const l = e.target.closest('.f-ligne');
@@ -509,6 +542,7 @@ button:disabled { opacity: .5; cursor: wait; }
     document.querySelectorAll('#f-colis .f-ligne').forEach(x => x.classList.toggle('on', x === l));
     FEN.colis = l.dataset.colis === 'nouveau' ? 'nouveau' : parseInt(l.dataset.colis, 10);
     if (FEN.colis === 'nouveau') FEN.t = '';
+    $('f-aide-colis').textContent = ''; $('f-aide-colis').className = 'f-aide';
     majFen();
   });
   $('f-transp').addEventListener('click', e => {
@@ -524,6 +558,11 @@ button:disabled { opacity: .5; cursor: wait; }
   $('f-valider').onclick = async () => {
     if (!FEN) return;
     if (!FEN.cochees.size) return;
+    if (!FEN.colis) {
+      $('f-aide-colis').textContent = '⚠️ Choisis d\u2019abord : ajouter à l\u2019envoi existant ou faire un nouvel envoi.'; $('f-aide-colis').className = 'f-aide err';
+      $('f-sec-colis').scrollIntoView({ block: 'nearest' });
+      return;
+    }
     if (!FEN.t) {
       $('f-aide-t').textContent = '⚠️ Choisis DSV ou DPD avant de valider.'; $('f-aide-t').className = 'f-aide err';
       const tc = $('f-transp'); tc.classList.remove('manque'); void tc.offsetWidth; tc.classList.add('manque');
@@ -536,7 +575,8 @@ button:disabled { opacity: .5; cursor: wait; }
     btn.disabled = true;
     try {
       const d = await api('preparer', { cles, lignes, transporteur: FEN.t, colis: FEN.colis });
-      cles.forEach(c => { const it = ITEMS.find(i => i.cle === c); if (it) { it.prepare = true; it.colis = d.colis; it.transporteur = d.transporteur; } });
+      const maintenant = new Date().toISOString();
+      cles.forEach(c => { const it = ITEMS.find(i => i.cle === c); if (it) { it.prepare = true; it.colis = d.colis; it.transporteur = d.transporteur; if (!it.prepare_le) it.prepare_le = maintenant; } });
       fermerFen();
       rendre();
       toast('📦 Colis ' + d.colis + ' · ' + d.transporteur + ' — ' + cles.length + ' dossier' + (cles.length > 1 ? 's' : '') + ' préparé' + (cles.length > 1 ? 's' : '') + ' (« x » posé dans le Sheet)', 3500);
@@ -581,7 +621,7 @@ button:disabled { opacity: .5; cursor: wait; }
         b.disabled = true;
         try {
           await api('annuler', { cle, ligne: it.ligne });
-          it.prepare = false; it.colis = null;
+          it.prepare = false; it.colis = null; it.prepare_le = null;
           rendre();
           toast('↩︎ ' + (it.cnb || it.fla) + ' remis « à préparer »');
         } catch (err) { if (err.message !== 'code') toast('⚠️ ' + err.message, 4500); b.disabled = false; }
