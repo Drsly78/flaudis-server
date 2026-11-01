@@ -2562,8 +2562,36 @@ Réponds UNIQUEMENT avec ce JSON, sans texte autour :
             cartons_ouverts: cartons.filter(c => !c.sealed)
           };
         }).sort((a, b) => a.ref.localeCompare(b.ref));
+        // 🧰 BOX de l'app notices (produits/{key}/manuel avec box, + ancien chemin manuels/) — lecture seule
+        let boxes = [];
+        try {
+          let legacy = {};
+          try { legacy = (await firebaseGet('manuels')) || {}; } catch (e) {}
+          const man = {};
+          Object.keys(legacy).forEach(k => { const v = legacy[k]; if (v && typeof v === 'object') man[k] = { ...v, ref: v.ref || k }; });
+          Object.keys(allProduits).forEach(k => {
+            const m = allProduits[k] && allProduits[k].manuel;
+            if (!m || typeof m !== 'object') return;
+            man[k] = { ...(man[k] || {}), ...m, ref: m.ref || (man[k] && man[k].ref) || k, items: { ...((man[k] || {}).items || {}), ...(m.items || {}) } };
+          });
+          const empl = {};
+          fiches.forEach(f => { empl[f.ref] = f.emplacements; });
+          boxes = Object.keys(man).filter(k => man[k].box).map(k => {
+            const m = man[k];
+            const items = Object.values(m.items || {}).filter(it => it && it.ref).map(it => ({
+              ref: String(it.ref), qte: parseInt(it.qte, 10) || 1, note: String(it.note || '')
+            })).sort((a, b) => a.ref.localeCompare(b.ref));
+            return { key: k, nom: String(m.ref || k), description: String(m.description || ''), emplacements: empl[k] || [], items };
+          }).sort((a, b) => a.nom.localeCompare(b.nom));
+          // chaque fiche sait dans quelle(s) box elle est rangée ; les fiches qui SONT des box sont marquées
+          const nrm = v => String(v || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+          const idx = {};
+          boxes.forEach(b => b.items.forEach(it => { (idx[nrm(it.ref)] = idx[nrm(it.ref)] || []).push({ nom: b.nom, qte: it.qte }); }));
+          const cles = new Set(boxes.map(b => b.key));
+          fiches.forEach(f => { if (cles.has(f.ref)) f.box = true; const d = idx[nrm(f.ref)]; if (d) f.dans_box = d; });
+        } catch (e) { console.log('stock-liste box :', e.message); }
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ fiches }));
+        res.end(JSON.stringify({ fiches, boxes }));
         return;
       }
 
