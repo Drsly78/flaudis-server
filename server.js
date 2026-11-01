@@ -4778,6 +4778,23 @@ prepa.init({
     if (r.error) throw new Error(r.error.message || 'lecture Sheet');
     return r.values || [];
   },
+  ecrirePlage: async (range, values) => {
+    const token = await getSheetsToken();
+    const r = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent(range)}?valueInputOption=RAW`, {
+      method: 'PUT', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ values })
+    }).then(x => x.json());
+    if (r.error) throw new Error(r.error.message || 'écriture Sheet');
+    return r;
+  },
+  viderPlage: async (range) => {   // efface les valeurs, garde la mise en forme
+    const token = await getSheetsToken();
+    const r = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent(range)}:clear`, {
+      method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: '{}'
+    }).then(x => x.json());
+    if (r.error) throw new Error(r.error.message || 'effacement Sheet');
+    return r;
+  },
   ecrireCellules: async (liste) => {   // [[range, valeur], …] en une seule requête
     const token = await getSheetsToken();
     const r = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values:batchUpdate`, {

@@ -135,7 +135,7 @@ function analyser(rows) {
       ligne: i + 1, date: String(r[0] || '').trim(), iso,
       ref: String(r[2] || '').trim(), piece: String(r[3] || '').trim(),
       enseigne: String(r[4] || '').trim(), ville: String(r[5] || '').trim(),
-      emplacement: g, cnb, fla, prepare: /^x$/i.test(b), cle: cleDe(cnb, fla)
+      emplacement: g, cnb, fla, x: /^x$/i.test(b), b, cle: cleDe(cnb, fla)
     });
   });
   return { attente, expedies };
@@ -188,11 +188,12 @@ async function construireListe(force) {
 
   const items = attente.map(a => {
     const d = parCnb[N(a.cnb)] || parFla[N(a.fla)] || null;
+    a.prepare = a.x || !!(d && d.prepare_le);
     const fichiers = (d && fParCle[d.cle]) || fParCle[a.cle] || [];
     return {
       cle: a.cle, ligne: a.ligne, date: a.date, iso: a.iso,
       cnb: a.cnb, fla: a.fla, enseigne: a.enseigne, ville: a.ville,
-      ref: a.ref, piece: a.piece, emplacement: a.emplacement, prepare: a.prepare,
+      ref: a.ref, piece: a.piece, emplacement: a.emplacement, prepare: a.prepare, x: a.x, b_autre: (!a.x && a.b) ? a.b : '',
       transporteur: (d && d.transporteur) || '',
       colis: (a.prepare && d && d.colis) || null,
       dept: deptDe(a.ville),
@@ -245,6 +246,7 @@ function lireCorps(req, max) {
 }
 
 const APP_ENTREPOT = 'https://drsly78.github.io/flaudis-notices/notices-app.html#prepa';
+const ONGLET_ENTREPOT = 'Pour SAV Entrepôt';
 
 // Retrouve la ligne Sheet d'un dossier et vérifie qu'elle n'a pas bougé
 async function ligneVerifiee(cle, ligneAnnoncee) {
@@ -328,9 +330,6 @@ async function handleApp(req, res) {
            ON CONFLICT (cle) DO UPDATE SET valeur = (CAST(app_meta.valeur AS INT) + 1)::TEXT RETURNING valeur`);
         colis = parseInt(r.rows[0].valeur, 10);
       }
-      const aEcrire = plan.filter(x => !/^x$/i.test(x.b)).map(x => ["'SYSTEME U'!B" + x.v.ligne, 'x']);
-      if (aEcrire.length) await D.ecrireCellules(aEcrire);
-      cacheSheet.t = 0;
       for (const x of plan) {
         await D.pool.query(
           `INSERT INTO prepa_dossiers (cle, cnb, fla, prepare_le, transporteur, colis, maj) VALUES ($1,$2,$3,NOW(),$4,$5,NOW())
@@ -352,6 +351,56 @@ async function handleApp(req, res) {
       cacheSheet.t = 0;
       await D.pool.query('UPDATE prepa_dossiers SET prepare_le = NULL, colis = NULL WHERE cle = $1', [cle]);
       json(res, 200, { ok: true });
+      return true;
+    }
+
+    // ✍️ Écrire les « x » en colonne B pour les dossiers préparés (lus par l'import des trackings).
+    // Rejouable : seuls les dossiers préparés sans x sont écrits ; les colis restent ouverts.
+    if (u.startsWith('/prepa-api/ecrire-x')) {
+      const items = await construireListe(true);
+      const voulu = Array.isArray(p.cles) && p.cles.length ? new Set(p.cles.map(N)) : null;
+      const cibles = items.filter(it => it.prepare && !it.x && (!voulu || voulu.has(it.cle)));
+      const ecrits = [], refuses = [];
+      const aEcrire = [];
+      for (const it of cibles) {
+        const v = await ligneVerifiee(it.cle, it.ligne);
+        if (!v) { refuses.push({ cle: it.cle, raison: 'introuvable dans SYSTEME U' }); continue; }
+        const b = String(v.r[1] || '').trim();
+        if (/^x$/i.test(b)) continue;
+        if (b) { refuses.push({ cle: it.cle, raison: 'colonne B = « ' + b + ' »' }); continue; }
+        aEcrire.push(["'SYSTEME U'!B" + v.ligne, 'x']);
+        ecrits.push(it.cle);
+      }
+      if (aEcrire.length) await D.ecrireCellules(aEcrire);
+      cacheSheet.t = 0;
+      json(res, 200, { ok: true, ecrits, refuses });
+      return true;
+    }
+
+    // 📋 Remplir le tableau de l'onglet « Pour SAV Entrepôt » (A2:H) avec les dossiers demandés,
+    // valeurs reprises de SYSTEME U (mêmes colonnes A→H, même ordre). Mise en forme conservée.
+    if (u.startsWith('/prepa-api/remplir-entrepot')) {
+      const cles = (Array.isArray(p.cles) ? p.cles : []).map(N).filter(Boolean);
+      if (!cles.length) { json(res, 400, { error: 'Aucun dossier à écrire.' }); return true; }
+      const items = await construireListe(true);
+      const parCle = {};
+      items.forEach(it => { parCle[it.cle] = it; });
+      const rows = await lignesSU(false);
+      const lignes = [];
+      cles.forEach(c => {
+        const it = parCle[c];
+        if (!it) return;
+        const r = rows[it.ligne - 1] || [];
+        if (cleDe(r[7], r[8]) !== c) return;
+        // B : jamais le « x » (c'est la date d'expédition)
+        lignes.push([r[0] || '', isoDe(r[1]) ? r[1] : '', r[2] || '', r[3] || '', r[4] || '', r[5] || '', r[6] || '', r[7] || r[8] || '']);
+      });
+      if (!lignes.length) { json(res, 409, { error: 'Dossiers introuvables dans SYSTEME U — rafraîchis.' }); return true; }
+      const onglet = "'" + ONGLET_ENTREPOT.replace(/'/g, "''") + "'";
+      const avant = await D.lireSheet(onglet + '!A2:H');
+      await D.viderPlage(onglet + '!A2:H' + Math.max(2, avant.length + 1));
+      await D.ecrirePlage(onglet + '!A2:H' + (lignes.length + 1), lignes);
+      json(res, 200, { ok: true, ecrites: lignes.length, effacees: avant.length });
       return true;
     }
 
