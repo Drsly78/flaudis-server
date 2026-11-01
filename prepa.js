@@ -387,20 +387,22 @@ async function handleApp(req, res) {
       items.forEach(it => { parCle[it.cle] = it; });
       const rows = await lignesSU(false);
       const lignes = [];
+      let ignoresX = 0;
       cles.forEach(c => {
         const it = parCle[c];
         if (!it) return;
+        if (it.x) { ignoresX++; return; }   // x déjà écrit : le colis part, il ne revient pas dans la liste de prépa
         const r = rows[it.ligne - 1] || [];
         if (cleDe(r[7], r[8]) !== c) return;
         // B : jamais le « x » (c'est la date d'expédition)
         lignes.push([r[0] || '', isoDe(r[1]) ? r[1] : '', r[2] || '', r[3] || '', r[4] || '', r[5] || '', r[6] || '', r[7] || r[8] || '']);
       });
-      if (!lignes.length) { json(res, 409, { error: 'Dossiers introuvables dans SYSTEME U — rafraîchis.' }); return true; }
+      if (!lignes.length) { json(res, 409, { error: ignoresX ? 'Tous ces dossiers ont déjà leur x : rien à remettre dans « Pour SAV Entrepôt ».' : 'Dossiers introuvables dans SYSTEME U — rafraîchis.' }); return true; }
       const onglet = "'" + ONGLET_ENTREPOT.replace(/'/g, "''") + "'";
       const avant = await D.lireSheet(onglet + '!A2:H');
       await D.viderPlage(onglet + '!A2:H' + Math.max(2, avant.length + 1));
       await D.ecrirePlage(onglet + '!A2:H' + (lignes.length + 1), lignes);
-      json(res, 200, { ok: true, ecrites: lignes.length, effacees: avant.length });
+      json(res, 200, { ok: true, ecrites: lignes.length, effacees: avant.length, ignores_x: ignoresX });
       return true;
     }
 
