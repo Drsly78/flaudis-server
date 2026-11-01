@@ -478,6 +478,13 @@ async function handleExt(req, res, p) {
       return;
     }
 
+    // Texte brut d'un dossier (LECTURE SEULE, diagnostic)
+    if (u === '/prepa-ext/brut') {
+      const r = await D.pool.query('SELECT cle, texte_brut FROM prepa_dossiers WHERE texte_brut IS NOT NULL ORDER BY maj DESC LIMIT $1', [Math.min(parseInt(p.n, 10) || 3, 20)]);
+      json(res, 200, { ok: true, dossiers: r.rows.map(x => ({ cle: x.cle, texte: String(x.texte_brut).slice(0, parseInt(p.taille, 10) || 2500) })) });
+      return;
+    }
+
     // Aperçu LECTURE SEULE d'un onglet du Sheet (entêtes + premières lignes)
     if (u === '/prepa-ext/apercu-onglet') {
       const nom = String(p.onglet || '').replace(/'/g, "''");
