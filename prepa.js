@@ -74,6 +74,21 @@ function nettoyerMessage(t) {
     .join('\n')
     .trim();
 }
+// Magasin exact, lu dans la fiche client Revers.io (texte brut) : nom + e-mail + téléphone.
+// Deux magasins d'une même ville ont des e-mails différents.
+function magasinDe(brut) {
+  const t = String(brut || '');
+  const pris = re => { const m = t.match(re); return m ? m[1].trim() : ''; };
+  let nom = pris(/\nNom\n([^\n]+)/);
+  const email = pris(/\nE-mail\n([^\n@\s]+@[^\n\s]+)/).toLowerCase();
+  let tel = pris(/\nT[ée]l[ée]phone\n([+\d][\d .]{7,})/).replace(/\D/g, '');
+  if (!nom || !tel) {
+    const c = t.match(/Client : Coop[ée]rative U seller (.+?) \/ (\+?\d{8,})/);
+    if (c) { nom = nom || c[1].trim(); tel = tel || c[2].replace(/\D/g, ''); }
+  }
+  const id = tel ? 'tel:' + tel.slice(-9) : email;   // le téléphone est présent dans les 2 blocs de la fiche : le plus fiable
+  return { id, nom, email, tel };
+}
 // « 44 NANTES » → 44 ; Corse 2A/2B → 20 ; inconnu → tout à la fin
 function deptDe(ville) {
   const m = String(ville || '').trim().match(/^(2A|2B|\d{2,3})\b/i);
@@ -189,6 +204,7 @@ async function construireListe(force) {
   const items = attente.map(a => {
     const d = parCnb[N(a.cnb)] || parFla[N(a.fla)] || null;
     a.prepare = a.x || !!(d && d.prepare_le);
+    const mg = magasinDe(d && d.texte_brut);
     const fichiers = (d && fParCle[d.cle]) || fParCle[a.cle] || [];
     return {
       cle: a.cle, ligne: a.ligne, date: a.date, iso: a.iso,
@@ -197,6 +213,7 @@ async function construireListe(force) {
       transporteur: (d && d.transporteur) || '',
       colis: (a.prepare && d && d.colis) || null,
       dept: deptDe(a.ville),
+      magasin_id: mg.id, magasin_nom: mg.nom, magasin_tel: mg.tel,
       ean: (d && d.ean) || eanDeRef(eans, a.ref),
       modele: (d && d.modele) || '', couleur: (d && d.couleur) || '',
       description_panne: (d && d.description_panne) || '',
@@ -211,6 +228,18 @@ async function construireListe(force) {
     || sansAccent(x.ville).localeCompare(sansAccent(y.ville))
     || sansAccent(x.enseigne).localeCompare(sansAccent(y.enseigne))
     || (x.iso < y.iso ? -1 : x.iso > y.iso ? 1 : x.ligne - y.ligne));
+
+  // Regroupement par magasin : enseigne + ville, puis séparation si les fiches Revers.io
+  // montrent plusieurs magasins distincts (e-mails différents) dans la même ville.
+  const parBase = {};
+  items.forEach(it => { const b = sansAccent(it.enseigne) + '|' + sansAccent(it.ville); (parBase[b] = parBase[b] || []).push(it); });
+  Object.keys(parBase).forEach(b => {
+    const ids = [...new Set(parBase[b].map(it => it.magasin_id).filter(Boolean))];
+    parBase[b].forEach(it => {
+      if (ids.length <= 1) { it.mag_cle = b; it.mag_multi = false; if (!it.magasin_nom && ids.length) it.magasin_nom = (parBase[b].find(x => x.magasin_nom) || {}).magasin_nom || ''; }
+      else { it.mag_cle = b + '#' + (it.magasin_id || '?'); it.mag_multi = true; }
+    });
+  });
 
   // Ménage : marquer les expédiés, purger les vieux (jamais si le Sheet n'a pas été lu)
   try {
@@ -572,4 +601,4 @@ async function handleExt(req, res, p) {
   }
 }
 
-module.exports = { init, handleApp, handleExt, _test: { analyser, isoDe, cleDe, eanDeRef, nettoyerMessage, deptDe, reset: () => { cacheSheet = { t: 0, rows: null }; cacheCode = { t: 0, v: null }; cacheEan = { t: 0, parRef: null }; pret = null; } } };
+module.exports = { init, handleApp, handleExt, _test: { analyser, isoDe, cleDe, eanDeRef, nettoyerMessage, deptDe, magasinDe, reset: () => { cacheSheet = { t: 0, rows: null }; cacheCode = { t: 0, v: null }; cacheEan = { t: 0, parRef: null }; pret = null; } } };
