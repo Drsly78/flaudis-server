@@ -39,6 +39,7 @@ async function initDB() {
     await q(`ALTER TABLE prepa_dossiers ADD COLUMN IF NOT EXISTS texte_demande TEXT`);
     await q(`ALTER TABLE prepa_dossiers ADD COLUMN IF NOT EXISTS texte_brut TEXT`);
     await q(`ALTER TABLE prepa_dossiers ADD COLUMN IF NOT EXISTS texte_le TIMESTAMPTZ`);
+    await q(`ALTER TABLE prepa_dossiers ADD COLUMN IF NOT EXISTS stock_retraits JSONB`);
   })();
   try { await pret; } catch (e) { pret = null; throw e; }
 }
@@ -220,6 +221,7 @@ async function construireListe(force) {
       message_magasin: nettoyerMessage(d && d.message_magasin),
       texte_demande: nettoyerMessage(d && d.texte_demande),
       prepare_le: (a.prepare && d && d.prepare_le) ? new Date(d.prepare_le).toISOString() : null,
+      stock_retraits: (a.prepare && d && d.stock_retraits) || null,
       revers_url: (d && d.revers_url) || urls[N(sansBis(a.cnb))] || urls[N(sansBis(a.fla))] || '',
       avec_donnees: !!(d && (d.description_panne || d.message_magasin || d.ean)),
       fichiers
@@ -359,11 +361,21 @@ async function handleApp(req, res) {
            ON CONFLICT (cle) DO UPDATE SET valeur = (CAST(app_meta.valeur AS INT) + 1)::TEXT RETURNING valeur`);
         colis = parseInt(r.rows[0].valeur, 10);
       }
+      const retraitsDe = cle => {
+        const r = (p.retraits && typeof p.retraits === 'object') ? p.retraits[cle] : null;
+        if (!r || typeof r !== 'object') return null;
+        const o = {};
+        Object.entries(r).forEach(([k, n]) => {
+          n = parseInt(n, 10);
+          if (n > 0 && n < 100000 && /^[^|.#$\[\]]+\|[^|.#$\[\]\/]+\|[^|.#$\[\]\/]+$/.test(k)) o[k] = n;
+        });
+        return Object.keys(o).length ? JSON.stringify(o) : null;
+      };
       for (const x of plan) {
         await D.pool.query(
-          `INSERT INTO prepa_dossiers (cle, cnb, fla, prepare_le, transporteur, colis, maj) VALUES ($1,$2,$3,NOW(),$4,$5,NOW())
-           ON CONFLICT (cle) DO UPDATE SET prepare_le = NOW(), transporteur = $4, colis = $5, expedie_le = NULL`,
-          [x.cle, String(x.v.r[7] || '').trim(), String(x.v.r[8] || '').trim(), transp, colis]);
+          `INSERT INTO prepa_dossiers (cle, cnb, fla, prepare_le, transporteur, colis, stock_retraits, maj) VALUES ($1,$2,$3,NOW(),$4,$5,$6,NOW())
+           ON CONFLICT (cle) DO UPDATE SET prepare_le = NOW(), transporteur = $4, colis = $5, stock_retraits = $6, expedie_le = NULL`,
+          [x.cle, String(x.v.r[7] || '').trim(), String(x.v.r[8] || '').trim(), transp, colis, retraitsDe(x.cle)]);
       }
       json(res, 200, { ok: true, colis, transporteur: transp, cles: plan.map(x => x.cle) });
       return true;
@@ -378,8 +390,9 @@ async function handleApp(req, res) {
       if (isoDe(b)) { json(res, 409, { error: 'Déjà expédié dans le Sheet — rien à annuler.' }); return true; }
       if (/^x$/i.test(b)) await D.ecrireCellules([["'SYSTEME U'!B" + v.ligne, '']]);
       cacheSheet.t = 0;
-      await D.pool.query('UPDATE prepa_dossiers SET prepare_le = NULL, colis = NULL WHERE cle = $1', [cle]);
-      json(res, 200, { ok: true });
+      // les pièces retirées du stock à la préparation sont rendues à l'app, qui les remet dans leur carton
+      const av = await D.pool.query('UPDATE prepa_dossiers d SET prepare_le = NULL, colis = NULL, stock_retraits = NULL FROM (SELECT cle, stock_retraits FROM prepa_dossiers WHERE cle = $1 FOR UPDATE) o WHERE d.cle = o.cle RETURNING o.stock_retraits', [cle]);
+      json(res, 200, { ok: true, stock_retraits: (av.rows[0] && av.rows[0].stock_retraits) || null });
       return true;
     }
 
