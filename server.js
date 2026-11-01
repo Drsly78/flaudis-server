@@ -4770,7 +4770,7 @@ Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
 });
 
 prepa.init({
-  pool, MODEL_LIGHT, callAnthropic, parseJsonModel,
+  pool, MODEL_LIGHT, callAnthropic, parseJsonModel, firebaseGet,
   lireSheet: async (range) => {
     const token = await getSheetsToken();
     const r = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent(range)}`,

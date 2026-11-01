@@ -521,6 +521,22 @@ async function handleExt(req, res, p) {
     }
 
     // Texte brut d'un dossier (LECTURE SEULE, diagnostic)
+    // Diagnostic lecture seule : quelles fiches Firebase ont un stock de pièces, et sous quelle clé
+    if (u === '/prepa-ext/stock-diag') {
+      const prod = (D.firebaseGet && await D.firebaseGet('produits')) || {};
+      const fiches = Object.keys(prod).filter(k => prod[k] && prod[k].pieces).map(k => {
+        const pcs = prod[k].pieces;
+        const cartons = {};
+        Object.values(pcs).forEach(pc => Object.entries((pc && pc.cartons) || {}).forEach(([cid, c]) => {
+          cartons[cid] = cartons[cid] || { qte: 0, scelle: false };
+          cartons[cid].qte += (c && parseInt(c.qte, 10)) || 0; if (c && c.sealed) cartons[cid].scelle = true;
+        }));
+        return { cle: k, pieces: Object.keys(pcs).length, sans_cartons: Object.values(pcs).filter(pc => !pc || !pc.cartons).length, cartons };
+      });
+      const items = (await construireListe(false)).map(it => ({ cle: it.cle, ref: it.ref, prepare: it.prepare }));
+      json(res, 200, { ok: true, fiches, items });
+      return true;
+    }
     if (u === '/prepa-ext/brut') {
       const r = await D.pool.query('SELECT cle, texte_brut FROM prepa_dossiers WHERE texte_brut IS NOT NULL ORDER BY maj DESC LIMIT $1', [Math.min(parseInt(p.n, 10) || 3, 20)]);
       json(res, 200, { ok: true, dossiers: r.rows.map(x => ({ cle: x.cle, texte: String(x.texte_brut).slice(0, parseInt(p.taille, 10) || 2500) })) });
