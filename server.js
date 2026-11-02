@@ -2680,8 +2680,49 @@ Réponds UNIQUEMENT avec ce JSON, sans texte autour :
           const cles = new Set(boxes.map(b => b.key));
           fiches.forEach(f => { if (cles.has(f.ref)) f.box = true; const d = idx[nrm(f.ref)]; if (d) f.dans_box = d; });
         } catch (e) { console.log('stock-liste box :', e.message); }
+        // 🏷 SAMPLES (produits d'exposition, app notices → samples/{id}) — lecture seule, photos chargées à part
+        let samples = [];
+        try {
+          const smp = (await firebaseGet('samples')) || {};
+          const emplDe = data => {
+            const out = [];
+            const slots = Object.keys(data || {}).filter(k => /^loc\d*$/.test(k)).sort((a, b) => (parseInt(a.slice(3)) || 1) - (parseInt(b.slice(3)) || 1));
+            slots.forEach(k => {
+              const loc = data[k];
+              if (!loc || !loc.allee) return;
+              if (loc.allee === 'HAM') out.push('HAM · Conteneur ' + (loc.conteneur != null ? loc.conteneur : '?'));
+              else if (loc.allee === 'AREA') out.push('Zone AREA');
+              else if (loc.cote === 'SOL') out.push('Allée ' + loc.allee + ' SOL');
+              else out.push('Allée ' + loc.allee + (loc.cote ? ' ' + loc.cote : '') + (loc.rack != null ? ' R' + loc.rack : '') + (loc.hauteur != null ? ' H' + loc.hauteur : ''));
+            });
+            return out;
+          };
+          let pdfs = [];
+          try { pdfs = ((await listNoticesGithub()) || []).filter(f => /\.pdf$/i.test(f.name || '')).map(f => f.name); } catch (e) {}
+          const nb = v => String(v || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+          samples = Object.entries(smp).filter(([, d]) => d && d.ref).map(([id, d]) => {
+            const r1 = nb(d.ref), r2 = nb(String(d.ref).trim().split(/\s+/)[0]);
+            const pdf = pdfs.find(f => nb(f.split(' ')[0].replace(/\.pdf$/i, '')) === r1) || (r2.length >= 4 ? pdfs.find(f => nb(f.split(' ')[0].replace(/\.pdf$/i, '')) === r2) : null);
+            return { id, ref: String(d.ref), qte: parseInt(d.qte, 10) || 0, note: String(d.note || ''), emplacements: emplDe(d),
+                     nb_photos: Object.keys(d.photos || {}).length,
+                     notice_url: pdf ? 'https://drsly78.github.io/flaudis-notices/notices/' + encodeURIComponent(pdf) : '',
+                     notice_nom: pdf ? pdf.replace(/\.pdf$/i, '') : '' };
+          }).sort((a, b) => a.ref.localeCompare(b.ref));
+        } catch (e) { console.log('stock-liste samples :', e.message); }
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ fiches, boxes }));
+        res.end(JSON.stringify({ fiches, boxes, samples }));
+        return;
+      }
+
+      // 📷 Photos d'un sample (onglet Stock de l'extension) — lecture seule
+      if (req.url === '/samples-photos') {
+        const id = String(payload.id || '');
+        if (!/^[A-Za-z0-9_\-]{4,40}$/.test(id)) { res.writeHead(400); res.end(JSON.stringify({ error: 'id invalide' })); return; }
+        const v = (await firebaseGet('samples_photos/' + id)) || {};
+        const photos = Object.entries(v).filter(([, x]) => x && typeof x.data === 'string' && x.data.startsWith('data:image/'))
+          .sort((a, b) => (a[1].ts || 0) - (b[1].ts || 0)).map(([pid, x]) => ({ pid, data: x.data }));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, photos }));
         return;
       }
 
