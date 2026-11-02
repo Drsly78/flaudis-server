@@ -1743,6 +1743,95 @@ out center tags;`;
         return;
       }
 
+      // ── ANNUAIRE INTERSPORT (fiches collectées par le navigateur sur intersport.fr) ──
+      if (req.url === '/magasins-its-bulk' || req.url === '/magasins-its-recherche' || req.url === '/magasins-its-status' ||
+          req.url === '/magasins-its-diag' || req.url === '/magasins-its-diag-lire') {
+        if (pool) await pool.query(`CREATE TABLE IF NOT EXISTS magasins_its (
+          code TEXT PRIMARY KEY, nom TEXT, adresse TEXT, cp TEXT, ville TEXT, dept TEXT,
+          tel TEXT, email TEXT, url TEXT, maj TIMESTAMPTZ DEFAULT now())`).catch(() => {});
+        if (pool) await pool.query(`CREATE TABLE IF NOT EXISTS magasins_its_diag (
+          id SERIAL PRIMARY KEY, url TEXT, note TEXT, html TEXT, cree TIMESTAMPTZ DEFAULT now())`).catch(() => {});
+        const repJ = o2 => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(o2)); };
+        if (!pool) { repJ({ error: 'pas de base de données' }); return; }
+        if (req.url === '/magasins-its-bulk') {
+          const mags = Array.isArray(payload.magasins) ? payload.magasins : [];
+          let ok = 0;
+          for (const mg of mags) {
+            try {
+              const code = String(mg.code || '').trim().slice(0, 40);
+              if (!code) continue;
+              // une fiche déjà complète n'est jamais écrasée par une lecture partielle (champ vide)
+              await pool.query(`INSERT INTO magasins_its (code, nom, adresse, cp, ville, dept, tel, email, url, maj)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now())
+                ON CONFLICT (code) DO UPDATE SET nom=COALESCE(NULLIF($2,''),magasins_its.nom), adresse=COALESCE(NULLIF($3,''),magasins_its.adresse),
+                  cp=COALESCE(NULLIF($4,''),magasins_its.cp), ville=COALESCE(NULLIF($5,''),magasins_its.ville), dept=COALESCE(NULLIF($6,''),magasins_its.dept),
+                  tel=COALESCE(NULLIF($7,''),magasins_its.tel), email=COALESCE(NULLIF($8,''),magasins_its.email), url=COALESCE(NULLIF($9,''),magasins_its.url), maj=now()`,
+                [code, String(mg.nom || '').slice(0, 200), String(mg.adresse || '').slice(0, 300), String(mg.cp || '').slice(0, 10),
+                 String(mg.ville || '').slice(0, 120), String(mg.dept || String(mg.cp || '').slice(0, 2)).slice(0, 3),
+                 String(mg.tel || '').slice(0, 40), String(mg.email || '').slice(0, 120), String(mg.url || '').slice(0, 400)]);
+              ok++;
+            } catch (e) {}
+          }
+          repJ({ ok: true, enregistres: ok });
+          return;
+        }
+        if (req.url === '/magasins-its-status') {
+          const r2 = await pool.query("SELECT COUNT(*) AS n, COUNT(NULLIF(adresse,'')) AS adr, COUNT(NULLIF(tel,'')) AS tel FROM magasins_its");
+          const r3 = await pool.query("SELECT code FROM magasins_its WHERE COALESCE(adresse,'') <> '' AND COALESCE(tel,'') <> ''");
+          repJ({ ok: true, enBase: parseInt(r2.rows[0].n, 10), avecAdresse: parseInt(r2.rows[0].adr, 10), avecTel: parseInt(r2.rows[0].tel, 10),
+                 codesComplets: r3.rows.map(x => x.code) });
+          return;
+        }
+        if (req.url === '/magasins-its-diag') {
+          // échantillon de page envoyé par l'extension quand elle ne sait pas lire le site (pour ajuster la lecture)
+          await pool.query('INSERT INTO magasins_its_diag (url, note, html) VALUES ($1,$2,$3)',
+            [String(payload.url || '').slice(0, 500), String(payload.note || '').slice(0, 500), String(payload.html || '').slice(0, 400000)]);
+          await pool.query('DELETE FROM magasins_its_diag WHERE id NOT IN (SELECT id FROM magasins_its_diag ORDER BY id DESC LIMIT 20)');
+          repJ({ ok: true });
+          return;
+        }
+        if (req.url === '/magasins-its-diag-lire') {
+          const r2 = await pool.query('SELECT id, url, note, cree, length(html) AS taille' + (payload.id ? ', html' : '') + ' FROM magasins_its_diag' +
+            (payload.id ? ' WHERE id = $1' : ' ORDER BY id DESC LIMIT 20'), payload.id ? [parseInt(payload.id, 10)] : []);
+          repJ({ ok: true, diags: r2.rows });
+          return;
+        }
+        // recherche : + code sociétaire de la feuille CODE SOCIETAIRE (même dept + même ville)
+        const q2 = (payload.q || '').trim();
+        if (q2.length < 2) { repJ({ magasins: [] }); return; }
+        const sansAcc = v => String(v || '').toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+        const like = '%' + sansAcc(q2) + '%';
+        const r2 = await pool.query(
+          `SELECT * FROM magasins_its WHERE
+             translate(UPPER(nom), 'ÉÈÊÀÂÎÔÛÇ', 'EEEAAIOUC') LIKE $1 OR
+             translate(UPPER(ville), 'ÉÈÊÀÂÎÔÛÇ', 'EEEAAIOUC') LIKE $1 OR
+             cp LIKE $2 OR UPPER(code) LIKE $1
+           ORDER BY ville, nom LIMIT 50`, [like, q2 + '%']);
+        let codes = [];
+        try {
+          if (!global.CODE_SOC_CACHE || (Date.now() - global.CODE_SOC_CACHE.t) > 10 * 60 * 1000) {
+            const token = await getSheetsToken();
+            const qq = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}/values/${encodeURIComponent("'CODE SOCIETAIRE'!A:B")}`,
+              { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+            global.CODE_SOC_CACHE = { t: Date.now(), rows: (qq.values || []).filter(r => /^\d{2,3}\s+\S/.test(String(r[0] || '').trim()) && r[1]) };
+          }
+          codes = global.CODE_SOC_CACHE.rows;
+        } catch (e) {}
+        const nv = v => sansAcc(v).replace(/\bSAINTE\b/g, 'STE').replace(/\bSAINT\b/g, 'ST').replace(/[^A-Z0-9]+/g, ' ').trim();
+        const magasins = r2.rows.map(m => {
+          const villeN = nv(m.ville), nomN = nv(String(m.nom || '').replace(/^INTERSPORT\s*/i, ''));
+          const cands = codes.filter(r => {
+            const mm = String(r[0]).trim().match(/^(\d{2,3})\s+(.*)$/);
+            return mm && mm[1] === String(m.dept || '').slice(0, 2) && (nv(mm[2]) === villeN || nv(mm[2]) === nomN);
+          });
+          return Object.assign({}, m, { code_societaire: cands.length === 1 ? String(cands[0][1]).trim() : '',
+            codes_possibles: cands.length > 1 ? cands.map(r => String(r[0]).trim() + ' : ' + String(r[1]).trim()) : [],
+            nom_sheet: cands.length === 1 ? String(cands[0][0]).trim() : '' });
+        });
+        repJ({ magasins });
+        return;
+      }
+
       // ── EN ATTENTE ITS : demandes de renvoi (feuille INTERSPORT) ────
       if (req.url === '/attente-its-liste') {
         const token = await getSheetsToken();
