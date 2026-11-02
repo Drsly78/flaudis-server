@@ -2714,6 +2714,23 @@ Réponds UNIQUEMENT avec ce JSON, sans texte autour :
         return;
       }
 
+      // 🔎 Diagnostic lecture seule des règles Firebase : quels chemins l'app (sans compte) peut lire
+      if (req.url === '/fb-regles-diag') {
+        const out = { secret_present: !!FIREBASE_SECRET, lecture_sans_compte: {} };
+        for (const ch of ['produits', 'manuels', 'masques', 'objets', 'postit', 'samples', 'samples_photos']) {
+          try {
+            const r = await fetch(FIREBASE_URL + '/' + ch + '.json?shallow=true');
+            out.lecture_sans_compte[ch] = r.status + ' ' + (r.ok ? 'OK' : (await r.text()).slice(0, 80));
+          } catch (e) { out.lecture_sans_compte[ch] = 'erreur ' + e.message; }
+        }
+        if (FIREBASE_SECRET) {
+          try { const r = await fetch(FIREBASE_URL + '/.settings/rules.json?auth=' + encodeURIComponent(FIREBASE_SECRET)); out.regles = r.ok ? await r.text() : r.status + ' ' + (await r.text()).slice(0, 120); } catch (e) { out.regles = 'erreur ' + e.message; }
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(out));
+        return;
+      }
+
       // 📷 Photos d'un sample (onglet Stock de l'extension) — lecture seule
       if (req.url === '/samples-photos') {
         const id = String(payload.id || '');
