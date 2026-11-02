@@ -1776,7 +1776,8 @@ out center tags;`;
           return;
         }
         if (req.url === '/magasins-its-status') {
-          const r2 = await pool.query("SELECT COUNT(*) AS n, COUNT(NULLIF(adresse,'')) AS adr, COUNT(NULLIF(tel,'')) AS tel FROM magasins_its");
+          // les magasins de location « INTERSPORT MONTAGNE » (stations de ski) ne font pas partie de l'annuaire
+          const r2 = await pool.query("SELECT COUNT(*) AS n, COUNT(NULLIF(adresse,'')) AS adr, COUNT(NULLIF(tel,'')) AS tel FROM magasins_its WHERE UPPER(nom) NOT LIKE '%MONTAGNE%'");
           const r3 = await pool.query("SELECT code FROM magasins_its WHERE COALESCE(adresse,'') <> '' AND COALESCE(tel,'') <> ''");
           repJ({ ok: true, enBase: parseInt(r2.rows[0].n, 10), avecAdresse: parseInt(r2.rows[0].adr, 10), avecTel: parseInt(r2.rows[0].tel, 10),
                  codesComplets: r3.rows.map(x => x.code) });
@@ -1802,10 +1803,10 @@ out center tags;`;
         const sansAcc = v => String(v || '').toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
         const like = '%' + sansAcc(q2) + '%';
         const r2 = await pool.query(
-          `SELECT * FROM magasins_its WHERE
+          `SELECT * FROM magasins_its WHERE UPPER(nom) NOT LIKE '%MONTAGNE%' AND (
              translate(UPPER(nom), 'ÉÈÊÀÂÎÔÛÇ', 'EEEAAIOUC') LIKE $1 OR
              translate(UPPER(ville), 'ÉÈÊÀÂÎÔÛÇ', 'EEEAAIOUC') LIKE $1 OR
-             cp LIKE $2 OR UPPER(code) LIKE $1
+             cp LIKE $2 OR UPPER(code) LIKE $1)
            ORDER BY ville, nom LIMIT 50`, [like, q2 + '%']);
         let codes = [];
         try {
