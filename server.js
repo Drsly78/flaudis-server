@@ -4270,15 +4270,16 @@ Réponds UNIQUEMENT avec ce JSON, sans texte autour :
         const block = isPdf
           ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: payload.file_b64 } }
           : { type: 'image', source: { type: 'base64', media_type: media, data: payload.file_b64 } };
-        const prompt = `Voici un bordereau d'expédition transporteur (DPD : tableau avec colonnes Date/B.L./N° Colis/Client/C.P./Localité — ou DSV : liste de fret avec N° d'expédition et blocs DESTINATAIRE).
+        const prompt = `Voici un bordereau d'expédition transporteur (DPD : tableau avec colonnes Date/B.L./N° Colis/Client/C.P./Localité — ou DSV : liste de fret avec N° d'expédition et blocs DESTINATAIRE — ou GLS : rapport « Reçu » + « Liste détaillée » avec colonnes Produit/Service, No Colis, Référence, Date initiale, Code Pos., Nom destinataire, Poids).
 Extrais TOUTES les expéditions du document.
 Règles :
 - DPD : tracking = N° Colis (13 chiffres). DSV : tracking = N° d'expédition (8 chiffres commençant par 0).
-- ville = nom de la localité SEULE (sans adresse, sans téléphone). cp = code postal 5 chiffres.
+- GLS : tracking = colonne « No Colis » (8 caractères lettres+chiffres, ex 00LH2Q7J), recopié EXACTEMENT caractère par caractère (attention 0/O, 1/I, 8/B) ; la colonne « Référence » n'est PAS le tracking, ignore-la. Les lignes sont dans la page « Liste détaillée » (la page « Reçu » n'est qu'un récapitulatif). « Nom destinataire » = ENSEIGNE + éventuel n° de département + VILLE, parfois coupé sur deux lignes à recoller : « SUPER U 26 BEAUMONT LES VALENCE » → enseigne SUPER U, ville BEAUMONT LES VALENCE ; « SUPER U 49 SAINT MACAIRE EN / MAUGES » → ville SAINT MACAIRE EN MAUGES ; « INTERSPORT TOURS NORD » → enseigne INTERSPORT, ville TOURS NORD. cp = « Code Pos. » sans le préfixe FR. date = « Date expédition ».
+- ville = nom de la localité SEULE (sans adresse, sans téléphone, sans n° de département). cp = code postal 5 chiffres.
 - enseigne = SUPER U, HYPER U, U EXPRESS, INTERSPORT… telle qu'écrite.
 - date = la date d'expédition du bordereau au format JJ/MM/AAAA.
 Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
-{"transporteur":"DPD|DSV|AUTRE","date":"JJ/MM/AAAA","lignes":[{"tracking":"...","cp":"...","ville":"...","enseigne":"..."}]}`;
+{"transporteur":"DPD|DSV|GLS|AUTRE","date":"JJ/MM/AAAA","lignes":[{"tracking":"...","cp":"...","ville":"...","enseigne":"..."}]}`;
         // Extraction bordereaux : les numéros ne sont PAS revérifiés par
         // l'opérateur → modèle principal obligatoire (fiabilité des chiffres).
         let aiData = await callAnthropic({
