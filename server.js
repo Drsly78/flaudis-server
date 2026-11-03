@@ -2847,6 +2847,25 @@ Réponds UNIQUEMENT avec ce JSON, sans texte autour :
             body: JSON.stringify({ values: [clean] })
           }).then(r => r.json());
           if (ap.error) { res.writeHead(500); res.end(JSON.stringify({ ok: false, error: ap.error.message })); return; }
+          // La ligne insérée hérite du fond de la ligne précédente (souvent VERTE = expédiée) :
+          // une demande qui vient d'arriver doit rester BLANCHE → fond blanc forcé sur A→I
+          try {
+            const mrow = ap.updates && ap.updates.updatedRange && ap.updates.updatedRange.match(/![A-Z]+(\d+)/);
+            if (mrow) {
+              const ligneU = parseInt(mrow[1], 10);
+              const meta = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}?fields=sheets.properties`,
+                { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json());
+              const shU = (meta.sheets || []).find(x => x.properties && x.properties.title === 'SYSTEME U');
+              if (shU) await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GOOGLE_SHEET_ID}:batchUpdate`, {
+                method: 'POST',
+                headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ requests: [{ repeatCell: {
+                  range: { sheetId: shU.properties.sheetId, startRowIndex: ligneU - 1, endRowIndex: ligneU, startColumnIndex: 0, endColumnIndex: 9 },
+                  cell: { userEnteredFormat: { backgroundColor: { red: 1, green: 1, blue: 1 } } },
+                  fields: 'userEnteredFormat.backgroundColor' } }] })
+              });
+            }
+          } catch (e) { console.log('Export U : fond blanc non appliqué —', e.message); }
           console.log('Export direct SYSTEME U:', key);
           res.writeHead(200); res.end(JSON.stringify({ ok: true }));
           return;
