@@ -136,11 +136,21 @@ async function lignesSU(force) {
 function analyser(rows) {
   const attente = [];
   const expedies = new Set();
-  (rows || []).forEach((r, i) => {
+  rows = rows || [];
+  // Ancre : 1re ligne d'une suite de 10 lignes datées après DEBUT_REVERS. Toute ligne
+  // ajoutée sous l'ancre compte, même avec une date ancienne (vieux dossier ressaisi).
+  const recente = i => (isoDe((rows[i] || [])[0]) || '') >= DEBUT_REVERS;
+  let ancre = rows.length;
+  for (let i = 0; i + 10 <= rows.length; i++) {
+    let ok = true;
+    for (let k = 0; k < 10 && ok; k++) ok = recente(i + k);
+    if (ok) { ancre = i; break; }
+  }
+  rows.forEach((r, i) => {
     const cnb = String(r[7] || '').trim(), fla = String(r[8] || '').trim();
     if (!cnb && !fla) return;
-    const iso = isoDe(r[0]);
-    if (!iso || iso < DEBUT_REVERS) return;
+    const iso = isoDe(r[0]) || '';
+    if (i < ancre && (!iso || iso < DEBUT_REVERS)) return;
     const b = String(r[1] || '').trim(), g = String(r[6] || '').trim();
     if (isoDe(b) || estTracking(g)) {
       if (cnb) expedies.add(N(cnb));
