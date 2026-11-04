@@ -555,7 +555,8 @@ const server = http.createServer(async function(req, res) {
 
   let body = '';
   let bodySize = 0;
-  const MAX_BODY = 12 * 1024 * 1024; // 12 Mo : au-delà on refuse plutôt que crasher
+  // 12 Mo : au-delà on refuse plutôt que crasher — 30 Mo pour le dépôt de notices (PDF ≤ 20 Mo, +33 % en base64)
+  const MAX_BODY = (req.url === '/notices-deposer' ? 30 : 12) * 1024 * 1024;
   let bodyTooBig = false;
   req.on('data', chunk => {
     bodySize += chunk.length;
