@@ -2,7 +2,6 @@ const https  = require('https');
 const http   = require('http');
 const { Pool } = require('pg');
 const prepa  = require('./prepa');
-const avoirs = require('./avoirs');
 
 const API_KEY         = process.env.ANTHROPIC_API_KEY;
 const APP_SECRET      = process.env.APP_SECRET || 'sav-flaudis-2024';
@@ -285,7 +284,7 @@ function getKey(ref) {
 function corsHeaders(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-App-Secret, X-Prepa-Code, X-Avoirs-Code');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-App-Secret, X-Prepa-Code');
 }
 
 function downloadBuffer(url) {
@@ -544,8 +543,6 @@ const server = http.createServer(async function(req, res) {
 
   // 📦 App préparateurs : page publique + API protégée par son propre code
   if (await prepa.handleApp(req, res)) return;
-  // 🧾 Outil avoirs SU : dépôt partagé des sources FOB/DDP (code propre)
-  if (await avoirs.handleApp(req, res)) return;
 
   // Exception lecture navigateur : le diagnostic du référentiel ITS
   // accepte la clé en paramètre d'URL (?key=…)
@@ -766,7 +763,6 @@ const server = http.createServer(async function(req, res) {
 
       // ── 📦 App préparateurs : routes de l'extension ──
       if (req.url.startsWith('/prepa-ext/')) { await prepa.handleExt(req, res, payload); return; }
-      if (req.url.startsWith('/avoirs-ext/')) { await avoirs.handleExt(req, res); return; }
 
       // ── 🔎 Audit du Google Sheet (LECTURE SEULE) : lignes incomplètes, formats de dates ──
       if (req.url === '/sheet-audit') {
@@ -4970,7 +4966,6 @@ Réponds UNIQUEMENT avec ce JSON, sans aucun texte autour :
   });
 });
 
-avoirs.init({ pool });
 prepa.init({
   pool, MODEL_LIGHT, callAnthropic, parseJsonModel, firebaseGet,
   lireSheet: async (range) => {
